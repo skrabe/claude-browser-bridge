@@ -48,6 +48,11 @@ Distinct from a single failed action — this is the loop that quietly wastes tu
 - When you do give up on a path, say why in plain terms rather than looping silently.
 
 ## Waiting
-There is no wait tool. After a slow action, verify with a concrete check — the action's status
-header (url/title), a `dom_query` for the expected element, or one re-`read_page` — and space out
-re-checks on known-slow transitions instead of hammering.
+`navigate` already waits for load. For anything else slow, use **`wait_for`** instead of polling
+`read_page` in a loop: `{state:"load"|"networkidle"}`, or `selector` / `text` / `textGone` /
+`urlIncludes` (caps at 25s). One call replaces an N-round-trip poll on known-slow transitions.
+
+## Fewer round trips
+- **`act_batch`** runs a sequence of actions (`fill`→`fill`→`click`…) in one call, stopping if a
+  step navigates unexpectedly. Use it for multi-field forms you've already resolved refs for.
+- Independent reads across tabs you already control can still go out as parallel tool calls.

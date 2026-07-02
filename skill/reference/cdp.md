@@ -15,11 +15,8 @@ cdp Runtime.evaluate { expression: "(() => { /* query + project */ })()", return
 Keep it bounded — query the container, return only the fields you need, cap rows. Don't dump the
 whole page.
 
-**Mouse beyond left-click** (`click` is a single left-click only)
-```
-cdp Input.dispatchMouseEvent { type:"mousePressed"|"mouseReleased", x, y, button:"right", clickCount:1 }  // context menu
-// double-click: two press/release pairs, the second pair with clickCount:2
-```
+**Exotic input** — `click` covers left/right/middle (`button:`) and double (`double:true`); reach
+here only for chorded mouse gestures or pointer types `click` doesn't expose.
 
 **Navigation & lifecycle**
 ```
@@ -31,22 +28,10 @@ Prefer the **`navigate` tool** over raw `Page.navigate` — it skips the reload 
 already on that URL (raw CDP doesn't, so it can wipe in-progress input). Reach for `cdp
 Page.navigate` only for something `navigate` can't do, e.g. targeting a specific subframe.
 
-**JS dialogs (alert / confirm / prompt)** — an open dialog blocks the page (actions start timing out)
-```
-cdp Page.handleJavaScriptDialog { accept:true, promptText:"…" }
-```
-The bridge doesn't deliver CDP events, so you can't read the dialog's text — infer it from the
-action you just took. `promptText` applies only to `prompt()`. If you can't attribute the dialog
-to your own last action, dismiss it (`accept:false`) or ask the user.
-
-**File uploads** (no dedicated tool covers these)
-```
-cdp DOM.getDocument { depth: 0 }                                              // → root.nodeId
-cdp DOM.querySelector { nodeId: <root.nodeId>, selector: "input[type=file]" } // → nodeId
-cdp DOM.setFileInputFiles { files: ["/absolute/path"], nodeId }
-```
-Always absolute paths. If the input is hidden behind a styled button, find the real
-`<input type="file">` in the DOM rather than clicking the button.
+**JS dialogs and file uploads have dedicated tools now** — use `dialog_handle` (accept/dismiss an
+open alert/confirm/prompt; an open dialog shows up as `openDialog` in the action status header) and
+`upload_file` (set files on an `<input type=file>` by ref, absolute paths, no native picker). Reach
+for raw `cdp` only for something those don't cover.
 For a screenshot use the **`screenshot` tool**, not raw `cdp Page.captureScreenshot` — the tool
 returns a viewable image, whereas raw `cdp` results come back as text, so `captureScreenshot` would
 hand you a multi-megabyte base64 string you can't see and shouldn't spend tokens on.

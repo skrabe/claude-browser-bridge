@@ -5,6 +5,9 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
 
 ## Tools
 - **`click`** — click an element by `ref`, or by `{x, y}` viewport coordinates. Default to ref.
+  `button:"right"|"middle"` for context/aux click; `double:true` for double-click.
+- **`upload_file`** — set files on an `<input type=file>` by ref (absolute paths); use this instead
+  of clicking the button, which opens a native OS picker you can't touch.
 - **`fill`** — replace an input's value (clears first). Prefer over `type_text` for form fields.
 - **`type_text`** — type into the currently focused element without clearing (focus it first,
   usually via a `click`). Use for contenteditable / search-as-you-type.
