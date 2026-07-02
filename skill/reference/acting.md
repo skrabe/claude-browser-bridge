@@ -8,6 +8,8 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
   `button:"right"|"middle"` for context/aux click; `double:true` for double-click.
 - **`upload_file`** — set files on an `<input type=file>` by ref (absolute paths); use this instead
   of clicking the button, which opens a native OS picker you can't touch.
+- **`download_wait`** — after triggering a download (clicking a link/button), call this to block
+  until it finishes and get the file's absolute path, then `Read` it in Claude Code.
 - **`fill`** — replace an input's value (clears first). Prefer over `type_text` for form fields.
 - **`type_text`** — type into the currently focused element without clearing (focus it first,
   usually via a `click`). Use for contenteditable / search-as-you-type.
