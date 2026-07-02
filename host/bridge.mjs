@@ -17,12 +17,14 @@ function encode(obj) {
   const h = Buffer.alloc(4); h.writeUInt32LE(b.length, 0);
   return Buffer.concat([h, b]);
 }
+const MAX_FRAME = 256 * 1024 * 1024; // sanity cap; a corrupt/misaligned prefix must not stall the leg
 function framer(onMsg) {
   let buf = Buffer.alloc(0);
   return (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     while (buf.length >= 4) {
       const len = buf.readUInt32LE(0);
+      if (len > MAX_FRAME) { buf = Buffer.alloc(0); break; } // corrupt frame — drop the stream, don't wait for 4GB
       if (buf.length < 4 + len) break;
       const body = buf.subarray(4, 4 + len); buf = buf.subarray(4 + len);
       try { onMsg(JSON.parse(body.toString('utf8'))); } catch {}
@@ -90,23 +92,31 @@ or solve CAPTCHAs — ask the user to sign in or clear the challenge themselves.
 For the full playbook (locators, lifecycle, safety, CDP recipes, troubleshooting), invoke the /browser skill.`;
 
 function runMcpServer() {
-  let sock = null; const reqs = new Map(); let idc = 0;
+  let sock = null; let connecting = null; const reqs = new Map(); let idc = 0;
   function connectSocket() {
-    return new Promise((res, rej) => {
-      if (sock && !sock.destroyed) return res(sock);
+    if (sock && !sock.destroyed) return Promise.resolve(sock);
+    if (connecting) return connecting; // dedupe concurrent connects — one socket, no fd leak
+    connecting = new Promise((res, rej) => {
       const s = net.createConnection(SOCK);
       s.on('data', framer((msg) => { const r = reqs.get(msg.id); if (r) { reqs.delete(msg.id); r(msg); } }));
-      s.on('connect', () => { sock = s; res(s); });
-      s.on('error', (e) => { if (!sock) rej(e); });
-      s.on('close', () => { sock = null; });
+      s.on('connect', () => { sock = s; connecting = null; res(s); });
+      s.on('error', (e) => { connecting = null; if (!sock) rej(e); });
+      s.on('close', () => {
+        sock = null; connecting = null;
+        // reject every in-flight request so tool calls fail fast instead of hanging forever
+        for (const [, r] of reqs) r({ error: 'browser bridge host connection closed mid-request' });
+        reqs.clear();
+      });
     });
+    return connecting;
   }
   async function callHost(method, params) {
     let s; try { s = await connectSocket(); }
-    catch { throw new Error('browser bridge host not running — open your browser with the Claude Browser Bridge extension loaded & enabled'); }
+    catch { throw new Error('browser bridge host not running — open your browser with the Better Claude in Chrome extension loaded & enabled'); }
     const id = `m${idc++}`;
     return new Promise((resolve, reject) => {
-      reqs.set(id, (msg) => (msg.error ? reject(new Error(msg.error)) : resolve(msg.result)));
+      const to = setTimeout(() => { if (reqs.has(id)) { reqs.delete(id); reject(new Error('browser bridge timed out — no response from the host/extension')); } }, 30000);
+      reqs.set(id, (msg) => { clearTimeout(to); if (msg.error) reject(new Error(msg.error)); else resolve(msg.result); });
       s.write(encode({ id, method, params }));
     });
   }
@@ -165,7 +175,7 @@ function runMcpServer() {
   let inbuf = '';
   process.stdin.on('data', (d) => {
     inbuf += d; let i;
-    while ((i = inbuf.indexOf('\n')) >= 0) { const line = inbuf.slice(0, i); inbuf = inbuf.slice(i + 1); if (line.trim()) handle(JSON.parse(line)); }
+    while ((i = inbuf.indexOf('\n')) >= 0) { const line = inbuf.slice(0, i); inbuf = inbuf.slice(i + 1); if (line.trim()) { try { handle(JSON.parse(line)); } catch {} } }
   });
   async function handle(msg) {
     if (msg.method === 'initialize') {

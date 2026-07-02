@@ -35,7 +35,8 @@ const BROWSERS = {
 const readJSON = (p, d = {}) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return d; } };
 function writeJSONAtomic(p, obj) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  if (fs.existsSync(p)) fs.copyFileSync(p, p + '.bak');
+  // pristine backup, ONCE — a single install writes ~/.claude.json twice; don't let the 2nd clobber it
+  if (fs.existsSync(p) && !fs.existsSync(p + '.bak')) fs.copyFileSync(p, p + '.bak');
   const tmp = p + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n'); fs.renameSync(tmp, p);
 }
 function extensionId() {
@@ -102,16 +103,31 @@ function install(opts) {
     : path.join(opts.project, '.claude', 'skills', 'browser');
   copyDir(path.join(ROOT, 'skill'), skillDest);
 
-  // 5) disable Claude-in-Chrome (scoped) + record prior state
+  // 5) disable Claude-in-Chrome (scoped) + record prior state.
+  // Reinstall/scope-change safety: read any prior state FIRST. On a same-scope reinstall, keep the
+  // original prior value (don't re-capture the `false` we already wrote). On a scope change, reverse
+  // the previous scope's disable so it isn't orphaned (uninstall would otherwise never undo it).
+  const prev = readJSON(STATE, null);
+  const prevD = (prev && prev.disable) || {};
   const cj = readJSON(CLAUDE_JSON);
+  if (prev && prev.scope !== scope) {
+    if (prev.scope === 'global') {
+      if (prevD.globalPrev === undefined) delete cj.claudeInChromeDefaultEnabled;
+      else cj.claudeInChromeDefaultEnabled = prevD.globalPrev;
+    } else if (prevD.projectPath && !prevD.projectAlreadyDisabled && cj.projects?.[prevD.projectPath]?.disabledMcpServers) {
+      cj.projects[prevD.projectPath].disabledMcpServers = cj.projects[prevD.projectPath].disabledMcpServers.filter(x => x !== CIC);
+    }
+  }
+  const sameScope = prev && prev.scope === scope;
   const disable = {};
   if (scope === 'global') {
-    disable.globalPrev = cj.claudeInChromeDefaultEnabled; // remember (could be true/undefined)
+    // preserve the ORIGINAL prior on same-scope reinstall; else capture the current (pre-disable) value
+    disable.globalPrev = (sameScope && 'globalPrev' in prevD) ? prevD.globalPrev : cj.claudeInChromeDefaultEnabled;
     cj.claudeInChromeDefaultEnabled = false;
   } else {
     cj.projects = cj.projects || {}; cj.projects[opts.project] = cj.projects[opts.project] || {};
     const list = cj.projects[opts.project].disabledMcpServers = cj.projects[opts.project].disabledMcpServers || [];
-    disable.projectAlreadyDisabled = list.includes(CIC);
+    disable.projectAlreadyDisabled = (sameScope && prev.project === opts.project && 'projectAlreadyDisabled' in prevD) ? prevD.projectAlreadyDisabled : list.includes(CIC);
     disable.projectPath = opts.project;
     if (!list.includes(CIC)) list.push(CIC);
   }
@@ -160,6 +176,8 @@ function uninstall() {
   }
   writeJSONAtomic(CLAUDE_JSON, cj);
   try { fs.unlinkSync(STATE); } catch {}
+  // drop the stale pristine backup so the next install re-captures a fresh one
+  try { fs.unlinkSync(CLAUDE_JSON + '.bak'); } catch {}
   log('uninstalled. Remove the unpacked extension manually from your browser (we cannot).');
   log('claude-in-chrome:', state.scope === 'global'
     ? (d.globalPrev === false ? 'left disabled (you had it off)' : 're-enabled')
