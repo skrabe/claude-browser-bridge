@@ -11,8 +11,10 @@
   right"), or as a fallback when the DOM is opaque.
 - **`find_text`** — does a word/price/error appear *anywhere* on the page (incl. off-screen, not
   yet scrolled into view)? One cheap check — beats a scroll+`read_text` loop.
-- **`read_console` / `read_network`** — buffered console messages / requests (url, method, status)
-  since claim. First stop when debugging a live site; `clear:true` resets between repro attempts.
+- **`read_console` / `read_network`** — buffered console messages / requests (url, method, status,
+  requestId) since claim. First stop when debugging a live site; `clear:true` resets between repro
+  attempts. Follow a request's `requestId` into **`network_body`** to read the API/JSON it returned.
+- **`screenshot`** also takes `ref` (just that element) or `fullPage:true` (whole scrollable page).
 - **`cdp`** — raw escape hatch (see `cdp.md`) for anything structured the above don't expose.
 
 ## Don't over-read (this is where tokens die)

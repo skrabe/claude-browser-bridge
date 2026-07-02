@@ -6,6 +6,7 @@
   after a local dev rebuild).
 - For a read-only lookup, one focused direct nav to the obvious result or a parameterized search
   URL (e.g. `?q=…`) is fine and often better than clicking through filters.
+- **`go_back`** / **`go_forward`** move through the tab's history without retyping URLs.
 
 ## Claiming vs creating
 - **Claim, don't spawn.** `tabs_list` → if the page you need is already open, `tab_claim` it
@@ -21,8 +22,9 @@
 - **Close by default.** Once you've gotten what you need from a tab, it's done — research, search,
   and intermediate tabs don't earn a spot just because they helped you answer. Keep one open only
   for a stated reason (below).
-- Tabs **you created** are yours to clean up; `tab_release` (or close) them when done — unless
-  the tab *is* a deliverable the user asked to keep open (a created doc, a checkout, a dashboard).
+- Tabs **you created** are yours to clean up; **`tab_close`** them when done (it only closes tabs
+  the agent opened, never the user's) — unless the tab *is* a deliverable the user asked to keep
+  open (a created doc, a checkout, a dashboard).
 - Tabs **you claimed** from the user: `tab_release` hands control back and **leaves them open**.
   Never close a user's own tab.
 - If work must continue on a page in a later turn (awaiting login/approval/payment), leave it and
