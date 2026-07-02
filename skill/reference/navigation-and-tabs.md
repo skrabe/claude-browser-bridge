@@ -1,16 +1,11 @@
 # Navigation & tabs
 
-You're driving the user's real browser. Tabs are theirs — treat them with care.
-
 ## Navigating
 - **`navigate`** goes to a URL in a controlled tab; it **skips the load if already on that URL**
-  (re-navigating reloads and can destroy in-progress input). Use **`reload`** when you truly need
-  a refresh (e.g., after a local dev rebuild).
+  (a reload can destroy in-progress input). Use **`reload`** when you truly need a refresh (e.g.,
+  after a local dev rebuild).
 - For a read-only lookup, one focused direct nav to the obvious result or a parameterized search
   URL (e.g. `?q=…`) is fine and often better than clicking through filters.
-- **Never** brute-force URL variants, query grids, or candidate-URL arrays. If the one focused
-  attempt fails or can't be verified, switch to the page's own search/nav, or give the best
-  answer with stated uncertainty.
 
 ## Claiming vs creating
 - **Claim, don't spawn.** `tabs_list` → if the page you need is already open, `tab_claim` it
@@ -19,9 +14,8 @@ You're driving the user's real browser. Tabs are theirs — treat them with care
 - Never guess a tabId — only use ids from the current `tabs_list`.
 - `tab_activate` brings a tab to the front (only when the user should watch — otherwise work in
   the background).
-- **Several sources at once?** `tab_create` one background tab per URL (don't `tab_activate`
-  them) instead of walking the user's current tab through each URL in turn — faster, and it
-  leaves whatever they had open alone. Release/close each as soon as you've extracted what you need.
+- **Several sources at once?** `tab_create` one background tab per URL instead of walking the
+  user's current tab through each URL in turn — faster, and it leaves whatever they had open alone.
 
 ## Lifecycle — leave the workspace tidy
 - **Close by default.** Once you've gotten what you need from a tab, it's done — research, search,
