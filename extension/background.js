@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 let port = null;
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
@@ -16,8 +16,9 @@ function st(tabId) {
 }
 
 function connect() {
+  if (port) return; // one native-messaging connection only — never spawn a second host
   try { port = chrome.runtime.connectNative(HOST); }
-  catch { setTimeout(connect, 2000); return; }
+  catch { port = null; setTimeout(connect, 2000); return; }
   port.onMessage.addListener(onMessage);
   port.onDisconnect.addListener(() => {
     port = null;
