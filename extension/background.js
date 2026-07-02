@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -20,6 +20,11 @@ try {
   });
 } catch {}
 
+// Secure credential entry: pending requests keyed by a token handed to the popup window. The
+// user's secret values live only inside the popup → this worker → the page fill; they are never
+// logged, returned to the host/MCP, or exposed to the model.
+const pendingCredentials = new Map(); // token -> { spec, tabId, origin, fields, submit, finish }
+
 // per controlled tab: refs: Map<ref, {backendNodeId, sessionId}>, seq, console, network,
 // frames: Map<sessionId, {parentSession, ownerBackendNodeId, url}> for cross-origin (OOPIF) frames.
 const state = new Map();
@@ -31,6 +36,8 @@ function st(tabId) {
 // Route a CDP command to a tab (number) or a specific frame session ({tabId, sessionId}). Chrome 125+
 // flat sessions: sendCommand takes {tabId, sessionId} to address an out-of-process child frame.
 const dbgOf = (tabId, sessionId) => (sessionId ? { tabId, sessionId } : tabId);
+// Pages the agent must never drive/see — browser UI and extension pages (incl. our credential popup).
+const PRIVILEGED_URL = /^(chrome|chrome-extension|devtools|edge|brave|about|view-source):/i;
 
 function connect() {
   if (port) return; // one native-messaging connection only — never spawn a second host
@@ -146,6 +153,35 @@ async function absCenter(tabId, backendNodeId, sessionId) {
 }
 async function refPoint(tabId, ref) { const { backendNodeId, sessionId } = refNode(tabId, ref); return absCenter(tabId, backendNodeId, sessionId); }
 
+// Fill user-entered secrets into the page by selector (top document). Values arrive only here from
+// the popup; never logged or returned. Returns a status code (browserAuth-style).
+const SETTER_FN = 'function(v){this.focus&&this.focus();const p=Object.getOwnPropertyDescriptor(this.__proto__,"value");if(p&&p.set)p.set.call(this,v);else this.value=v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));}';
+async function fillCredentials(pend, values) {
+  const { tabId, origin, fields, submit } = pend;
+  let curOrigin = ''; try { curOrigin = new URL((await chrome.tabs.get(tabId)).url).origin; } catch {}
+  if (origin && curOrigin && origin !== curOrigin) return 'origin_changed';
+  const { root } = await cmd(tabId, 'DOM.getDocument', { depth: 0 });
+  for (const f of fields) {
+    if (values[f.id] == null) continue;
+    let nodeId;
+    try { nodeId = (await cmd(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector: f.selector })).nodeId; } catch { return 'locator_invalid'; }
+    if (!nodeId) return 'locator_invalid';
+    const { object } = await cmd(tabId, 'DOM.resolveNode', { nodeId });
+    await cmd(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: SETTER_FN, arguments: [{ value: String(values[f.id]) }] });
+  }
+  if (submit && submit.selector) {
+    let snid;
+    try { snid = (await cmd(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector: submit.selector })).nodeId; } catch { return 'submission_failed'; }
+    if (!snid) return 'submission_failed';
+    const { object } = await cmd(tabId, 'DOM.resolveNode', { nodeId: snid });
+    const fn = submit.action === 'enter'
+      ? 'function(){this.focus();const f=this.form;if(f){f.requestSubmit?f.requestSubmit():f.submit();}else{this.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",keyCode:13,bubbles:true}));}}'
+      : 'function(){this.click();}';
+    await cmd(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: fn });
+  }
+  return 'submitted';
+}
+
 // ---- key map for press_key ----
 const KEYS = {
   Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
@@ -219,6 +255,7 @@ async function dispatch(method, p) {
       const out = [];
       for (const t of list) {
         if (t.id == null) continue;
+        if (t.url && PRIVILEGED_URL.test(t.url)) continue; // hide browser/extension pages (incl. the credential popup)
         let group = null;
         if (t.groupId != null && t.groupId !== -1) {
           try { group = (await chrome.tabGroups.get(t.groupId)).title || null; } catch {}
@@ -231,7 +268,9 @@ async function dispatch(method, p) {
 
     case 'claimTab': {
       const tab = await chrome.tabs.get(p.tabId);
-      if (tab.url && tab.url.startsWith('chrome://')) throw new Error('cannot claim a chrome:// tab');
+      // Refuse privileged/extension pages — notably our own credential popup, so the secret the user
+      // types there can never be read back by claiming it.
+      if (tab.url && PRIVILEGED_URL.test(tab.url)) throw new Error('cannot claim a browser/extension page');
       await attach(p.tabId);
       return { id: p.tabId, title: tab.title, url: tab.url, claimed: true };
     }
@@ -536,6 +575,21 @@ async function dispatch(method, p) {
       return { ok: false, timedOut: true };
     }
 
+    case 'requestCredential': {
+      await need(p.tabId);
+      let origin = ''; try { origin = new URL((await chrome.tabs.get(p.tabId)).url).origin; } catch {}
+      const token = (crypto.randomUUID && crypto.randomUUID()) || 't' + Date.now() + Math.random();
+      // spec sent to the popup carries labels/types only — never values (there are none yet)
+      const spec = { origin, reason: p.reason || '', fields: (p.fields || []).map((f) => ({ id: f.id, label: f.label, type: f.type })) };
+      return await new Promise((resolve) => {
+        let winId = null;
+        const finish = (status) => { if (!pendingCredentials.has(token)) return; pendingCredentials.delete(token); clearTimeout(timer); if (winId != null) chrome.windows.remove(winId).catch(() => {}); resolve({ status }); };
+        const timer = setTimeout(() => finish('expired'), Math.min(p.timeoutMs || 180000, 300000));
+        pendingCredentials.set(token, { spec, tabId: p.tabId, origin, fields: p.fields || [], submit: p.submit, finish });
+        chrome.windows.create({ type: 'popup', url: chrome.runtime.getURL('credential.html') + '?token=' + token, width: 460, height: 440, focused: true }, (w) => { winId = w?.id ?? null; });
+      });
+    }
+
     case 'executeCdp': { await need(p.tabId); return await cmd(p.tabId, p.cdpMethod, p.cdpParams || {}); }
 
     default: throw new Error('unknown method: ' + method);
@@ -585,3 +639,21 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
   }
 });
 chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) state.delete(source.tabId); });
+
+// Popup ↔ worker channel for secure credential entry. Secret values arrive here and go straight to
+// the page fill (fillCredentials); they are never logged or forwarded to the host/MCP side.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || !msg.token) return;
+  const pend = pendingCredentials.get(msg.token);
+  if (msg.type === 'cbb-cred-getspec') { sendResponse(pend ? pend.spec : { error: 'This request expired.' }); return; }
+  if (!pend) { sendResponse({ status: 'expired' }); return; }
+  if (msg.type === 'cbb-cred-cancel') { pend.finish('declined'); sendResponse({ status: 'declined' }); return; }
+  if (msg.type === 'cbb-cred-submit') {
+    (async () => {
+      let status; try { status = await fillCredentials(pend, msg.values || {}); } catch { status = 'submission_failed'; }
+      pend.finish(status);
+      sendResponse({ status });
+    })();
+    return true; // async response
+  }
+});
