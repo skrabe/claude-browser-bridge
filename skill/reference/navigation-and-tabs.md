@@ -17,6 +17,10 @@
   the background).
 - **Several sources at once?** `tab_create` one background tab per URL instead of walking the
   user's current tab through each URL in turn — faster, and it leaves whatever they had open alone.
+- **Group the tabs you open by topic.** Pass `tab_create` a `group:"<topic>"` (a short task name)
+  so the tabs you spawn land in one labeled tab group instead of scattering across the user's
+  window — it reuses an existing group of that name, or starts one. Keeps their workspace tidy and
+  makes cleanup obvious.
 
 ## Lifecycle — leave the workspace tidy
 - **Close by default.** Once you've gotten what you need from a tab, it's done — research, search,

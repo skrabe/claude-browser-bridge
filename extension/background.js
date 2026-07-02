@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.6.1';
+const VERSION = '0.7.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -278,7 +278,15 @@ async function dispatch(method, p) {
       const tab = await chrome.tabs.create({ url: p.url || 'about:blank', active: !!p.active });
       await attach(tab.id);
       st(tab.id).createdByAgent = true; // tab_close may only close tabs the agent opened
-      return { id: tab.id, url: tab.url };
+      let grouped = null;
+      if (p.group) { // put the tab in a topic group — reuse an existing group of that name, else create one
+        try {
+          const existing = await chrome.tabGroups.query({ title: String(p.group), windowId: tab.windowId });
+          if (existing && existing.length) { await chrome.tabs.group({ tabIds: [tab.id], groupId: existing[0].id }); grouped = String(p.group); }
+          else { const gid = await chrome.tabs.group({ tabIds: [tab.id] }); await chrome.tabGroups.update(gid, { title: String(p.group) }); grouped = String(p.group); }
+        } catch {}
+      }
+      return { id: tab.id, url: tab.url, ...(grouped ? { group: grouped } : {}) };
     }
     case 'activateTab': { const t = await chrome.tabs.get(p.tabId); await chrome.windows.update(t.windowId, { focused: true }); await chrome.tabs.update(p.tabId, { active: true }); return { ok: true }; }
     case 'reload': { await need(p.tabId); await cmd(p.tabId, 'Page.reload', {}); return { ok: true }; }

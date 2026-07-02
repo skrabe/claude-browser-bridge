@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.6.1';
+const VERSION = '0.7.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -107,7 +107,7 @@ function runMcpServer() {
   const TOOLS = [
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
     { name: 'tab_claim', description: 'Take control of an EXISTING tab in place by id (from tabs_list). Attaches the debugger; does not open a new tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
-    { name: 'tab_create', description: 'Open a new tab and take control of it.', inputSchema: { type: 'object', properties: { url: str, active: { type: 'boolean' } } } },
+    { name: 'tab_create', description: 'Open a new tab and take control of it. Pass group:"<topic>" to place it in a topic tab group — reuses an existing group of that name, else starts one. Group the tabs you open by topic.', inputSchema: { type: 'object', properties: { url: str, active: { type: 'boolean' }, group: str } } },
     { name: 'tab_activate', description: 'Bring a controlled tab to the front (only when the user should watch).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'tab_release', description: 'Detach from a tab and hand it back to the user (leaves it open).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'navigate', description: 'Navigate a controlled tab to a URL (skips reload if already there); waits for load by default so the next read is not racing it (waitUntil:"none" to skip).', inputSchema: { type: 'object', properties: { tabId: num, url: str, waitUntil: str }, required: ['tabId', 'url'] } },
