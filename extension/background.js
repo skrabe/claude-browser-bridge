@@ -58,11 +58,18 @@ function cmd(tabId, method, params = {}) {
   });
 }
 function attach(tabId) {
-  return new Promise((res, rej) => {
-    if (state.get(tabId)?.attached) return res();
+  const s = st(tabId);
+  if (s.attached) return Promise.resolve();
+  if (s.attaching) return s.attaching; // dedupe concurrent attaches (parallel tool calls on a cold tab)
+  s.attaching = new Promise((res, rej) => {
     chrome.debugger.attach({ tabId }, '1.3', async () => {
-      if (chrome.runtime.lastError) return rej(new Error(chrome.runtime.lastError.message));
-      const s = st(tabId); s.attached = true;
+      s.attaching = null;
+      if (chrome.runtime.lastError) {
+        // a racing attach already won — treat as attached, not an error
+        if (s.attached || /already attached/i.test(chrome.runtime.lastError.message)) { s.attached = true; return res(); }
+        return rej(new Error(chrome.runtime.lastError.message));
+      }
+      s.attached = true;
       try {
         for (const d of ['Page', 'DOM', 'Runtime', 'Accessibility', 'Network', 'Log']) {
           await cmd(tabId, d + '.enable').catch(() => {});
@@ -71,6 +78,7 @@ function attach(tabId) {
       res();
     });
   });
+  return s.attaching;
 }
 function detach(tabId) {
   return new Promise((res) => {
@@ -164,7 +172,7 @@ async function handle(method, p) {
 
     case 'readPage': {
       await need(p.tabId);
-      const s = st(p.tabId); s.refs.clear(); s.seq = 0;
+      const s = st(p.tabId); s.refs.clear(); // fresh snapshot; seq stays monotonic so stale ids error, never re-alias
       const { nodes } = await cmd(p.tabId, 'Accessibility.getFullAXTree', {});
       const lines = [];
       for (const n of nodes) {
@@ -211,7 +219,7 @@ async function handle(method, p) {
     case 'find': {
       // heuristic over the a11y tree: rank interactive nodes by fuzzy match on name/role
       await need(p.tabId);
-      const s = st(p.tabId); s.refs.clear(); s.seq = 0;
+      const s = st(p.tabId); // append 'f' refs with a monotonic seq — never clobber read_page's 'e' refs
       const { nodes } = await cmd(p.tabId, 'Accessibility.getFullAXTree', {});
       const q = String(p.query || '').toLowerCase();
       const terms = q.split(/\s+/).filter(Boolean);
@@ -224,7 +232,7 @@ async function handle(method, p) {
         let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
         if (name && q.includes(name.toLowerCase())) score += 5;
         if (score <= 0) continue;
-        const ref = 'e' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
+        const ref = 'f' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
         scored.push({ ref, role, name: name.slice(0, 160), score });
       }
       scored.sort((a, b) => b.score - a.score);
@@ -254,9 +262,16 @@ async function handle(method, p) {
     case 'typeText': { await need(p.tabId); await cmd(p.tabId, 'Input.insertText', { text: String(p.text ?? '') }); return { ok: true }; }
     case 'pressKey': {
       await need(p.tabId);
-      const k = KEYS[p.key] || { key: p.key, code: p.key, windowsVirtualKeyCode: 0 };
-      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...k });
-      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...k });
+      // support modifier chords like "Meta+A", "Ctrl+Shift+K"
+      const parts = String(p.key).split('+');
+      const base = parts.pop();
+      let modifiers = 0;
+      for (const m of parts) { const ml = m.toLowerCase(); if (ml === 'alt') modifiers |= 1; else if (ml === 'ctrl' || ml === 'control') modifiers |= 2; else if (ml === 'meta' || ml === 'cmd' || ml === 'command') modifiers |= 4; else if (ml === 'shift') modifiers |= 8; }
+      const k = KEYS[base] || (base.length === 1
+        ? { key: base, code: 'Key' + base.toUpperCase(), windowsVirtualKeyCode: base.toUpperCase().charCodeAt(0) }
+        : { key: base, code: base, windowsVirtualKeyCode: 0 });
+      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k });
+      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...k });
       return { ok: true };
     }
     case 'scroll': {
@@ -269,12 +284,14 @@ async function handle(method, p) {
     case 'selectOption': {
       await need(p.tabId);
       const objectId = await objectFor(p.tabId, refBackend(p.tabId, p.ref));
-      await cmd(p.tabId, 'Runtime.callFunctionOn', {
+      const r = await cmd(p.tabId, 'Runtime.callFunctionOn', {
         objectId,
-        functionDeclaration: 'function(v){this.value=v;this.dispatchEvent(new Event("change",{bubbles:true}));}',
+        // match by option value OR visible label/text (doctrine advertises both)
+        functionDeclaration: 'function(v){const o=[...(this.options||[])];const m=o.find(x=>x.value===v)||o.find(x=>(x.label||x.text||x.textContent||"").trim()===v);this.value=m?m.value:v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));return !!m;}',
         arguments: [{ value: String(p.value ?? '') }],
+        returnByValue: true,
       });
-      return { ok: true };
+      return { ok: true, matched: !!r?.result?.value };
     }
     case 'drag': {
       await need(p.tabId);
