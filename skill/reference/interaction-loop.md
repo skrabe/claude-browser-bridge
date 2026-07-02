@@ -34,6 +34,22 @@ through header badges, alternate surfaces, or repeated full-page reads.
   strategy** (different tool, the site's own search, a direct URL).
 - If you fall back to a general web search from inside a page, run **one focused query** and open
   the strongest result — don't loop rewriting the query.
+- On a freshly loaded/navigated page, check for a blocking modal / cookie banner / overlay as part
+  of orienting and dismiss it via its own close/accept control *before* going for the real target
+  — don't click the target first and diagnose the failure afterward.
+- When a screen needs several actions (a multi-field form) and filling one won't invalidate
+  another's ref, resolve **all** the targets from one `read_page`, then fire the actions — don't
+  re-observe between each field unless one changes the DOM.
+
+## Stuck detection
+Distinct from a single failed action — this is the loop that quietly wastes turns:
+- Same URL after 3+ actions with no new element/content = **stuck**, even if each action reported
+  success. Change approach, don't push the same sequence further.
+- The same action failing repeatedly → change approach, not repeat it. An explicit
+  rejection/validation message → change the value or target next attempt, never retry it identical.
+- A click that resolves to a unique element but produces no visible change → suspect a covering
+  overlay/modal/banner (a `screenshot` usually shows it); clear that before re-clicking.
+- When you do give up on a path, say why in plain terms rather than looping silently.
 
 ## Waiting
 - Don't use fixed sleeps as a default wait. After an action, do a concrete state check

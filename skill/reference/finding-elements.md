@@ -45,3 +45,6 @@ be the first in the source.
 - Same target failed twice → stop escalating on role/text. Switch to the most stable attribute
   from a fresh `read_page`, or fall back to a `screenshot` + coordinate `click`.
 - Never retry the exact same failing selector without re-observing first.
+- A single opaque `canvas`/generic node where you expect many rows/cells (a spreadsheet, a canvas
+  editor, a map) means the content is **painted, not in the DOM** — go straight to `screenshot` +
+  coordinate `click`/`drag`, don't keep retrying ref/CSS selectors.

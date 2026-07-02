@@ -9,6 +9,8 @@
   specific thing* (does X exist? how many? what's its href?).
 - **`screenshot`** — pixels. Best when *visual layout matters* (charts, canvas, "does it look
   right"), or as a fallback when the DOM is opaque.
+- **`find_text`** — does a word/price/error appear *anywhere* on the page (incl. off-screen, not
+  yet scrolled into view)? One cheap check — beats a scroll+`read_text` loop.
 - **`cdp`** — raw escape hatch (see `cdp.md`) for anything structured the above don't expose.
 
 ## Don't over-read (this is where tokens die)
@@ -21,5 +23,7 @@
 
 ## Extracting structured data
 - Scope first (find the container/table), then extract from *that*.
+- Need a link/URL? Read the element's actual `href` via `dom_query` — never reconstruct or guess
+  a URL from truncated or visible anchor text.
 - For a bounded, already-identified set, a single `cdp` → `Runtime.evaluate` that queries and
   projects exactly the fields you need (return by value, limit rows) beats many small reads.

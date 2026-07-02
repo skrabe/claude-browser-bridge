@@ -52,6 +52,10 @@ to fix that tool's auth, or get their explicit go-ahead first.
 - **Speak in plain language.** Describe what you're doing in the browser in the user's terms;
   don't surface tool/protocol internals (tabIds, CDP domain names, "MCP", debugger attach/detach)
   unless they ask.
+- **Ground every value before you report it.** A price, name, date, URL, or count you tell the
+  user must have actually appeared in a `read_page`/`read_text`/`dom_query`/`screenshot` result
+  this session — never fill a gap from memory, and never call a submit/change done without checking
+  the resulting page. If you couldn't verify part of the ask, say so instead of implying success.
 - **`chrome.debugger` shows a "…is debugging this browser" banner** on claimed tabs — expected.
 
 ## When to read which reference doc
