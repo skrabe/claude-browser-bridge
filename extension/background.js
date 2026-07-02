@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -103,6 +103,11 @@ function attach(tabId) {
         // Reach into cross-origin (out-of-process) iframes. Chrome 125+ flat sessions; older Chrome
         // just no-ops here and we stay main-frame-only.
         await cmd(tabId, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe', exclude: false }] }).catch(() => {});
+        // Let a backgrounded tab behave as focused + stay lifecycle-active, so SPAs that gate
+        // rendering on focus/visibility (e.g. the Cloudflare dashboard) load without us stealing the
+        // user's foreground. Work on the tab in the background instead of activating it.
+        await cmd(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+        await cmd(tabId, 'Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
       } catch {}
       res();
     });
