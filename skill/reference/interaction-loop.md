@@ -10,6 +10,8 @@ After a click / type / navigate, collect the **single cheapest** observation tha
 - Need to confirm a value or read prose? → `read_text`, or a scoped `dom_query`.
 - Need visual layout / a rendered widget / a chart? → `screenshot`.
 - **Do not take both `read_page` and `screenshot` by default.** Pick one.
+- Independent reads across tabs you *already* control can go out as parallel tool calls in one
+  turn instead of serially — a cheap latency win when comparing several open pages.
 
 ## Reuse, don't refetch
 - Keep the latest `read_page`/`dom_query` result and reuse it for building targets and retry
@@ -30,6 +32,8 @@ through header badges, alternate surfaces, or repeated full-page reads.
 - Then **narrow** to the relevant section or a few strong candidates.
 - If you're not getting narrower, don't scale extraction across more elements — **change
   strategy** (different tool, the site's own search, a direct URL).
+- If you fall back to a general web search from inside a page, run **one focused query** and open
+  the strongest result — don't loop rewriting the query.
 
 ## Waiting
 - Don't use fixed sleeps as a default wait. After an action, do a concrete state check
