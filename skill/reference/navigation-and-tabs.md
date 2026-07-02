@@ -19,8 +19,14 @@ You're driving the user's real browser. Tabs are theirs — treat them with care
 - Never guess a tabId — only use ids from the current `tabs_list`.
 - `tab_activate` brings a tab to the front (only when the user should watch — otherwise work in
   the background).
+- **Several sources at once?** `tab_create` one background tab per URL (don't `tab_activate`
+  them) instead of walking the user's current tab through each URL in turn — faster, and it
+  leaves whatever they had open alone. Release/close each as soon as you've extracted what you need.
 
 ## Lifecycle — leave the workspace tidy
+- **Close by default.** Once you've gotten what you need from a tab, it's done — research, search,
+  and intermediate tabs don't earn a spot just because they helped you answer. Keep one open only
+  for a stated reason (below).
 - Tabs **you created** are yours to clean up; `tab_release` (or close) them when done — unless
   the tab *is* a deliverable the user asked to keep open (a created doc, a checkout, a dashboard).
 - Tabs **you claimed** from the user: `tab_release` hands control back and **leaves them open**.

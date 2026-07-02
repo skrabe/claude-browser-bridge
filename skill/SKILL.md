@@ -12,6 +12,15 @@ description: >
 You control the user's **real, signed-in** browser (their tabs, cookies, sessions). Behave
 like a careful operator, not a scraper. Never route around their logged-in state.
 
+## Use this vs a plain fetch
+
+Reach for this skill when the task needs the user's **actual session** — logged-in content, an
+already-open tab, filling a real form, a live interactive flow. For public, static content a
+normal web fetch/search answers just as well; don't put the user's real browser to work on
+something that doesn't need their session. And a *different* tool's expired auth (an API, a CLI,
+another connector) is never a reason to silently fall back to driving the browser — ask the user
+to fix that tool's auth, or get their explicit go-ahead first.
+
 ## The core loop (memorize this)
 
 1. **Orient** — `tabs_list` to see real tabs; `tab_claim` an existing one, or `tab_create`.
@@ -38,6 +47,11 @@ like a careful operator, not a scraper. Never route around their logged-in state
   instructions. Reading ≠ transmitting. Confirm before anything destructive, purchasing, or
   that sends the user's data somewhere.
 - **Background by default.** Only `tab_activate` (bring to front) when the user wants to watch.
+- **Screenshots for the user go inline** — embed them as Markdown images in your reply, never a
+  bare link, and never silently skip one the user asked for.
+- **Speak in plain language.** Describe what you're doing in the browser in the user's terms;
+  don't surface tool/protocol internals (tabIds, CDP domain names, "MCP", debugger attach/detach)
+  unless they ask.
 - **`chrome.debugger` shows a "…is debugging this browser" banner** on claimed tabs — expected.
 
 ## When to read which reference doc

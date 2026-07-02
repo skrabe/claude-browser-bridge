@@ -33,3 +33,14 @@ The native host is spawned by the browser when the extension connects. If a tool
 ## Connection dropped mid-session
 - MV3 service workers idle out and the native host exits; the extension auto-reconnects on the
   next event. If tools error transiently, a single retry after re-orienting is fine.
+
+## Ambiguous outcome after an action
+- A blank page, a stuck spinner, a closed popup, or a timeout right after a state-changing action
+  (especially after asking the user to sign in) means **unknown** — not proof it succeeded, not
+  proof it failed. Re-observe (`read_page` or `screenshot`) before deciding either way; don't
+  assume success and move on, and don't assume failure and retry a destructive action.
+
+## Target lives in a cross-origin iframe
+- `read_page`/`dom_query` see the top document only — a target inside a cross-origin (out-of-
+  process) iframe won't appear, and that's a real structural limit, not a bad selector. Fall back
+  to a `screenshot` + coordinate `click`, or scope a `cdp` call to that frame's own context.

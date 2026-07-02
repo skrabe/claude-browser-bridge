@@ -34,6 +34,25 @@ cdp Page.enable {}
 cdp Page.navigate { url }
 cdp Page.getFrameTree {}
 ```
+Prefer the **`navigate` tool** over raw `Page.navigate` — it skips the reload when the tab is
+already on that URL (raw CDP doesn't, so it can wipe in-progress input). Reach for `cdp
+Page.navigate` only for something `navigate` can't do, e.g. targeting a specific subframe.
+
+**JS dialogs (alert / confirm / prompt)** — an open dialog blocks the whole page until handled
+```
+cdp Page.enable {}                                    // then read Page.javascriptDialogOpening
+cdp Page.handleJavaScriptDialog { accept:true, promptText:"…" }
+```
+`promptText` applies only to `prompt()`; `confirm()`/`alert()` take `accept` alone. Read the
+dialog text from the `javascriptDialogOpening` event first — don't blind-accept.
+
+**File uploads** (no dedicated tool covers these)
+```
+cdp DOM.querySelector { nodeId, selector:"input[type=file]" }   // → backendNodeId
+cdp DOM.setFileInputFiles { files:["/absolute/path"], backendNodeId }
+```
+Always absolute paths. If the input is hidden behind a styled button, find the real
+`<input type="file">` in the DOM rather than clicking the button.
 For a screenshot use the **`screenshot` tool**, not raw `cdp Page.captureScreenshot` — the tool
 returns a viewable image, whereas raw `cdp` results come back as text, so `captureScreenshot` would
 hand you a multi-megabyte base64 string you can't see and shouldn't spend tokens on.
@@ -55,3 +74,5 @@ cdp DOM.querySelector { nodeId, selector }
   `read_console`/`read_network` tools buffer and expose them — use those unless you need a domain
   they don't cover.
 - CDP is per-tab and scoped to the tab's current origin/session. Enable a domain before using it.
+- Before overriding device metrics / viewport via raw CDP, check whether the `screenshot` tool's
+  own options already cover the need — an override resizes the user's real browser window.

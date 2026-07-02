@@ -37,6 +37,10 @@ Generic labels (`Menu`, `Close`, `Search`, `Add to cart`, size letters `S/M/L`, 
 repeated `href`s on grids/carousels/modals are **ambiguous by default** — first identify the
 stable card/container, then scope inside it before acting.
 
+Resolve "the first / last X" from **rendered order** — what `read_page` or a `screenshot` shows —
+not DOM source order; CSS (flex/grid `order`, positioning) can make the visually-first element not
+be the first in the source.
+
 ## Recovery
 - Same target failed twice → stop escalating on role/text. Switch to the most stable attribute
   from a fresh `read_page`, or fall back to a `screenshot` + coordinate `click`.
