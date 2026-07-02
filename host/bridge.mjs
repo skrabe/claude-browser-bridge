@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -138,6 +138,7 @@ function runMcpServer() {
     { name: 'download_wait', description: 'After triggering a download, wait for it to finish and get its absolute path to Read in Claude Code. timeoutMs caps at 120s.', inputSchema: { type: 'object', properties: { timeoutMs: num }, required: [] } },
     { name: 'downloads_list', description: 'Recent downloads (id, url, filename, state) this session.', inputSchema: { type: 'object', properties: { limit: num } } },
     { name: 'act_batch', description: 'Run several actions in one round trip: actions=[{tool, args}] (fill/click/type_text/press_key/select_option/scroll/hover). Stops if a step navigates unexpectedly. Cuts round trips on multi-field forms.', inputSchema: { type: 'object', properties: { tabId: num, actions: { type: 'array', items: { type: 'object' } }, stopOnError: { type: 'boolean' } }, required: ['tabId', 'actions'] } },
+    { name: 'credential_request', description: 'Sign in without seeing the secret: the USER types credentials into a secure popup Claude never sees; the bridge fills them into the page by selector and returns only a status (submitted/declined/origin_changed/locator_invalid/expired/submission_failed). Pass field SELECTORS + metadata, NEVER values. Use this instead of ever asking for a password/OTP in chat. fields:[{id,label,type,selector}]; optional submit:{selector,action:"click"|"enter"}.', inputSchema: { type: 'object', properties: { tabId: num, reason: str, fields: { type: 'array', items: { type: 'object' } }, submit: { type: 'object' }, timeoutMs: num }, required: ['tabId', 'fields'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
   ];
 
@@ -174,6 +175,7 @@ function runMcpServer() {
     network_body: (a) => callHost('getNetworkBody', a),
     download_wait: (a) => callHost('waitDownload', a),
     downloads_list: (a) => callHost('listDownloads', a),
+    credential_request: (a) => callHost('requestCredential', a),
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),
     // Host-side composition: run several existing tools in one round trip, aborting if a step
     // navigates unexpectedly (each action's status header carries the post-action url).

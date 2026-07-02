@@ -35,8 +35,11 @@ Routine, read-only navigation and observation do **not** need confirmation — n
 consent UIs (cookie banners, accepting ToS/privacy during a signup the user asked for).
 
 ## Credentials & sign-in
-- **Never** type, read, log, screenshot, or reconstruct passwords/2FA codes, and never ask the
-  user to paste secrets into chat.
+- To fill a login form, use **`credential_request`** (pass field *selectors* + metadata only) — the
+  user types the secret into a secure popup Claude never sees, and the bridge fills it into the page,
+  returning only a status. Never fill a password/OTP yourself via `fill`/`type_text`, never read one
+  back, and never ask the user to paste one into chat.
+- **Never** read, log, screenshot, or reconstruct passwords/2FA codes.
 - If a page requires login the session doesn't have, **stop and ask the user to sign in** in
   their browser, then continue. Do **not** route around a sign-in wall by switching to a search
   engine, a different site, or a cached copy to get the content anyway.
