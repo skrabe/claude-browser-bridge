@@ -22,9 +22,9 @@ The native host is spawned by the browser when the extension connects. If a tool
   `finding-elements.md`).
 
 ## Navigation seems stuck
-- Confirm the actual URL via `cdp Runtime.evaluate { expression:"location.href", returnByValue:true }`
-  before assuming failure — a client-side route change may have already happened without a full
-  load.
+- The last action's status header shows the landed URL/title — a client-side route change may
+  already have happened without a full load. To poll later without acting: `cdp Runtime.evaluate
+  { expression:"location.href", returnByValue:true }`.
 
 ## Screenshot is blank/stale on a background tab
 - CDP screenshots a background tab can be stale. `tab_activate` it briefly, or rely on `read_page`

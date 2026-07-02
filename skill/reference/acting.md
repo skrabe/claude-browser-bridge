@@ -15,15 +15,15 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
 - **`scroll`** — scroll the page or a container by a delta, or to bring a ref into view.
 - **`hover`** — move the pointer over a ref to reveal hover-only controls (a card's CTA, a
   hover menu), then act on what appears.
-- **`drag`** — drag from one point/ref to another (sliders, reordering, canvas).
+- **`drag`** — drag from one point/ref to another (sliders, reordering, canvas). Raw mouse events:
+  HTML5-`draggable` widgets may not respond; verify the drop landed.
 
 ## Rules
-- **Verify the target is unique before acting** (see `finding-elements.md`). One element only.
+- **One unique target before acting** (see `finding-elements.md`).
 - **Don't assume every click navigates.** Opening a menu/filter changes UI state, not the page —
   wait for the expected element to appear, not for a page load.
 - **After acting, observe only if the next decision needs it** (see `interaction-loop.md`).
   A fill/type often needs no re-read; a submit needs a state check.
-- **Don't add explicit timeouts** to routine click/fill/select unless the target is known slow.
 - If you already know the destination URL and no click side-effect matters, prefer `navigate`
   over a brittle click.
 - After a checkbox/radio `click` reports hidden/no-change, click its scoped visible `label[for]`

@@ -4,14 +4,16 @@ Never act on an element you haven't located and confirmed. Acting blind (guessed
 guessed selectors) is the top cause of wrong clicks.
 
 ## How to locate
-- **`read_page`** — returns the accessibility tree with a stable **ref** per interactable
-  element (role + accessible name + ref). This is the primary way to target: read it, pick the
-  element by role/name, act on it by `ref`. Robust across layout changes.
-- **`dom_query`** — run a CSS selector, get back the matches (count + a ref/box each). Use when
+- **`read_page`** — the accessibility tree with a stable **ref** per interactable element (role +
+  accessible name). Primary way to target: read it, pick by role/name, act by `ref`. Robust across
+  layout changes (capped at ~500 elements — on a huge page, narrow with `dom_query`/`find_text`
+  before concluding a target is absent).
+- **`dom_query`** — run a CSS selector, get back the matches (count + a ref & attrs each). Use when
   you know a stable selector and want to confirm uniqueness.
-- **`find`** — natural-language element match ("the blue Subscribe button in the header") when
-  role/name/selector aren't obvious. Slower (it reasons over the page); prefer `read_page`/
-  `dom_query` when you can name the element.
+- **`find`** — keyword match over the a11y tree (role + accessible name); returns ≤10 ranked
+  candidate refs. Query with the element's *label words* ("subscribe newsletter"), never visual
+  descriptions ("the blue button in the header" — color/position match nothing). Cheap but
+  context-free: confirm the winner is the right element before acting.
 
 ## Uniqueness — the hard rule
 Before any click/fill/select, confirm the target resolves to **exactly one** element:
@@ -22,15 +24,11 @@ Before any click/fill/select, confirm the target resolves to **exactly one** ele
   - **count >1** → ambiguous. Scope to the right container or a stronger attribute. **Never**
     just take the first match.
 
-## Selector stability ladder
-Prefer the most durable contract, in order:
-1. `data-testid`
-2. other stable `data-*`
-3. stable `href` (exact/strong match, not broad substring)
-4. ARIA role + accessible name (string, not regex)
-5. scoped visible text
-6. scoped CSS
-7. an element `ref` from `read_page` (when no stable selector exists)
+## Selector durability ladder
+Refs from the current snapshot are how you act. When you need a re-findable `dom_query` selector
+(retries, re-observation), prefer the most durable contract, in order:
+1. `data-testid`  2. other stable `data-*`  3. stable `href` (exact/strong match)
+4. ARIA role + accessible name (string, not regex)  5. scoped visible text  6. scoped CSS
 
 ## Ambiguity to expect
 Generic labels (`Menu`, `Close`, `Search`, `Add to cart`, size letters `S/M/L`, `Sort by`) and
