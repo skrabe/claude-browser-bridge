@@ -13,7 +13,10 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const SOCK = `${os.tmpdir()}/claude-browser-bridge-${os.userInfo().username}.sock`;
+// Fixed /tmp path (symlink to /private/tmp) so the browser-spawned native host and the
+// Claude-spawned MCP server always rendezvous — os.tmpdir() is $TMPDIR-dependent and can
+// differ between the two processes.
+const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 // ---- framing (4-byte LE length + UTF-8 JSON) ----
 function encode(obj) {
