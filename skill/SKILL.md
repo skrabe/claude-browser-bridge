@@ -1,5 +1,5 @@
 ---
-name: browser-navigation
+name: browser
 description: >
   Drive the user's real, logged-in browser from Claude Code via the claude-browser MCP
   tools. Use for ANY web interaction: reading pages, filling forms, clicking through flows,
