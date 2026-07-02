@@ -1,9 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Claude Browser Bridge",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Let Claude Code drive your real, logged-in browser tabs via CDP (Codex-style hands, owned).",
-  "background": { "service_worker": "background.js" },
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": [
     "debugger",
     "tabs",
@@ -12,6 +14,11 @@
     "nativeMessaging",
     "storage"
   ],
-  "host_permissions": ["<all_urls>"],
-  "action": { "default_title": "Claude Browser Bridge" }
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "Claude Browser Bridge"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwU2JoTePQJcyVOR+IU5Fb6KRLuVwN6D2UzhkPoz9BW9jPr0po5QxLfNao0zkxdYZEq+gdagxsTSPu8wwnxIZ5d9ODFkOgDcg9ab10lN/5RUgq3qq8O+2cfegWukyz7oUgUecX6pFbl40CGWeqq1/2YPtNjL9wL3CdiBwx8cuchdU1pcmipwG3HRF5yNyro8ubkpBdl9aOPDr0OyTbjW79yNzKVeJSKOJpj5omuauTklpfKMw04ShJ+4vLKhj3FNoeKTaj8DW6VR70UsZUXSg0gllMee2hEWUT/4mFxozyiYrKe5VisOx+qyHmVrF5mRd/QwTem5jfA+8rsZ5sjhoHwIDAQAB"
 }
