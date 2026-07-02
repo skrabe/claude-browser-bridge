@@ -4,8 +4,21 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 let port = null;
+
+// Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
+// its absolute path to Read in Claude Code.
+const downloads = new Map(); // id -> { id, url, filename, state, ts }
+try {
+  chrome.downloads.onCreated.addListener((d) => downloads.set(d.id, { id: d.id, url: d.url, filename: d.filename || '', state: d.state || 'in_progress', ts: Date.now() }));
+  chrome.downloads.onChanged.addListener((delta) => {
+    const e = downloads.get(delta.id) || { id: delta.id, url: '', filename: '', ts: Date.now() };
+    if (delta.filename) e.filename = delta.filename.current;
+    if (delta.state) { e.state = delta.state.current; e.ts = Date.now(); }
+    downloads.set(delta.id, e);
+  });
+} catch {}
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
 const state = new Map();
@@ -461,6 +474,24 @@ async function dispatch(method, p) {
         else if (p.state === 'networkidle') { if (s.lastRequestTs && Date.now() - s.lastRequestTs > 500) return { ok: true, matched: 'networkidle' }; }
         else { if ((await ev('document.readyState')) === 'complete') return { ok: true, matched: 'load' }; }
         await new Promise((res) => setTimeout(res, 120));
+      }
+      return { ok: false, timedOut: true };
+    }
+
+    case 'listDownloads': { return { downloads: [...downloads.values()].sort((a, b) => b.ts - a.ts).slice(0, p.limit || 10) }; }
+    case 'waitDownload': {
+      // Wait for a download to COMPLETE (one triggered by the action you just took). Returns its
+      // absolute path so Claude Code can Read it. Ignores downloads already complete before now.
+      const deadline = Date.now() + Math.min(p.timeoutMs || 30000, 120000);
+      const seen = new Set([...downloads.values()].filter((d) => d.state === 'complete').map((d) => d.id));
+      while (Date.now() < deadline) {
+        const done = [...downloads.values()].filter((d) => d.state === 'complete' && !seen.has(d.id)).sort((a, b) => b.ts - a.ts)[0];
+        if (done) {
+          let path = done.filename, bytes;
+          try { const res = await chrome.downloads.search({ id: done.id }); if (res?.[0]) { path = res[0].filename; bytes = res[0].fileSize; } } catch {}
+          return { ok: true, path, url: done.url, ...(bytes != null ? { bytes } : {}) };
+        }
+        await new Promise((res) => setTimeout(res, 200));
       }
       return { ok: false, timedOut: true };
     }
