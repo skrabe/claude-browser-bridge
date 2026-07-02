@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -20,13 +20,17 @@ try {
   });
 } catch {}
 
-// per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
+// per controlled tab: refs: Map<ref, {backendNodeId, sessionId}>, seq, console, network,
+// frames: Map<sessionId, {parentSession, ownerBackendNodeId, url}> for cross-origin (OOPIF) frames.
 const state = new Map();
 function st(tabId) {
   let s = state.get(tabId);
-  if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set() }; state.set(tabId, s); }
+  if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set(), frames: new Map() }; state.set(tabId, s); }
   return s;
 }
+// Route a CDP command to a tab (number) or a specific frame session ({tabId, sessionId}). Chrome 125+
+// flat sessions: sendCommand takes {tabId, sessionId} to address an out-of-process child frame.
+const dbgOf = (tabId, sessionId) => (sessionId ? { tabId, sessionId } : tabId);
 
 function connect() {
   if (port) return; // one native-messaging connection only — never spawn a second host
@@ -62,9 +66,11 @@ async function onMessage(m) {
 }
 
 // ---- low-level CDP ----
-function cmd(tabId, method, params = {}) {
+// target: a tabId (number) → {tabId}, or a debuggee object {tabId, sessionId} for a child frame.
+function cmd(target, method, params = {}) {
+  const dbg = typeof target === 'number' ? { tabId: target } : target;
   return new Promise((res, rej) => {
-    chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+    chrome.debugger.sendCommand(dbg, method, params, (result) => {
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
@@ -87,6 +93,9 @@ function attach(tabId) {
         for (const d of ['Page', 'DOM', 'Runtime', 'Accessibility', 'Network', 'Log']) {
           await cmd(tabId, d + '.enable').catch(() => {});
         }
+        // Reach into cross-origin (out-of-process) iframes. Chrome 125+ flat sessions; older Chrome
+        // just no-ops here and we stay main-frame-only.
+        await cmd(tabId, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe', exclude: false }] }).catch(() => {});
       } catch {}
       res();
     });
@@ -102,21 +111,40 @@ function detach(tabId) {
 async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId); }
 
 // ---- ref resolution ----
-async function boxCenter(tabId, backendNodeId) {
-  await cmd(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
-  const { model } = await cmd(tabId, 'DOM.getBoxModel', { backendNodeId });
-  const q = model.content; // [x1,y1,x2,y2,x3,y3,x4,y4]
-  return { x: (q[0] + q[2] + q[4] + q[6]) / 4, y: (q[1] + q[3] + q[5] + q[7]) / 4 };
+function refNode(tabId, ref) {
+  const n = st(tabId).refs.get(ref);
+  if (n == null) throw new Error(`unknown ref "${ref}" — take a fresh read_page/dom_query`);
+  return n; // { backendNodeId, sessionId }
 }
-async function objectFor(tabId, backendNodeId) {
-  const { object } = await cmd(tabId, 'DOM.resolveNode', { backendNodeId });
+async function objectFor(dbg, backendNodeId) {
+  const { object } = await cmd(dbg, 'DOM.resolveNode', { backendNodeId });
   return object.objectId;
 }
-function refBackend(tabId, ref) {
-  const b = st(tabId).refs.get(ref);
-  if (b == null) throw new Error(`unknown ref "${ref}" — take a fresh read_page/dom_query`);
-  return b;
+// Accumulated top-left offset of a frame chain, in top-level viewport CSS px. In a real
+// (non-headless) browser DOM.getBoxModel returns FRAME-LOCAL coords, so an OOPIF element's viewport
+// position = its local box + each ancestor <iframe> owner's content-box origin, walked to the top.
+async function frameOffset(tabId, sessionId) {
+  let ox = 0, oy = 0, sid = sessionId; const s = st(tabId); const guard = new Set();
+  while (sid && !guard.has(sid)) {
+    guard.add(sid);
+    const fr = s.frames.get(sid);
+    if (!fr || fr.ownerBackendNodeId == null || !fr.parentSession) break;
+    try { const { model } = await cmd(fr.parentSession, 'DOM.getBoxModel', { backendNodeId: fr.ownerBackendNodeId }); ox += model.content[0]; oy += model.content[1]; }
+    catch { break; }
+    sid = fr.parentSession.sessionId; // undefined at the main frame → stop
+  }
+  return { ox, oy };
 }
+// Center of a ref in top-level viewport coords (translates through any OOPIF chain).
+async function absCenter(tabId, backendNodeId, sessionId) {
+  const dbg = dbgOf(tabId, sessionId);
+  await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+  const { model } = await cmd(dbg, 'DOM.getBoxModel', { backendNodeId });
+  const q = model.content;
+  const { ox, oy } = sessionId ? await frameOffset(tabId, sessionId) : { ox: 0, oy: 0 };
+  return { x: (q[0] + q[2] + q[4] + q[6]) / 4 + ox, y: (q[1] + q[3] + q[5] + q[7]) / 4 + oy };
+}
+async function refPoint(tabId, ref) { const { backendNodeId, sessionId } = refNode(tabId, ref); return absCenter(tabId, backendNodeId, sessionId); }
 
 // ---- key map for press_key ----
 const KEYS = {
@@ -237,23 +265,26 @@ async function dispatch(method, p) {
     case 'readPage': {
       await need(p.tabId);
       const s = st(p.tabId); s.refs.clear(); // fresh snapshot; seq stays monotonic so stale ids error, never re-alias
-      const { nodes } = await cmd(p.tabId, 'Accessibility.getFullAXTree', {});
       const lines = [];
-      for (const n of nodes) {
-        if (n.ignored) continue;
-        const role = n.role?.value; if (!role || role === 'none' || role === 'generic') continue;
-        const name = (n.name?.value || '').trim();
-        const interactive = INTERACTIVE.has(role);
-        if (!interactive && !name) continue;
-        let ref = null;
-        if (n.backendDOMNodeId != null && (interactive || name)) {
-          ref = 'e' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
+      outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
+        let nodes;
+        try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+        for (const n of nodes) {
+          if (n.ignored) continue;
+          const role = n.role?.value; if (!role || role === 'none' || role === 'generic') continue;
+          const name = (n.name?.value || '').trim();
+          const interactive = INTERACTIVE.has(role);
+          if (!interactive && !name) continue;
+          let ref = null;
+          if (n.backendDOMNodeId != null && (interactive || name)) {
+            ref = 'e' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
+          }
+          const val = n.value?.value;
+          lines.push({ ref, role, name: cleanName(name).slice(0, 160), ...(val != null ? { value: String(val).slice(0, 80) } : {}), ...(sessionId ? { frame: true } : {}) });
+          if (lines.length >= 500) break outer;
         }
-        const val = n.value?.value;
-        lines.push({ ref, role, name: cleanName(name).slice(0, 160), ...(val != null ? { value: String(val).slice(0, 80) } : {}) });
-        if (lines.length >= 500) break;
       }
-      return { url: (await chrome.tabs.get(p.tabId)).url, count: lines.length, elements: lines };
+      return { url: (await chrome.tabs.get(p.tabId)).url, count: lines.length, elements: lines, ...(s.frames.size ? { frames: s.frames.size } : {}) };
     }
 
     case 'readText': {
@@ -272,7 +303,7 @@ async function dispatch(method, p) {
       for (const nodeId of nodeIds.slice(0, limit)) {
         let desc; try { desc = (await cmd(p.tabId, 'DOM.describeNode', { nodeId })).node; } catch { continue; }
         const backendNodeId = desc.backendNodeId;
-        const ref = 'q' + (++s.seq); s.refs.set(ref, backendNodeId);
+        const ref = 'q' + (++s.seq); s.refs.set(ref, { backendNodeId, sessionId: undefined });
         const attrs = {}; const a = desc.attributes || [];
         for (let i = 0; i < a.length; i += 2) attrs[a[i]] = a[i + 1];
         matches.push({ ref, tag: (desc.nodeName || '').toLowerCase(), href: attrs.href, id: attrs.id, class: attrs.class });
@@ -281,23 +312,26 @@ async function dispatch(method, p) {
     }
 
     case 'find': {
-      // heuristic over the a11y tree: rank interactive nodes by fuzzy match on name/role
+      // heuristic over the a11y tree (main + cross-origin frames): rank interactive nodes by fuzzy match
       await need(p.tabId);
       const s = st(p.tabId); // append 'f' refs with a monotonic seq — never clobber read_page's 'e' refs
-      const { nodes } = await cmd(p.tabId, 'Accessibility.getFullAXTree', {});
       const q = String(p.query || '').toLowerCase();
       const terms = q.split(/\s+/).filter(Boolean);
       const scored = [];
-      for (const n of nodes) {
-        if (n.ignored || n.backendDOMNodeId == null) continue;
-        const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
-        if (!INTERACTIVE.has(role) && !name) continue;
-        const hay = (role + ' ' + name).toLowerCase();
-        let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
-        if (name && q.includes(name.toLowerCase())) score += 5;
-        if (score <= 0) continue;
-        const ref = 'f' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
-        scored.push({ ref, role, name: cleanName(name).slice(0, 160), score });
+      for (const sessionId of [undefined, ...s.frames.keys()]) {
+        let nodes;
+        try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+        for (const n of nodes) {
+          if (n.ignored || n.backendDOMNodeId == null) continue;
+          const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
+          if (!INTERACTIVE.has(role) && !name) continue;
+          const hay = (role + ' ' + name).toLowerCase();
+          let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
+          if (name && q.includes(name.toLowerCase())) score += 5;
+          if (score <= 0) continue;
+          const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
+          scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, ...(sessionId ? { frame: true } : {}) });
+        }
       }
       scored.sort((a, b) => b.score - a.score);
       return { candidates: scored.slice(0, 10).map(({ score, ...c }) => c) };
@@ -306,7 +340,7 @@ async function dispatch(method, p) {
     case 'click': {
       await need(p.tabId);
       let x = p.x, y = p.y;
-      if (p.ref != null) { const c = await boxCenter(p.tabId, refBackend(p.tabId, p.ref)); x = c.x; y = c.y; }
+      if (p.ref != null) { const c = await refPoint(p.tabId, p.ref); x = c.x; y = c.y; }
       if (x == null || y == null) throw new Error('click needs a ref or {x,y}');
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }); // settle :hover before pressing
@@ -319,8 +353,10 @@ async function dispatch(method, p) {
 
     case 'fill': {
       await need(p.tabId);
-      const objectId = await objectFor(p.tabId, refBackend(p.tabId, p.ref));
-      await cmd(p.tabId, 'Runtime.callFunctionOn', {
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const dbg = dbgOf(p.tabId, sessionId);
+      const objectId = await objectFor(dbg, backendNodeId);
+      await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId,
         functionDeclaration: 'function(v){this.focus&&this.focus();const p=Object.getOwnPropertyDescriptor(this.__proto__,"value");if(p&&p.set)p.set.call(this,v);else this.value=v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));}',
         arguments: [{ value: String(p.value ?? '') }],
@@ -348,15 +384,17 @@ async function dispatch(method, p) {
     }
     case 'scroll': {
       await need(p.tabId);
-      if (p.ref != null) { const b = refBackend(p.tabId, p.ref); await cmd(p.tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: b }); return { ok: true }; }
+      if (p.ref != null) { const { backendNodeId, sessionId } = refNode(p.tabId, p.ref); await cmd(dbgOf(p.tabId, sessionId), 'DOM.scrollIntoViewIfNeeded', { backendNodeId }); return { ok: true }; }
       const x = p.x ?? 100, y = p.y ?? 100;
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: p.dx || 0, deltaY: p.dy || 300 });
       return { ok: true };
     }
     case 'selectOption': {
       await need(p.tabId);
-      const objectId = await objectFor(p.tabId, refBackend(p.tabId, p.ref));
-      const r = await cmd(p.tabId, 'Runtime.callFunctionOn', {
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const dbg = dbgOf(p.tabId, sessionId);
+      const objectId = await objectFor(dbg, backendNodeId);
+      const r = await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId,
         // match by option value OR visible label/text (doctrine advertises both)
         functionDeclaration: 'function(v){const o=[...(this.options||[])];const m=o.find(x=>x.value===v)||o.find(x=>(x.label||x.text||x.textContent||"").trim()===v);this.value=m?m.value:v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));return !!m;}',
@@ -367,8 +405,8 @@ async function dispatch(method, p) {
     }
     case 'drag': {
       await need(p.tabId);
-      const from = p.fromRef != null ? await boxCenter(p.tabId, refBackend(p.tabId, p.fromRef)) : { x: p.fromX, y: p.fromY };
-      const to = p.toRef != null ? await boxCenter(p.tabId, refBackend(p.tabId, p.toRef)) : { x: p.toX, y: p.toY };
+      const from = p.fromRef != null ? await refPoint(p.tabId, p.fromRef) : { x: p.fromX, y: p.fromY };
+      const to = p.toRef != null ? await refPoint(p.tabId, p.toRef) : { x: p.toX, y: p.toY };
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'left' });
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
@@ -379,12 +417,14 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const opts = { format: 'png' };
       if (p.ref != null) { // just this element
-        const b = refBackend(p.tabId, p.ref);
-        await cmd(p.tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: b }).catch(() => {});
-        const { model } = await cmd(p.tabId, 'DOM.getBoxModel', { backendNodeId: b });
+        const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+        const dbg = dbgOf(p.tabId, sessionId);
+        await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+        const { model } = await cmd(dbg, 'DOM.getBoxModel', { backendNodeId });
         const q = model.border, xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
-        const x = Math.min(...xs), y = Math.min(...ys);
-        opts.clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: 1 };
+        const { ox, oy } = sessionId ? await frameOffset(p.tabId, sessionId) : { ox: 0, oy: 0 };
+        const x0 = Math.min(...xs), y0 = Math.min(...ys);
+        opts.clip = { x: x0 + ox, y: y0 + oy, width: Math.max(...xs) - x0, height: Math.max(...ys) - y0, scale: 1 };
       } else if (p.fullPage) { // whole scrollable page, not just the viewport
         opts.captureBeyondViewport = true;
         const m = await cmd(p.tabId, 'Page.getLayoutMetrics').catch(() => ({}));
@@ -417,7 +457,7 @@ async function dispatch(method, p) {
 
     case 'hover': {
       await need(p.tabId);
-      const c = await boxCenter(p.tabId, refBackend(p.tabId, p.ref));
+      const c = await refPoint(p.tabId, p.ref);
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: c.x, y: c.y });
       return { ok: true };
     }
@@ -444,9 +484,9 @@ async function dispatch(method, p) {
 
     case 'setFiles': {
       await need(p.tabId);
-      const backendNodeId = refBackend(p.tabId, p.ref);
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
       const files = Array.isArray(p.paths) ? p.paths : [p.paths];
-      await cmd(p.tabId, 'DOM.setFileInputFiles', { files, backendNodeId });
+      await cmd(dbgOf(p.tabId, sessionId), 'DOM.setFileInputFiles', { files, backendNodeId });
       return { ok: true, files };
     }
 
@@ -526,6 +566,22 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     s.dialog = null;
   } else if (cdpMethod === 'Page.loadEventFired') {
     s.lastLoadTs = Date.now();
+  } else if (cdpMethod === 'Target.attachedToTarget') {
+    // A cross-origin child frame attached. Enable its domains, resolve its owner <iframe> in the
+    // parent (needed for coordinate translation), and recurse auto-attach for nested frames.
+    const child = { tabId, sessionId: cdpParams.sessionId };
+    (async () => {
+      for (const d of ['DOM', 'Runtime', 'Accessibility', 'Page']) await cmd(child, d + '.enable').catch(() => {});
+      let ownerBackendNodeId = null;
+      try {
+        const frameId = (await cmd(child, 'Page.getFrameTree'))?.frameTree?.frame?.id;
+        if (frameId) ownerBackendNodeId = (await cmd(source, 'DOM.getFrameOwner', { frameId }))?.backendNodeId ?? null;
+      } catch {}
+      s.frames.set(cdpParams.sessionId, { parentSession: source, ownerBackendNodeId, url: cdpParams.targetInfo?.url });
+      await cmd(child, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe', exclude: false }] }).catch(() => {});
+    })();
+  } else if (cdpMethod === 'Target.detachedFromTarget') {
+    s.frames.delete(cdpParams.sessionId);
   }
 });
 chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) state.delete(source.tabId); });

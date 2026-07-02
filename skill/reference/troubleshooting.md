@@ -43,7 +43,11 @@ The native host is spawned by the browser when the extension connects. If a tool
   accessible names, treat that as **still loading**, not empty/wrong — re-read once after a beat
   before concluding there's no content or switching strategy.
 
-## Target lives in a cross-origin iframe
-- `read_page`/`dom_query` see the top document only — a target inside a cross-origin (out-of-
-  process) iframe won't appear, and that's a real structural limit, not a bad selector. Fall back
-  to a `screenshot` + coordinate `click`, or scope a `cdp` call to that frame's own context.
+## Cross-origin iframes
+- `read_page` and `find` **do** see into cross-origin (out-of-process) iframes now — those
+  elements come back tagged `frame:true`, and `click`/`fill`/`type_text`/`select_option` on their
+  refs work (clicks are coordinate-translated through the frame chain). Payment widgets (Stripe),
+  auth frames, and embedded editors are reachable.
+- `dom_query` is still **top-document only** (a CSS selector can't cross an origin boundary) — use
+  `read_page`/`find` to target inside a frame.
+- If a frame just loaded, its elements may lag one `read_page` — `wait_for` or a second read.
