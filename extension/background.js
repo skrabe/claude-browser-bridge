@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 let port = null;
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
@@ -26,6 +26,15 @@ function connect() {
   });
 }
 connect();
+
+// Self-heal: MV3 service workers go dormant, so a failed/dropped native-messaging port can get
+// stuck. Reconnect on startup/install and via a periodic alarm that wakes the worker.
+try { chrome.runtime.onStartup.addListener(() => connect()); } catch {}
+try { chrome.runtime.onInstalled.addListener(() => connect()); } catch {}
+try {
+  chrome.alarms.create('cbb-reconnect', { periodInMinutes: 0.5 });
+  chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'cbb-reconnect' && !port) connect(); });
+} catch {}
 
 function reply(id, result, error) {
   if (!port || id === undefined) return;
