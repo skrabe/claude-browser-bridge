@@ -63,7 +63,10 @@ function install(opts) {
   const scope = opts.scope || 'global';
   const extId = extensionId();
   const node = process.execPath;
-  const browsers = (opts.browsers || detectedBrowsers());
+  // Always register with EVERY detected Chromium browser. Some (notably Brave) read
+  // native-messaging manifests from Chrome's directory, not their own — so writing only to
+  // the "selected" browser silently breaks discovery. The manifest is inert where unused.
+  const browsers = detectedBrowsers();
   if (browsers.length === 0) throw new Error('no Chromium-family browser found');
 
   // 1) native-host wrapper (absolute node + bridge path)
