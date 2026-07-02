@@ -39,6 +39,9 @@ The native host is spawned by the browser when the extension connects. If a tool
   (especially after asking the user to sign in) means **unknown** — not proof it succeeded, not
   proof it failed. Re-observe (`read_page` or `screenshot`) before deciding either way; don't
   assume success and move on, and don't assume failure and retry a destructive action.
+- If a `read_page` right after a nav/action returns very few elements, or elements with no
+  accessible names, treat that as **still loading**, not empty/wrong — re-read once after a beat
+  before concluding there's no content or switching strategy.
 
 ## Target lives in a cross-origin iframe
 - `read_page`/`dom_query` see the top document only — a target inside a cross-origin (out-of-

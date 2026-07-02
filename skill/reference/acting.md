@@ -13,6 +13,8 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
   it.
 - **`select_option`** — choose an option in a `<select>` by value/label.
 - **`scroll`** — scroll the page or a container by a delta, or to bring a ref into view.
+- **`hover`** — move the pointer over a ref to reveal hover-only controls (a card's CTA, a
+  hover menu), then act on what appears.
 - **`drag`** — drag from one point/ref to another (sliders, reordering, canvas).
 
 ## Rules
@@ -26,3 +28,22 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
   over a brittle click.
 - After a checkbox/radio `click` reports hidden/no-change, click its scoped visible `label[for]`
   or enclosing control once, then verify checked state — don't hammer the hidden input.
+
+## Choice controls
+- Target radio/checkbox/`select` options by their **exact rendered label** — never a paraphrase
+  ("I am not a protected veteran" is not "No"). Map yes/no-shaped data straight onto the matching
+  exact-text option; never invert it.
+- A real `<select>` is one step. A **custom** listbox/combobox (styled `div`/`button`,
+  `role=listbox`/`combobox`) is two: `click` to open (its options often aren't in the DOM, or
+  render into a portal, until opened), re-observe, then `click` the option. A placeholder
+  ("Select…", "—") or a loading row means *not ready yet* — wait/re-observe, don't select it.
+- After filling a search/autocomplete field, check for a suggestions dropdown before moving on —
+  many sites want an explicit pick (`click` the option, or `press_key Escape`) rather than the raw
+  typed text. This is the one fill that *does* need a follow-up check.
+- Split OTP/verification-code input: focus the first box and `type_text` the **whole** code once
+  before falling back to one `fill` per box — most auto-advance focus per keystroke.
+
+## Scrolling
+- If a page-level `scroll` does nothing, the content is likely in its own scrollable sub-panel
+  (modal body, side filter, embedded list/chat log) — target `scroll` at a **ref inside that
+  container** instead of the page.

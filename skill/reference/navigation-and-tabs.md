@@ -37,3 +37,9 @@ You're driving the user's real browser. Tabs are theirs — treat them with care
 ## Multi-window
 - `tabs_list` spans all windows (each tab carries its `windowId` and, if any, `tabGroup`). Use
   the window/group to disambiguate which of several similar tabs is the right one.
+
+## State across navigation
+- After a transition you didn't cause (a redirect after submit, an unexpected reload), re-verify
+  fields you filled earlier are still populated before continuing — don't assume they held.
+- Before deliberately leaving a page, capture anything a later step needs (a confirmation number,
+  the current sort/filter, an extracted value) — going back may not reproduce the same state.
