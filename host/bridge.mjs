@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.2';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -53,6 +53,10 @@ function runNativeHost() {
     }));
     client.on('close', () => eventClients.delete(client));
     client.on('error', () => {});
+  });
+  server.on('error', (e) => {
+    // Stale socket from a crashed prior host, or a race: clear it and retry once.
+    if (e && e.code === 'EADDRINUSE') { try { fs.unlinkSync(SOCK); } catch {} setTimeout(() => { try { server.listen(SOCK); } catch {} }, 100); }
   });
   const um = process.umask(0o177);
   server.listen(SOCK, () => process.umask(um));
