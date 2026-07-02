@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 let port = null;
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
@@ -149,7 +149,7 @@ async function downscaleImage(b64) {
 // Actions that change page/UI state — attach a cheap status header (post-action url/title + new
 // console error/warning counts) so the model can often skip a follow-up read_page. Best-effort:
 // a failure here never affects the action's own result.
-const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'drag', 'navigate', 'reload', 'hover']);
+const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'drag', 'navigate', 'reload', 'hover', 'goBack', 'goForward', 'setFiles', 'handleDialog']);
 async function handle(method, p) {
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
@@ -161,7 +161,8 @@ async function handle(method, p) {
       const fresh = state.get(tabId)?.console.slice(before) || [];
       const errs = fresh.filter((m) => m.level === 'error').length;
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
-      result.status = { url: tab.url, title: tab.title, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}) };
+      const dialog = state.get(tabId)?.dialog;
+      result.status = { url: tab.url, title: tab.title, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
   return result;
@@ -196,6 +197,7 @@ async function dispatch(method, p) {
     case 'createTab': {
       const tab = await chrome.tabs.create({ url: p.url || 'about:blank', active: !!p.active });
       await attach(tab.id);
+      st(tab.id).createdByAgent = true; // tab_close may only close tabs the agent opened
       return { id: tab.id, url: tab.url };
     }
     case 'activateTab': { const t = await chrome.tabs.get(p.tabId); await chrome.windows.update(t.windowId, { focused: true }); await chrome.tabs.update(p.tabId, { active: true }); return { ok: true }; }
@@ -208,6 +210,14 @@ async function dispatch(method, p) {
       const cur = (await chrome.tabs.get(p.tabId)).url;
       if (cur === p.url) return { ok: true, skipped: 'already on url' };
       await cmd(p.tabId, 'Page.navigate', { url: p.url });
+      if (p.waitUntil !== 'none') { // settle so the next read isn't racing the load
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+          const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({}));
+          if (r.result?.value === 'complete') break;
+          await new Promise((res) => setTimeout(res, 120));
+        }
+      }
       return { ok: true };
     }
 
@@ -285,8 +295,12 @@ async function dispatch(method, p) {
       let x = p.x, y = p.y;
       if (p.ref != null) { const c = await boxCenter(p.tabId, refBackend(p.tabId, p.ref)); x = c.x; y = c.y; }
       if (x == null || y == null) throw new Error('click needs a ref or {x,y}');
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+      const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
+      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }); // settle :hover before pressing
+      for (const clickCount of (p.double ? [1, 2] : [1])) {
+        await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount });
+        await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount });
+      }
       return { ok: true };
     }
 
@@ -311,7 +325,11 @@ async function dispatch(method, p) {
       const k = KEYS[base] || (base.length === 1
         ? { key: base, code: 'Key' + base.toUpperCase(), windowsVirtualKeyCode: base.toUpperCase().charCodeAt(0) }
         : { key: base, code: base, windowsVirtualKeyCode: 0 });
-      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k });
+      // A printable key with no Alt/Ctrl/Meta must carry `text`, or CDP fires the event without
+      // inserting the character (a chord like Ctrl+A intentionally omits text — it's a shortcut).
+      const printable = base.length === 1 && !(modifiers & (1 | 2 | 4));
+      const textField = printable ? { text: base } : {};
+      await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k, ...textField });
       await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...k });
       return { ok: true };
     }
@@ -346,7 +364,21 @@ async function dispatch(method, p) {
 
     case 'screenshot': {
       await need(p.tabId);
-      const r = await cmd(p.tabId, 'Page.captureScreenshot', { format: 'png' });
+      const opts = { format: 'png' };
+      if (p.ref != null) { // just this element
+        const b = refBackend(p.tabId, p.ref);
+        await cmd(p.tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: b }).catch(() => {});
+        const { model } = await cmd(p.tabId, 'DOM.getBoxModel', { backendNodeId: b });
+        const q = model.border, xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+        const x = Math.min(...xs), y = Math.min(...ys);
+        opts.clip = { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y, scale: 1 };
+      } else if (p.fullPage) { // whole scrollable page, not just the viewport
+        opts.captureBeyondViewport = true;
+        const m = await cmd(p.tabId, 'Page.getLayoutMetrics').catch(() => ({}));
+        const cs = m.cssContentSize || m.contentSize;
+        if (cs) opts.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 };
+      }
+      const r = await cmd(p.tabId, 'Page.captureScreenshot', opts);
       let data = r.data;
       try { data = await downscaleImage(r.data); } catch { data = r.data; } // fall back to raw on any decode/resize failure
       return { __image: data, mimeType: 'image/png' };
@@ -380,6 +412,59 @@ async function dispatch(method, p) {
     case 'readConsole': { const s = st(p.tabId); const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = []; return { messages: out }; }
     case 'readNetwork': { const s = st(p.tabId); const out = [...s.network.values()].slice(-(p.limit || 50)); if (p.clear) s.network.clear(); return { requests: out }; }
 
+    case 'getNetworkBody': {
+      await need(p.tabId);
+      const r = await cmd(p.tabId, 'Network.getResponseBody', { requestId: p.requestId });
+      let body = r.body || '';
+      const full = body.length;
+      const cap = p.limit || 20000;
+      if (body.length > cap) body = body.slice(0, cap);
+      return { body, base64Encoded: !!r.base64Encoded, truncated: full > cap, length: full };
+    }
+
+    case 'handleDialog': {
+      await need(p.tabId);
+      await cmd(p.tabId, 'Page.handleJavaScriptDialog', { accept: p.accept !== false, ...(p.promptText != null ? { promptText: String(p.promptText) } : {}) });
+      st(p.tabId).dialog = null;
+      return { ok: true };
+    }
+
+    case 'setFiles': {
+      await need(p.tabId);
+      const backendNodeId = refBackend(p.tabId, p.ref);
+      const files = Array.isArray(p.paths) ? p.paths : [p.paths];
+      await cmd(p.tabId, 'DOM.setFileInputFiles', { files, backendNodeId });
+      return { ok: true, files };
+    }
+
+    case 'closeAgentTab': {
+      const s = state.get(p.tabId);
+      if (!s?.createdByAgent) throw new Error('refusing to close a tab the agent did not open — use tab_release to hand it back');
+      await detach(p.tabId).catch(() => {});
+      await chrome.tabs.remove(p.tabId);
+      return { ok: true, closed: p.tabId };
+    }
+
+    case 'goBack': { await need(p.tabId); await cmd(p.tabId, 'Runtime.evaluate', { expression: 'history.back()' }); return { ok: true }; }
+    case 'goForward': { await need(p.tabId); await cmd(p.tabId, 'Runtime.evaluate', { expression: 'history.forward()' }); return { ok: true }; }
+
+    case 'waitFor': {
+      await need(p.tabId);
+      const deadline = Date.now() + Math.min(p.timeoutMs || 10000, 25000); // under the 30s host timeout
+      const s = st(p.tabId);
+      const ev = (expr) => cmd(p.tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true }).then((r) => r.result?.value).catch(() => undefined);
+      while (Date.now() < deadline) {
+        if (p.selector) { if (await ev(`!!document.querySelector(${JSON.stringify(p.selector)})`)) return { ok: true, matched: 'selector' }; }
+        else if (p.textGone != null) { if (await ev(`!(document.body?.innerText||'').includes(${JSON.stringify(p.textGone)})`)) return { ok: true, matched: 'textGone' }; }
+        else if (p.text != null) { if (await ev(`(document.body?.innerText||'').includes(${JSON.stringify(p.text)})`)) return { ok: true, matched: 'text' }; }
+        else if (p.urlIncludes != null) { const t = await chrome.tabs.get(p.tabId); if ((t.url || '').includes(p.urlIncludes)) return { ok: true, matched: 'url', url: t.url }; }
+        else if (p.state === 'networkidle') { if (s.lastRequestTs && Date.now() - s.lastRequestTs > 500) return { ok: true, matched: 'networkidle' }; }
+        else { if ((await ev('document.readyState')) === 'complete') return { ok: true, matched: 'load' }; }
+        await new Promise((res) => setTimeout(res, 120));
+      }
+      return { ok: false, timedOut: true };
+    }
+
     case 'executeCdp': { await need(p.tabId); return await cmd(p.tabId, p.cdpMethod, p.cdpParams || {}); }
 
     default: throw new Error('unknown method: ' + method);
@@ -397,9 +482,19 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     s.console.push({ level: 'error', text: cdpParams.exceptionDetails?.exception?.description || cdpParams.exceptionDetails?.text || 'exception' });
     if (s.console.length > 500) s.console.shift();
   } else if (cdpMethod === 'Network.requestWillBeSent') {
-    s.network.set(cdpParams.requestId, { url: cdpParams.request?.url, method: cdpParams.request?.method });
+    s.network.set(cdpParams.requestId, { requestId: cdpParams.requestId, url: cdpParams.request?.url, method: cdpParams.request?.method });
+    s.lastRequestTs = Date.now(); // for networkidle in waitFor
   } else if (cdpMethod === 'Network.responseReceived') {
     const e = s.network.get(cdpParams.requestId); if (e) { e.status = cdpParams.response?.status; e.type = cdpParams.type; }
+  } else if (cdpMethod === 'Page.javascriptDialogOpening') {
+    // A dialog freezes the page's CDP — record it so the agent sees it in the status header and can
+    // clear it (dialog_handle). beforeunload we auto-accept so it can't wedge navigation.
+    s.dialog = { type: cdpParams.type, message: cdpParams.message, defaultPrompt: cdpParams.defaultPrompt };
+    if (cdpParams.type === 'beforeunload') { cmd(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {}); s.dialog = null; }
+  } else if (cdpMethod === 'Page.javascriptDialogClosed') {
+    s.dialog = null;
+  } else if (cdpMethod === 'Page.loadEventFired') {
+    s.lastLoadTs = Date.now();
   }
 });
 chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) state.delete(source.tabId); });

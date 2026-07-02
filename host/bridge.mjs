@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -110,24 +110,32 @@ function runMcpServer() {
     { name: 'tab_create', description: 'Open a new tab and take control of it.', inputSchema: { type: 'object', properties: { url: str, active: { type: 'boolean' } } } },
     { name: 'tab_activate', description: 'Bring a controlled tab to the front (only when the user should watch).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'tab_release', description: 'Detach from a tab and hand it back to the user (leaves it open).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
-    { name: 'navigate', description: 'Navigate a controlled tab to a URL (skips reload if already there).', inputSchema: { type: 'object', properties: { tabId: num, url: str }, required: ['tabId', 'url'] } },
+    { name: 'navigate', description: 'Navigate a controlled tab to a URL (skips reload if already there); waits for load by default so the next read is not racing it (waitUntil:"none" to skip).', inputSchema: { type: 'object', properties: { tabId: num, url: str, waitUntil: str }, required: ['tabId', 'url'] } },
     { name: 'reload', description: 'Reload a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'read_page', description: 'Accessibility tree of a controlled tab: role + name + a stable "ref" per interactable element. Primary way to see structure and target elements.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'read_text', description: 'Visible innerText of a controlled tab (for reading prose once on the right page).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'dom_query', description: 'Run a CSS selector in a controlled tab; returns match count and a "ref" + basic attrs per match. Use to check existence/uniqueness or target by selector.', inputSchema: { type: 'object', properties: { tabId: num, selector: str, limit: num }, required: ['tabId', 'selector'] } },
     { name: 'find', description: "Keyword search over visible element roles/names (a11y tree); returns ranked candidate refs. Query with the element's label words, not visual descriptions.", inputSchema: { type: 'object', properties: { tabId: num, query: str }, required: ['tabId', 'query'] } },
     { name: 'find_text', description: 'Does a word/phrase appear ANYWHERE in the page text (incl. off-screen, not yet scrolled)? Returns a count + context snippets. Cheap — beats a scroll+read_text loop. Set regex:true for a regex query.', inputSchema: { type: 'object', properties: { tabId: num, query: str, regex: { type: 'boolean' }, limit: num }, required: ['tabId', 'query'] } },
-    { name: 'screenshot', description: 'PNG screenshot of a controlled tab (visual confirmation). Auto-downscaled to vision limits.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'screenshot', description: 'PNG screenshot of a controlled tab, auto-downscaled to vision limits. ref: just that element; fullPage:true: the whole scrollable page, not just the viewport.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, fullPage: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_console', description: 'Recent console messages / exceptions captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_network', description: 'Recent network requests (url, method, status) captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
-    { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find), or by {x,y} viewport coords. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num }, required: ['tabId'] } },
+    { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find), or by {x,y} coords. button:"right"|"middle" for context/aux click; double:true for double-click. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, button: str, double: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'fill', description: 'Replace an input/textarea value by ref (clears first, fires input+change).', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
     { name: 'type_text', description: 'Type text into the currently focused element (focus it first via click).', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
-    { name: 'press_key', description: 'Press a key on the focused element (Enter, Tab, Escape, Arrow*, etc.).', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
+    { name: 'press_key', description: 'Press a key/chord on the focused element (Enter, Tab, Escape, Arrow*, Meta+A). A single printable key also types its character.', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
     { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y}.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num }, required: ['tabId'] } },
     { name: 'hover', description: 'Move the pointer over an element by ref to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str }, required: ['tabId', 'ref'] } },
     { name: 'select_option', description: 'Choose a <select> option by value, by ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
     { name: 'drag', description: 'Drag from one ref/point to another (sliders, reordering).', inputSchema: { type: 'object', properties: { tabId: num, fromRef: str, toRef: str, fromX: num, fromY: num, toX: num, toY: num }, required: ['tabId'] } },
+    { name: 'upload_file', description: 'Set files on an <input type=file> by ref (no native picker). Absolute paths.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, paths: { type: 'array', items: str } }, required: ['tabId', 'ref', 'paths'] } },
+    { name: 'dialog_handle', description: 'Accept/dismiss an open JS dialog (alert/confirm/prompt). A dialog freezes the page — the action status header shows openDialog when one is up.', inputSchema: { type: 'object', properties: { tabId: num, accept: { type: 'boolean' }, promptText: str }, required: ['tabId'] } },
+    { name: 'wait_for', description: 'Block until a condition holds, instead of polling read_page: {state:"load"|"networkidle"} after a nav, or selector / text / textGone / urlIncludes. timeoutMs caps at 25s.', inputSchema: { type: 'object', properties: { tabId: num, state: str, selector: str, text: str, textGone: str, urlIncludes: str, timeoutMs: num }, required: ['tabId'] } },
+    { name: 'go_back', description: 'Navigate back in the tab history.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'go_forward', description: 'Navigate forward in the tab history.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'tab_close', description: 'Close a tab the AGENT opened (refuses tabs the agent did not open — use tab_release for the user’s own). Cleans up after multi-tab work.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'network_body', description: 'Fetch a captured response body by requestId (from read_network). For reading API/JSON responses the page fetched.', inputSchema: { type: 'object', properties: { tabId: num, requestId: str, limit: num }, required: ['tabId', 'requestId'] } },
+    { name: 'act_batch', description: 'Run several actions in one round trip: actions=[{tool, args}] (fill/click/type_text/press_key/select_option/scroll/hover). Stops if a step navigates unexpectedly. Cuts round trips on multi-field forms.', inputSchema: { type: 'object', properties: { tabId: num, actions: { type: 'array', items: { type: 'object' } }, stopOnError: { type: 'boolean' } }, required: ['tabId', 'actions'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
   ];
 
@@ -155,7 +163,33 @@ function runMcpServer() {
     hover: (a) => callHost('hover', a),
     select_option: (a) => callHost('selectOption', a),
     drag: (a) => callHost('drag', a),
+    upload_file: (a) => callHost('setFiles', a),
+    dialog_handle: (a) => callHost('handleDialog', a),
+    wait_for: (a) => callHost('waitFor', a),
+    go_back: (a) => callHost('goBack', a),
+    go_forward: (a) => callHost('goForward', a),
+    tab_close: (a) => callHost('closeAgentTab', a),
+    network_body: (a) => callHost('getNetworkBody', a),
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),
+    // Host-side composition: run several existing tools in one round trip, aborting if a step
+    // navigates unexpectedly (each action's status header carries the post-action url).
+    act_batch: async (a) => {
+      const out = []; let lastUrl = null;
+      for (let i = 0; i < (a.actions || []).length; i++) {
+        const step = a.actions[i] || {}; const fn = MAP[step.tool];
+        if (!fn || step.tool === 'act_batch') { out.push({ tool: step.tool, error: 'not a batchable tool' }); break; }
+        let r;
+        try { r = await fn({ tabId: a.tabId, ...(step.args || {}) }); }
+        catch (e) { out.push({ tool: step.tool, error: e.message }); if (a.stopOnError === false) continue; else break; }
+        out.push({ tool: step.tool, result: r });
+        const url = r && r.status && r.status.url;
+        if (url && lastUrl && url !== lastUrl && i < a.actions.length - 1 && step.tool !== 'navigate' && step.tool !== 'reload' && step.tool !== 'go_back' && step.tool !== 'go_forward') {
+          out.push({ aborted: `page navigated to ${url} — remaining ${a.actions.length - i - 1} action(s) skipped` }); break;
+        }
+        if (url) lastUrl = url;
+      }
+      return { batch: out };
+    },
   };
 
   const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
