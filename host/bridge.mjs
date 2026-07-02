@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.3.3';
+const VERSION = '0.4.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -133,7 +133,8 @@ function runMcpServer() {
     { name: 'read_text', description: 'Visible innerText of a controlled tab (for reading prose once on the right page).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'dom_query', description: 'Run a CSS selector in a controlled tab; returns match count and a "ref" + basic attrs per match. Use to check existence/uniqueness or target by selector.', inputSchema: { type: 'object', properties: { tabId: num, selector: str, limit: num }, required: ['tabId', 'selector'] } },
     { name: 'find', description: 'Natural-language element search; returns ranked candidate refs. Use when role/name/selector are not obvious.', inputSchema: { type: 'object', properties: { tabId: num, query: str }, required: ['tabId', 'query'] } },
-    { name: 'screenshot', description: 'PNG screenshot of a controlled tab (visual confirmation).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'find_text', description: 'Does a word/phrase appear ANYWHERE in the page text (incl. off-screen, not yet scrolled)? Returns a count + context snippets. Cheap — beats a scroll+read_text loop. Set regex:true for a regex query.', inputSchema: { type: 'object', properties: { tabId: num, query: str, regex: { type: 'boolean' }, limit: num }, required: ['tabId', 'query'] } },
+    { name: 'screenshot', description: 'PNG screenshot of a controlled tab (visual confirmation). Auto-downscaled to vision limits.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'read_console', description: 'Recent console messages / exceptions captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_network', description: 'Recent network requests (url, method, status) captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find), or by {x,y} viewport coords. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num }, required: ['tabId'] } },
@@ -141,6 +142,7 @@ function runMcpServer() {
     { name: 'type_text', description: 'Type text into the currently focused element (focus it first via click).', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
     { name: 'press_key', description: 'Press a key on the focused element (Enter, Tab, Escape, Arrow*, etc.).', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
     { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y}.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num }, required: ['tabId'] } },
+    { name: 'hover', description: 'Move the pointer over an element by ref to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str }, required: ['tabId', 'ref'] } },
     { name: 'select_option', description: 'Choose a <select> option by value, by ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
     { name: 'drag', description: 'Drag from one ref/point to another (sliders, reordering).', inputSchema: { type: 'object', properties: { tabId: num, fromRef: str, toRef: str, fromX: num, fromY: num, toX: num, toY: num }, required: ['tabId'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
@@ -158,6 +160,7 @@ function runMcpServer() {
     read_text: (a) => callHost('readText', a),
     dom_query: (a) => callHost('domQuery', a),
     find: (a) => callHost('find', a),
+    find_text: (a) => callHost('findText', a),
     screenshot: (a) => callHost('screenshot', a),
     read_console: (a) => callHost('readConsole', a),
     read_network: (a) => callHost('readNetwork', a),
@@ -166,6 +169,7 @@ function runMcpServer() {
     type_text: (a) => callHost('typeText', a),
     press_key: (a) => callHost('pressKey', a),
     scroll: (a) => callHost('scroll', a),
+    hover: (a) => callHost('hover', a),
     select_option: (a) => callHost('selectOption', a),
     drag: (a) => callHost('drag', a),
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),

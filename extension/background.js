@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.3.3';
+const VERSION = '0.4.0';
 let port = null;
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
@@ -126,8 +126,49 @@ const INTERACTIVE = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox
   'radio', 'switch', 'slider', 'spinbutton', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
   'tab', 'option', 'listbox', 'textarea', 'colorwell', 'date', 'datetime']);
 
-// ---- method dispatch ----
+// Icon-font glyphs surface as Private-Use-Area codepoints — meaningless to the model. Collapse to [icon].
+function cleanName(s) {
+  return String(s || '').replace(/[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]+/gu, '[icon]');
+}
+
+// Clamp screenshots to Claude's vision limits (~1568px longest edge / ~1.15MP) to cut token cost. Best-effort.
+async function downscaleImage(b64) {
+  const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const bmp = await createImageBitmap(new Blob([bin], { type: 'image/png' }));
+  const w = bmp.width, h = bmp.height;
+  const scale = Math.min(1, 1568 / Math.max(w, h), Math.sqrt(1.15e6 / (w * h)));
+  if (scale >= 1) { bmp.close && bmp.close(); return b64; } // already within limits
+  const nw = Math.max(1, Math.round(w * scale)), nh = Math.max(1, Math.round(h * scale));
+  const canvas = new OffscreenCanvas(nw, nh);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, nw, nh); bmp.close && bmp.close();
+  const buf = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer());
+  let s = ''; for (let i = 0; i < buf.length; i++) s += String.fromCharCode(buf[i]);
+  return btoa(s);
+}
+
+// Actions that change page/UI state — attach a cheap status header (post-action url/title + new
+// console error/warning counts) so the model can often skip a follow-up read_page. Best-effort:
+// a failure here never affects the action's own result.
+const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'drag', 'navigate', 'reload', 'hover']);
 async function handle(method, p) {
+  const tabId = p && p.tabId;
+  const track = ACTION_METHODS.has(method) && tabId != null;
+  const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
+  const result = await dispatch(method, p);
+  if (track && result && typeof result === 'object' && !result.__image) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const fresh = state.get(tabId)?.console.slice(before) || [];
+      const errs = fresh.filter((m) => m.level === 'error').length;
+      const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
+      result.status = { url: tab.url, title: tab.title, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}) };
+    } catch { /* status is best-effort — never fail the action over it */ }
+  }
+  return result;
+}
+
+// ---- method dispatch ----
+async function dispatch(method, p) {
   switch (method) {
     case 'getInfo': return { name: 'ClaudeBrowserBridge', version: VERSION, cdp: '1.3' };
 
@@ -186,7 +227,7 @@ async function handle(method, p) {
           ref = 'e' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
         }
         const val = n.value?.value;
-        lines.push({ ref, role, name: name.slice(0, 160), ...(val != null ? { value: String(val).slice(0, 80) } : {}) });
+        lines.push({ ref, role, name: cleanName(name).slice(0, 160), ...(val != null ? { value: String(val).slice(0, 80) } : {}) });
         if (lines.length >= 500) break;
       }
       return { url: (await chrome.tabs.get(p.tabId)).url, count: lines.length, elements: lines };
@@ -233,7 +274,7 @@ async function handle(method, p) {
         if (name && q.includes(name.toLowerCase())) score += 5;
         if (score <= 0) continue;
         const ref = 'f' + (++s.seq); s.refs.set(ref, n.backendDOMNodeId);
-        scored.push({ ref, role, name: name.slice(0, 160), score });
+        scored.push({ ref, role, name: cleanName(name).slice(0, 160), score });
       }
       scored.sort((a, b) => b.score - a.score);
       return { candidates: scored.slice(0, 10).map(({ score, ...c }) => c) };
@@ -303,7 +344,38 @@ async function handle(method, p) {
       return { ok: true };
     }
 
-    case 'screenshot': { await need(p.tabId); const r = await cmd(p.tabId, 'Page.captureScreenshot', { format: 'png' }); return { __image: r.data, mimeType: 'image/png' }; }
+    case 'screenshot': {
+      await need(p.tabId);
+      const r = await cmd(p.tabId, 'Page.captureScreenshot', { format: 'png' });
+      let data = r.data;
+      try { data = await downscaleImage(r.data); } catch { data = r.data; } // fall back to raw on any decode/resize failure
+      return { __image: data, mimeType: 'image/png' };
+    }
+
+    case 'findText': {
+      await need(p.tabId);
+      const q = String(p.query ?? '');
+      if (!q) throw new Error('find_text needs a non-empty query');
+      const max = Math.min(p.limit || 20, 50);
+      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+        expression: `(()=>{const q=${JSON.stringify(q)},rx=${p.regex ? 'true' : 'false'},max=${max};
+          const t=document.body?document.body.innerText:'';const out=[];let count=0;
+          const push=(i,len)=>{if(out.length<max){const s=Math.max(0,i-40);out.push(t.slice(s,i+len+40).replace(/\\s+/g,' ').trim());}};
+          if(rx){const re=new RegExp(q,'gi');let m;while((m=re.exec(t))&&count<10000){count++;push(m.index,m[0].length);if(m.index===re.lastIndex)re.lastIndex++;}}
+          else{const hay=t.toLowerCase(),n=q.toLowerCase();let i=0;while((i=hay.indexOf(n,i))>=0&&count<10000){count++;push(i,n.length);i+=n.length;}}
+          return{count,contexts:out};})()`,
+        returnByValue: true,
+      });
+      const v = r.result?.value || { count: 0, contexts: [] };
+      return { query: q, count: v.count, matches: v.contexts };
+    }
+
+    case 'hover': {
+      await need(p.tabId);
+      const c = await boxCenter(p.tabId, refBackend(p.tabId, p.ref));
+      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: c.x, y: c.y });
+      return { ok: true };
+    }
 
     case 'readConsole': { const s = st(p.tabId); const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = []; return { messages: out }; }
     case 'readNetwork': { const s = st(p.tabId); const out = [...s.network.values()].slice(-(p.limit || 50)); if (p.clear) s.network.clear(); return { requests: out }; }
