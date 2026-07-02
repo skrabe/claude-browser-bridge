@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 let port = null;
 
 // per controlled tab: { refs: Map<ref, backendNodeId>, seq, console: [], network: Map<reqId,obj>, domains: Set }
@@ -42,6 +42,7 @@ function reply(id, result, error) {
   port.postMessage(error ? { id, error: String(error && error.message || error) } : { id, result });
 }
 async function onMessage(m) {
+  if (m && m.keepalive !== undefined) return; // host heartbeat — just keeps this worker alive
   const { id, method, params } = m || {};
   try { reply(id, await handle(method, params || {})); }
   catch (e) { reply(id, undefined, e); }

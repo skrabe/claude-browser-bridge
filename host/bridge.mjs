@@ -9,7 +9,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -37,6 +37,12 @@ else runMcpServer();
 function runNativeHost() {
   const pending = new Map(); const eventClients = new Set(); let counter = 0;
   const toExt = (o) => process.stdout.write(encode(o));
+  // Keep the extension's MV3 service worker alive: receiving a port message resets its idle
+  // timer, so it won't be killed (which would drop the port and kill this host / stale the socket).
+  const ka = setInterval(() => { try { toExt({ keepalive: Date.now() }); } catch {} }, 15000);
+  ka.unref?.();
+  process.on('uncaughtException', (e) => { try { fs.appendFileSync('/tmp/cbb-host.log', 'uncaught ' + (e && e.stack || e) + '\n'); } catch {} });
+  process.on('unhandledRejection', (e) => { try { fs.appendFileSync('/tmp/cbb-host.log', 'unhandledRejection ' + String(e) + '\n'); } catch {} });
   process.stdin.on('data', framer((msg) => {
     if (msg.id !== undefined && pending.has(msg.id)) {
       const { client, origId } = pending.get(msg.id); pending.delete(msg.id);
