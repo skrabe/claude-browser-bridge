@@ -286,7 +286,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this._q, i: t.i, value: String(secretVal(value)) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
     // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
     // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
-    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await cdp('Input.insertText', { text: String(secretVal(value)) }); }
+    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await typeChars(cdp, secretVal(value)); }
     async press(keyChord, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await pressChord(cdp, keyChord); }
     async selectOption(values, o = {}) { const t = await this._one(true, o.timeoutMs); const arr = Array.isArray(values) ? values : [values]; const r = await evalIn('select', { steps: this._q, i: t.i, values: arr }, t.sessionId); if (!r || !r.ok) throw new Error('selectOption failed: ' + (r && r.err)); return r.selected; }
     async check(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this._q, i: t.i }, t.sessionId); if (s && s.checked) return; await this.click(o); }
@@ -311,6 +311,16 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   }
 
   async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: ch } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
+  // Real per-character typing: keyDown(text)+keyUp per code point, so widgets listening on
+  // keydown/keypress (search-as-you-type, key-filtered inputs, per-key OTP boxes) actually fire.
+  async function typeChars(cdpFn, text, sessionId) {
+    for (const ch of String(text)) {
+      const up = ch.toUpperCase(); const code = /^[a-z]$/i.test(ch) ? 'Key' + up : /^[0-9]$/.test(ch) ? 'Digit' + ch : '';
+      const kc = /^[a-z0-9]$/i.test(ch) ? up.charCodeAt(0) : 0;
+      await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, code, windowsVirtualKeyCode: kc }, sessionId);
+      await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, windowsVirtualKeyCode: kc }, sessionId);
+    }
+  }
 
   const rootLoc = (step) => new Locator([step]);
   const dom_cua = {
@@ -352,7 +362,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async waitForLoadState(o = {}) { const state = o.state || 'load'; if (state === 'networkidle') { await callHost('waitFor', { tabId, state: 'networkidle', timeoutMs: Math.min((o.timeoutMs || 15000), 25000) }).catch(() => {}); return; } const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const r = await cdp('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if (state === 'load' && rs === 'complete') return; await sleep(120); } },
     async waitForURL(pattern, o = {}) { const deadline = Date.now() + Math.min((o && o.timeoutMs) || 15000, 60000); const re = pattern instanceof RegExp ? pattern : null; while (Date.now() < deadline) { const u = await this.url(); if (u && (re ? re.test(u) : u.includes(pattern))) return; await sleep(150); } throw new Error('waitForURL timed out: ' + pattern); },
     async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } throw new Error('expectNavigation: no matching navigation within timeout' + (o.url ? ' (url ' + o.url + ')' : '')); },
-    async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000, exclude = (o && o.exclude) || undefined, boxes = !!(o && o.boxes); const main = await evalIn('snapshot', { selector: sel, max, exclude, boxes }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; for (const f of frames) { let s; try { s = await evalIn('snapshot', { selector: sel, max: 4000, exclude, boxes }, f.sessionId); } catch { continue; } if (s && !/^\(/.test(s)) parts.push('— frame ' + (f.url || '') + ' —\n' + s); } return parts.join('\n'); },
+    async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000, exclude = (o && o.exclude) || undefined, boxes = !!(o && o.boxes); const main = await evalIn('snapshot', { selector: sel, max, exclude, boxes }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; const framed = await Promise.all(frames.map(async (f) => { try { const s = await evalIn('snapshot', { selector: sel, max: 4000, exclude, boxes }, f.sessionId); return s && !/^\(/.test(s) ? '— frame ' + (f.url || '') + ' —\n' + s : null; } catch { return null; } })); for (const s of framed) if (s) parts.push(s); return parts.join('\n'); },
     async snapshot(o) { return this.domSnapshot(o); },
     async screenshot(o = {}) { const params = { format: 'png' }; if (o.fullPage) { params.captureBeyondViewport = true; const m = await cdp('Page.getLayoutMetrics').catch(() => ({})); const cs = m.cssContentSize || m.contentSize; if (cs) params.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 }; } if (o.clip) params.clip = { ...o.clip, scale: 1 }; const r = await cdp('Page.captureScreenshot', params); return { __image: r.data, mimeType: 'image/png' }; },
     // Real JS-dialog handling: read the pending alert/confirm/prompt (recorded by the extension on
@@ -390,7 +400,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   };
 
   const browser = {
-    async openTabs() { const r = await callHost('getUserTabs', {}); return (r.tabs || []).map((t) => ({ id: String(t.id), title: t.title, url: t.url, tabGroup: t.tabGroup, lastOpened: t.lastAccessed })); },
+    async openTabs() { const r = await callHost('getUserTabs', {}); return (r.tabs || []).map((t) => ({ id: String(t.id), title: t.title, url: t.url, tabGroup: t.tabGroup, windowId: t.windowId, lastOpened: t.lastAccessed })); },
     async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id, abort, secrets).page; },
     async newTab(url) { const r = await callHost("createTab", { url: url || "about:blank" }); return makeBrowser(callHost, r.id, abort, secrets).page; },
     async nameSession() { /* no-op: our tabs aren't session-scoped */ },
@@ -399,21 +409,26 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async readUrls(urls, o = {}) {
       const list = Array.isArray(urls) ? urls : [urls];
       const max = Math.min(o.max || 20000, 50000);
-      const out = [];
-      for (const url of list) {
+      const conc = Math.min(o.concurrency || 6, 12); // load tabs in parallel, bounded so we don't open 50 at once
+      const one = async (url) => {
         let tab = null;
         try {
           const r = await callHost('createTab', { url: String(url), active: false });
           tab = r.id;
           const p = makeBrowser(callHost, tab, abort, secrets).page;
           await p.waitForLoadState({ state: 'load', timeoutMs: o.timeoutMs || 15000 });
-          const title = await p.title().catch(() => null);
-          const snapshot = o.snapshot === false ? undefined : await p.domSnapshot({ max }).catch(() => null);
-          const text = await p.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => null);
-          out.push({ url, title, ...(snapshot !== undefined ? { snapshot } : {}), text: text ? String(text).slice(0, max) : null });
-        } catch (e) { out.push({ url, error: e && e.message ? e.message : String(e) }); }
+          const [title, snapshot, text] = await Promise.all([
+            p.title().catch(() => null),
+            o.snapshot === false ? Promise.resolve(undefined) : p.domSnapshot({ max }).catch(() => null),
+            p.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => null),
+          ]);
+          return { url, title, ...(snapshot !== undefined ? { snapshot } : {}), text: text ? String(text).slice(0, max) : null };
+        } catch (e) { return { url, error: e && e.message ? e.message : String(e) }; }
         finally { if (tab != null) await callHost('closeAgentTab', { tabId: tab }).catch(() => {}); }
-      }
+      };
+      const out = new Array(list.length); let idx = 0;
+      const worker = async () => { while (idx < list.length) { const i = idx++; out[i] = await one(list[i]); } };
+      await Promise.all(Array.from({ length: Math.min(conc, list.length) }, worker));
       return out;
     },
     async history(o = {}) { const r = await callHost('getHistory', { text: o.query || o.text || '', maxResults: o.maxResults || 50, ...(o.startTime ? { startTime: o.startTime } : {}), ...(o.endTime ? { endTime: o.endTime } : {}) }).catch((e) => ({ error: e && e.message })); return (r && r.entries) || []; },
@@ -431,7 +446,11 @@ export async function runScript({ callHost, tabId, script, timeoutMs = 60000, se
   const log = (...a) => { logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
   const console = { log, info: log, warn: log, error: log };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const fn = new AsyncFunction('page', 'tab', 'browser', 'console', 'log', 'sleep', `"use strict";\n${script}`);
+  // Shadow host-Node globals as undefined params so a script (esp. one a malicious page maneuvered
+  // the model into writing) can't casually reach process.env/fetch/require. A speed bump, not a jail
+  // (constructor chains can still escape) — the untrusted-content doctrine covers the rest.
+  const SHADOW = ['process', 'require', 'fetch', 'globalThis', 'global', 'XMLHttpRequest', 'WebSocket', 'module', '__dirname', '__filename'];
+  const fn = new AsyncFunction('page', 'tab', 'browser', 'console', 'log', 'sleep', ...SHADOW, `"use strict";\n${script}`);
   let result, error;
   const run = (async () => { try { result = await fn(page, page, browser, console, log, sleep); } catch (e) { error = e; } })();
   let timer; const guard = new Promise((_, rej) => { timer = setTimeout(() => { abort.aborted = true; rej(new Error('run: script exceeded ' + timeoutMs + 'ms')); }, timeoutMs); });

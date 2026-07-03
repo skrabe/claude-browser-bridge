@@ -415,7 +415,16 @@ async function dispatch(method, p) {
       });
       return { ok: true };
     }
-    case 'typeText': { await need(p.tabId); await cmd(p.tabId, 'Input.insertText', { text: String(p.text ?? '') }); return { ok: true }; }
+    case 'typeText': { // real per-char keystrokes (keyDown+keyUp) so search-as-you-type / key-filtered / per-key OTP widgets fire
+      await need(p.tabId);
+      for (const ch of String(p.text ?? '')) {
+        const up = ch.toUpperCase(); const code = /^[a-z]$/i.test(ch) ? 'Key' + up : /^[0-9]$/.test(ch) ? 'Digit' + ch : '';
+        const kc = /^[a-z0-9]$/i.test(ch) ? up.charCodeAt(0) : 0;
+        await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, code, windowsVirtualKeyCode: kc });
+        await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, windowsVirtualKeyCode: kc });
+      }
+      return { ok: true };
+    }
     case 'pressKey': {
       await need(p.tabId);
       // support modifier chords like "Meta+A", "Ctrl+Shift+K"
