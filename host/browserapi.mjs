@@ -56,6 +56,9 @@ if (!window.__cbb) {
     const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0;
   };
   const isEnabled = (e) => !(e.disabled || e.getAttribute && (e.getAttribute('aria-disabled') === 'true'));
+  // aria-hidden/hidden subtrees are pruned from the a11y tree — exclude them from role/text/label
+  // matching so hidden duplicates don't inflate the count and trip strict mode (like Playwright).
+  const aHidden = (e) => { let n = e; while (n && n.nodeType === 1) { if (n.getAttribute && (n.getAttribute('aria-hidden') === 'true' || n.hasAttribute('hidden'))) return true; n = n.parentElement; } return false; };
   const isChecked = (e) => { if (typeof e.checked === 'boolean') return e.checked; const a = e.getAttribute && e.getAttribute('aria-checked'); return a === 'true'; };
   const isEditable = (e) => (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA' || e.isContentEditable) && isEnabled(e) && !e.readOnly;
   // top-viewport box: getBoundingClientRect is frame-local; add each same-origin ancestor iframe's origin
@@ -77,11 +80,14 @@ if (!window.__cbb) {
   };
   const universe = (scope) => { const out = []; if (scope.nodeType === 9 || scope.shadowRoot === undefined && scope.querySelectorAll) { /*document or element*/ } deep(scope.documentElement ? scope : scope, out); return out; };
   const queryStep = (scopes, step) => {
+    // A scope that is itself an <iframe> (e.g. after frameLocator) means "inside that frame's document".
+    scopes = scopes.map((s) => { if (s && s.tagName === 'IFRAME') { let d = null; try { d = s.contentDocument; } catch {} return d || s; } return s; });
     let out = [];
     for (const scope of scopes) {
       const all = universe(scope);
       if (step.by === 'css') { try { const found = []; const collect = (r) => { for (const e of r.querySelectorAll(step.selector)) found.push(e); for (const e of r.querySelectorAll('*')) { if (e.shadowRoot) collect(e.shadowRoot); if (e.tagName === 'IFRAME') { let d = null; try { d = e.contentDocument; } catch {} if (d) collect(d); } } }; collect(scope.documentElement ? scope : scope); out.push(...found); } catch {} continue; }
       for (const e of all) {
+        if (aHidden(e)) continue;
         if (step.by === 'role') { if (roleOf(e) !== step.role) continue; if (step.name != null && !M(accName(e), step.name, step.exact)) continue; out.push(e); }
         else if (step.by === 'text') { if (M(e.textContent, step.text, step.exact)) out.push(e); }
         else if (step.by === 'label') { const l = labelForm(e); const ar = e.getAttribute && e.getAttribute('aria-label'); if ((l && M(l, step.text, step.exact)) || (ar && M(ar, step.text, step.exact))) out.push(e); }
@@ -121,7 +127,7 @@ if (!window.__cbb) {
     if (op === 'text') { if (!el) return null; return a.kind === 'inner' ? (el.innerText != null ? el.innerText : el.textContent) : a.kind === 'value' ? ('value' in el ? String(el.value) : null) : a.kind === 'attr' ? el.getAttribute(a.name) : (el.textContent == null ? null : el.textContent); }
     if (op === 'bool') { if (!el) return false; return a.q === 'visible' ? isVisible(el) : a.q === 'enabled' ? isEnabled(el) : a.q === 'checked' ? isChecked(el) : a.q === 'editable' ? isEditable(el) : false; }
     if (op === 'fill') { if (!el) return { ok: false, err: 'not found' }; el.focus && el.focus(); if (el.isContentEditable) { el.textContent = a.value; el.dispatchEvent(new Event('input', { bubbles: true })); } else nativeSet(el, a.value); return { ok: true }; }
-    if (op === 'select') { if (!el || el.tagName !== 'SELECT') return { ok: false, err: 'not a <select>' }; const want = a.values; let sel = []; for (const o of el.options) { const hit = want.some((w) => (w.value != null && o.value === w.value) || (w.label != null && (o.label || o.text) === w.label) || (w.index != null && o.index === w.index) || (typeof w === 'string' && (o.value === w || o.label === w || o.text === w))); o.selected = hit; if (hit) sel.push(o.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return { ok: sel.length > 0, selected: sel }; }
+    if (op === 'select') { if (!el || el.tagName !== 'SELECT') return { ok: false, err: 'not a <select>' }; const want = a.values; let sel = []; for (const o of el.options) { const hit = want.some((w) => (w.value != null && o.value === String(w.value)) || (w.label != null && (o.label || o.text) === String(w.label)) || (w.index != null && o.index === Number(w.index)) || (typeof w === 'string' && (o.value === w || o.label === w || o.text === w)) || (typeof w === 'number' && (o.value === String(w) || o.index === w))); o.selected = hit; if (hit) sel.push(o.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return { ok: sel.length > 0, selected: sel }; }
     if (op === 'focus') { if (!el) return { ok: false }; el.focus && el.focus(); return { ok: true }; }
     if (op === 'scroll') { if (!el) return { ok: false }; if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'center' }); return { ok: true, box: topBox(el) }; }
     if (op === 'checkstate') { if (!el) return null; return { box: topBox(el), checked: isChecked(el), vis: isVisible(el), en: isEnabled(el) }; }
@@ -159,10 +165,20 @@ export const _ENGINE = ENGINE; // exported for the jsdom unit test (host/test/en
 const KEY = { Enter: { key: 'Enter', code: 'Enter', kc: 13 }, Tab: { key: 'Tab', code: 'Tab', kc: 9 }, Escape: { key: 'Escape', code: 'Escape', kc: 27 }, Backspace: { key: 'Backspace', code: 'Backspace', kc: 8 }, Delete: { key: 'Delete', code: 'Delete', kc: 46 }, ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', kc: 38 }, ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', kc: 40 }, ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', kc: 37 }, ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', kc: 39 }, Home: { key: 'Home', code: 'Home', kc: 36 }, End: { key: 'End', code: 'End', kc: 35 }, PageUp: { key: 'PageUp', code: 'PageUp', kc: 33 }, PageDown: { key: 'PageDown', code: 'PageDown', kc: 34 }, Space: { key: ' ', code: 'Space', kc: 32 } };
 const MOD = { Alt: 1, Control: 2, Meta: 4, Shift: 8, ControlOrMeta: 4 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A trailing run of nth/first/last must be applied GLOBALLY (after merging all frame sessions),
+// never per-session inside the engine — otherwise each session picks its own nth and the merge is wrong.
+const splitTail = (steps) => { let cut = steps.length; for (let i = steps.length - 1; i >= 0; i--) { const op = steps[i].op; if (op === 'nth' || op === 'first' || op === 'last') cut = i; else break; } return { base: steps.slice(0, cut), tail: steps.slice(cut) }; };
+// A RegExp survives JSON.stringify only as a plain {__re,source,flags} the ENGINE's M() understands.
+const reWrap = (v) => (v instanceof RegExp ? { __re: true, source: v.source, flags: v.flags } : v);
+// Shift-produced character for a single printable base (letters + common US-layout symbols).
+const SHIFTED = { '`': '~', '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?' };
+const shiftChar = (c) => (/^[a-z]$/.test(c) ? c.toUpperCase() : SHIFTED[c] || c);
 
-// Build a driver bound to one tab. `callHost(method, params)` reaches the extension.
-export function makeBrowser(callHost, tabId) {
-  const cdp = (method, params = {}, sessionId) => callHost('executeCdp', { tabId, cdpMethod: method, cdpParams: params, ...(sessionId ? { sessionId } : {}) });
+// Build a driver bound to one tab. `callHost(method, params)` reaches the extension. `abort` is a
+// shared {aborted} flag: once set (on run timeout), every further CDP call throws so a timed-out
+// script cannot keep clicking/navigating the user's real browser behind our back.
+export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
+  const cdp = (method, params = {}, sessionId) => { if (abort.aborted) throw new Error('run aborted (timeout)'); return callHost('executeCdp', { tabId, cdpMethod: method, cdpParams: params, ...(sessionId ? { sessionId } : {}) }); };
   const evalIn = async (op, arg, sessionId) => { const r = await cdp('Runtime.evaluate', { expression: asExpr(op, arg), returnByValue: true, awaitPromise: true }, sessionId); if (r && r.exceptionDetails) throw new Error('page eval failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; };
 
   let framesCache = null, framesCacheAt = 0;
@@ -170,19 +186,30 @@ export function makeBrowser(callHost, tabId) {
   const frameOffset = async (sessionId) => { try { return await callHost('frameOffsetOf', { tabId, sessionId }); } catch { return { ox: 0, oy: 0 }; } };
 
   // Resolve a locator's step-chain across the main session + every cross-origin frame session.
-  // Returns a global, ordered list: [{sessionId|null, i (local index), box (top-viewport, OOPIF-translated), ...meta}]
+  // The QUERY steps (base) resolve per-session; a trailing run of nth/first/last is applied GLOBALLY
+  // on the merged, document-ordered list (main first, then frames). Returns [{sessionId|null,
+  // i (per-session index into the base query), box (top-viewport, OOPIF-translated), ...meta}].
   async function resolveGlobal(steps) {
+    const { base, tail } = splitTail(steps);
     const out = [];
-    const main = await evalIn('q', { steps, cap: 500 });
+    const main = await evalIn('q', { steps: base, cap: 500 });
     for (const m of main.matches || []) out.push({ sessionId: null, ...m });
     const frames = await frameSessions();
-    for (const f of frames) {
-      let res; try { res = await evalIn('q', { steps, cap: 500 }, f.sessionId); } catch { continue; }
-      if (!res || !res.matches || !res.matches.length) continue;
+    // resolve frames in parallel — each is an independent CDP round trip
+    const framed = await Promise.all(frames.map(async (f) => {
+      let res; try { res = await evalIn('q', { steps: base, cap: 500 }, f.sessionId); } catch { return []; }
+      if (!res || !res.matches || !res.matches.length) return [];
       const off = await frameOffset(f.sessionId);
-      for (const m of res.matches) out.push({ sessionId: f.sessionId, ...m, box: { ...m.box, x: m.box.x + off.ox, y: m.box.y + off.oy, cx: m.box.cx + off.ox, cy: m.box.cy + off.oy } });
+      return res.matches.map((m) => ({ sessionId: f.sessionId, ...m, box: { ...m.box, x: m.box.x + off.ox, y: m.box.y + off.oy, cx: m.box.cx + off.ox, cy: m.box.cy + off.oy } }));
+    }));
+    for (const arr of framed) out.push(...arr);
+    let list = out;
+    for (const p of tail) {
+      if (p.op === 'first') list = list.slice(0, 1);
+      else if (p.op === 'last') list = list.slice(-1);
+      else if (p.op === 'nth') { const idx = p.n < 0 ? list.length + p.n : p.n; list = idx >= 0 && list[idx] ? [list[idx]] : []; }
     }
-    return out;
+    return list;
   }
 
   const mouse = async (type, x, y, opts = {}) => cdp('Input.dispatchMouseEvent', { type, x, y, button: opts.button || 'left', clickCount: opts.clickCount || 1, modifiers: opts.modifiers || 0, ...(opts.buttons != null ? { buttons: opts.buttons } : {}) });
@@ -197,25 +224,29 @@ export function makeBrowser(callHost, tabId) {
   class Locator {
     constructor(steps) { this.steps = steps; }
     _child(step) { return new Locator([...this.steps, step]); }
-    getByRole(role, o = {}) { return this._child({ by: 'role', role, name: o.name, exact: o.exact }); }
-    getByText(text, o = {}) { return this._child({ by: 'text', text, exact: o.exact }); }
-    getByLabel(text, o = {}) { return this._child({ by: 'label', text, exact: o.exact }); }
-    getByPlaceholder(text, o = {}) { return this._child({ by: 'placeholder', text, exact: o.exact }); }
+    getByRole(role, o = {}) { return this._child({ by: 'role', role, name: reWrap(o.name), exact: o.exact }); }
+    getByText(text, o = {}) { return this._child({ by: 'text', text: reWrap(text), exact: o.exact }); }
+    getByLabel(text, o = {}) { return this._child({ by: 'label', text: reWrap(text), exact: o.exact }); }
+    getByPlaceholder(text, o = {}) { return this._child({ by: 'placeholder', text: reWrap(text), exact: o.exact }); }
     getByTestId(testId) { return this._child({ by: 'testid', testId }); }
     locator(selector) { return this._child({ by: 'css', selector }); }
-    filter(o = {}) { return this._child({ op: 'filter', hasText: o.hasText, hasNotText: o.hasNotText }); }
+    filter(o = {}) { return this._child({ op: 'filter', hasText: reWrap(o.hasText), hasNotText: reWrap(o.hasNotText) }); }
     nth(n) { return this._child({ op: 'nth', n }); }
     first() { return this._child({ op: 'first' }); }
     last() { return this._child({ op: 'last' }); }
+    // the query part (base) drives per-session engine reads; trailing nth/first/last are applied
+    // globally by resolveGlobal, so terminal reads must use `_q`, not the full step chain.
+    get _q() { return splitTail(this.steps).base; }
     // terminal reads
     async count() { return (await resolveGlobal(this.steps)).length; }
     async all() { const g = await resolveGlobal(this.steps); return g.map((_, i) => this.nth(i)); }
+    // actionable: true → visible+enabled; 'visible' → visible only (hover); false → attached only.
     async _one(actionable, timeoutMs = 15000) {
       const deadline = Date.now() + Math.min(timeoutMs, 60000);
       let last = null;
       while (Date.now() < deadline) {
         const g = await resolveGlobal(this.steps);
-        if (g.length === 1 || (g.length > 1 && this._picked != null)) { const t = g.length === 1 ? g[0] : g[this._picked]; if (!actionable || (t.vis && t.en)) return t; last = t; }
+        if (g.length === 1) { const t = g[0]; const ok = actionable === 'visible' ? t.vis : actionable ? (t.vis && t.en) : true; if (ok) return t; last = t; }
         else if (g.length > 1) throw new Error(`strict mode: ${g.length} elements match — add .first()/.nth()/.filter()`);
         await sleep(120);
       }
@@ -223,33 +254,35 @@ export function makeBrowser(callHost, tabId) {
       throw new Error('locator matched no element in time');
     }
     async waitFor(o = {}) { const state = o.state || 'visible'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const g = await resolveGlobal(this.steps); const t = g[0]; const ok = state === 'attached' ? !!t : state === 'detached' ? !t : state === 'visible' ? (t && t.vis) : state === 'hidden' ? (!t || !t.vis) : !!t; if (ok) return; await sleep(120); } throw new Error('waitFor(' + state + ') timed out'); }
-    async textContent(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this.steps, i: t.i, kind: 'text' }, t.sessionId); }
-    async innerText(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this.steps, i: t.i, kind: 'inner' }, t.sessionId); }
-    async inputValue(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this.steps, i: t.i, kind: 'value' }, t.sessionId); }
-    async getAttribute(name, o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this.steps, i: t.i, kind: 'attr', name }, t.sessionId); }
-    async allTextContents() { const g = await resolveGlobal(this.steps); return Promise.all(g.map((t) => evalIn('text', { steps: this.steps, i: t.i, kind: 'text' }, t.sessionId))); }
+    async textContent(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'text' }, t.sessionId); }
+    async innerText(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'inner' }, t.sessionId); }
+    async inputValue(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'value' }, t.sessionId); }
+    async getAttribute(name, o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'attr', name }, t.sessionId); }
+    async allTextContents() { const g = await resolveGlobal(this.steps); const q = this._q; return Promise.all(g.map((t) => evalIn('text', { steps: q, i: t.i, kind: 'text' }, t.sessionId))); }
     async isVisible() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].vis); }
     async isEnabled() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].en); }
     async isChecked() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].checked); }
     async boundingBox(o = {}) { const t = await this._one(false, o.timeoutMs); return { x: t.box.x, y: t.box.y, width: t.box.w, height: t.box.h }; }
-    async scrollIntoViewIfNeeded(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('scroll', { steps: this.steps, i: t.i }, t.sessionId); }
+    async scrollIntoViewIfNeeded(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); }
     // terminal actions (real events / in-page mutation with auto-wait)
-    async click(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this.steps, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; const mods = (o.modifiers || []).reduce((m, k) => m | (MOD[k] || 0), 0); const button = o.button || 'left'; const clicks = o.clickCount || (o._double ? 2 : 1); await mouse('mouseMoved', b.cx, b.cy); for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); await mouse('mouseReleased', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); } }
+    async click(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; const mods = (o.modifiers || []).reduce((m, k) => m | (MOD[k] || 0), 0); const button = o.button || 'left'; const clicks = o.clickCount || (o._double ? 2 : 1); await mouse('mouseMoved', b.cx, b.cy); for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); await mouse('mouseReleased', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); } }
     async dblclick(o = {}) { return this.click({ ...o, _double: true }); }
-    async hover(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this.steps, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; await mouse('mouseMoved', b.cx, b.cy); }
-    async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this.steps, i: t.i, value: String(value) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
-    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this.steps, i: t.i }, t.sessionId); await cdp('Input.insertText', { text: String(value) }, t.sessionId); }
-    async press(keyChord, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this.steps, i: t.i }, t.sessionId); await pressChord(cdp, keyChord, t.sessionId); }
-    async selectOption(values, o = {}) { const t = await this._one(true, o.timeoutMs); const arr = (Array.isArray(values) ? values : [values]).map((v) => (typeof v === 'string' ? v : v)); const r = await evalIn('select', { steps: this.steps, i: t.i, values: arr }, t.sessionId); if (!r || !r.ok) throw new Error('selectOption failed: ' + (r && r.err)); return r.selected; }
-    async check(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this.steps, i: t.i }, t.sessionId); if (s && s.checked) return; await this.click(o); }
-    async uncheck(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this.steps, i: t.i }, t.sessionId); if (s && !s.checked) return; await this.click(o); }
+    async hover(o = {}) { const t = await this._one('visible', o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one('visible', 2000)).box; await mouse('mouseMoved', b.cx, b.cy); }
+    async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this._q, i: t.i, value: String(value) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
+    // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
+    // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
+    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await cdp('Input.insertText', { text: String(value) }); }
+    async press(keyChord, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await pressChord(cdp, keyChord); }
+    async selectOption(values, o = {}) { const t = await this._one(true, o.timeoutMs); const arr = Array.isArray(values) ? values : [values]; const r = await evalIn('select', { steps: this._q, i: t.i, values: arr }, t.sessionId); if (!r || !r.ok) throw new Error('selectOption failed: ' + (r && r.err)); return r.selected; }
+    async check(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this._q, i: t.i }, t.sessionId); if (s && s.checked) return; await this.click(o); }
+    async uncheck(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this._q, i: t.i }, t.sessionId); if (s && !s.checked) return; await this.click(o); }
     async setChecked(v, o = {}) { return v ? this.check(o) : this.uncheck(o); }
-    async focus(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('focus', { steps: this.steps, i: t.i }, t.sessionId); }
+    async focus(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); }
     // Set files on an <input type=file> without opening the native picker. Resolve the element to a
     // Runtime objectId (returnByValue:false), then DOM.setFileInputFiles by objectId.
     async setInputFiles(files, o = {}) {
       const t = await this._one(false, o.timeoutMs);
-      const r = await cdp('Runtime.evaluate', { expression: asExpr('el', { steps: this.steps, i: t.i }), returnByValue: false }, t.sessionId);
+      const r = await cdp('Runtime.evaluate', { expression: asExpr('el', { steps: this._q, i: t.i }), returnByValue: false }, t.sessionId);
       const objectId = r && r.result && r.result.objectId;
       if (!objectId) throw new Error('setInputFiles: could not resolve the file input element');
       const arr = (Array.isArray(files) ? files : [files]).map(String);
@@ -261,31 +294,39 @@ export function makeBrowser(callHost, tabId) {
       await dragPath({ x: b1.x + b1.width / 2, y: b1.y + b1.height / 2 }, { x: b2.x + b2.width / 2, y: b2.y + b2.height / 2 }, o.steps || 10);
     }
   }
-  // pick() lets nth() resolve a specific global index for actions
-  Object.defineProperty(Locator.prototype, '_picked', { get() { for (let k = this.steps.length - 1; k >= 0; k--) { if (this.steps[k].op === 'nth') return this.steps[k].n; if (this.steps[k].op === 'first') return 0; if (this.steps[k].op === 'last') return -1; } return null; }, configurable: true });
 
-  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const k = KEY[base] || (base.length === 1 ? { key: base, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: base } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
+  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: ch } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
 
   const rootLoc = (step) => new Locator([step]);
   const dom_cua = {
     async get_visible_dom() { return evalIn('vdom', { cap: 400 }); },
     async click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.click: ' + (r && r.err)); await mouse('mouseMoved', r.box.cx, r.box.cy); await mouse('mousePressed', r.box.cx, r.box.cy); await mouse('mouseReleased', r.box.cx, r.box.cy); },
-    async double_click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); await mouse('mouseMoved', r.box.cx, r.box.cy); for (let c = 1; c <= 2; c++) { await mouse('mousePressed', r.box.cx, r.box.cy, { clickCount: c }); await mouse('mouseReleased', r.box.cx, r.box.cy, { clickCount: c }); } },
+    async double_click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.double_click: ' + (r && r.err)); await mouse('mouseMoved', r.box.cx, r.box.cy); for (let c = 1; c <= 2; c++) { await mouse('mousePressed', r.box.cx, r.box.cy, { clickCount: c }); await mouse('mouseReleased', r.box.cx, r.box.cy, { clickCount: c }); } },
     async type({ text }) { await cdp('Input.insertText', { text: String(text) }); },
     async keypress({ keys }) { for (const k of (Array.isArray(keys) ? keys : [keys])) await pressChord(cdp, k); },
     async scroll({ node_id, x = 0, y = 300 }) { let cx = 200, cy = 300; if (node_id) { const r = await evalIn('vact', { node_id, action: 'box' }); if (r && r.ok) { cx = r.box.cx; cy = r.box.cy; } } await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x: cx, y: cy, deltaX: x, deltaY: y }); },
   };
 
   const page = {
-    getByRole: (role, o) => rootLoc({ by: 'role', role, name: (o || {}).name, exact: (o || {}).exact }),
-    getByText: (text, o) => rootLoc({ by: 'text', text, exact: (o || {}).exact }),
-    getByLabel: (text, o) => rootLoc({ by: 'label', text, exact: (o || {}).exact }),
-    getByPlaceholder: (text, o) => rootLoc({ by: 'placeholder', text, exact: (o || {}).exact }),
+    getByRole: (role, o) => rootLoc({ by: 'role', role, name: reWrap((o || {}).name), exact: (o || {}).exact }),
+    getByText: (text, o) => rootLoc({ by: 'text', text: reWrap(text), exact: (o || {}).exact }),
+    getByLabel: (text, o) => rootLoc({ by: 'label', text: reWrap(text), exact: (o || {}).exact }),
+    getByPlaceholder: (text, o) => rootLoc({ by: 'placeholder', text: reWrap(text), exact: (o || {}).exact }),
     getByTestId: (testId) => rootLoc({ by: 'testid', testId }),
     locator: (selector) => rootLoc({ by: 'css', selector }),
-    frameLocator: (frameSelector) => rootLoc({ by: 'css', selector: frameSelector + ' ' }), // same-origin frames are pierced automatically; scope by the iframe's ancestor
+    frameLocator: (frameSelector) => rootLoc({ by: 'css', selector: frameSelector }), // selects the iframe; queryStep descends into its (same-origin) contentDocument for chained steps
     async evaluate(fn, arg) { const expr = typeof fn === 'function' ? `(${fn.toString()})(${JSON.stringify(arg ?? null)})` : String(fn); const r = await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) throw new Error('evaluate failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; },
-    async goto(url, o = {}) { const cur = await this.url(); await cdp('Page.navigate', { url }); if ((o.waitUntil || 'load') !== 'commit') await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: o.timeoutMs }); return null; },
+    async goto(url, o = {}) {
+      const r = await cdp('Page.navigate', { url });
+      if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ')');
+      if ((o.waitUntil || 'load') === 'commit') return null;
+      // wait for the NEW document to commit (readyState leaves the old 'complete') before waiting for
+      // its load state — otherwise a slow/blocked nav resolves against the stale page.
+      const commitBy = Date.now() + 2000;
+      while (Date.now() < commitBy) { const rs = await this.evaluate(() => document.readyState).catch(() => null); if (rs && rs !== 'complete') break; await sleep(60); }
+      await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: o.timeoutMs });
+      return null;
+    },
     async url() { try { const r = await cdp('Runtime.evaluate', { expression: 'location.href', returnByValue: true }); return r.result.value; } catch { return null; } },
     async title() { const r = await cdp('Runtime.evaluate', { expression: 'document.title', returnByValue: true }); return r.result.value; },
     async reload(o = {}) { await cdp('Page.reload', {}); await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: o.timeoutMs }); },
@@ -293,10 +334,10 @@ export function makeBrowser(callHost, tabId) {
     async goForward() { await this.evaluate(() => history.forward()); await sleep(300); },
     async bringToFront() { await callHost('activateTab', { tabId }); },
     async waitForTimeout(ms) { await sleep(Math.min(ms, 30000)); },
-    async waitForLoadState(o = {}) { const state = o.state || 'load'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const r = await cdp('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if ((state === 'load' || state === 'networkidle') && rs === 'complete') { if (state === 'load') return; await sleep(500); return; } await sleep(120); } },
+    async waitForLoadState(o = {}) { const state = o.state || 'load'; if (state === 'networkidle') { await callHost('waitFor', { tabId, state: 'networkidle', timeoutMs: Math.min((o.timeoutMs || 15000), 25000) }).catch(() => {}); return; } const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const r = await cdp('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if (state === 'load' && rs === 'complete') return; await sleep(120); } },
     async waitForURL(pattern, o = {}) { const deadline = Date.now() + Math.min((o && o.timeoutMs) || 15000, 60000); const re = pattern instanceof RegExp ? pattern : null; while (Date.now() < deadline) { const u = await this.url(); if (u && (re ? re.test(u) : u.includes(pattern))) return; await sleep(150); } throw new Error('waitForURL timed out: ' + pattern); },
-    async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } return r; },
-    async domSnapshot(o = {}) { return evalIn('snapshot', { selector: o && o.selector, max: (o && o.max) || 20000 }); },
+    async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } throw new Error('expectNavigation: no matching navigation within timeout' + (o.url ? ' (url ' + o.url + ')' : '')); },
+    async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000; const main = await evalIn('snapshot', { selector: sel, max }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; for (const f of frames) { let s; try { s = await evalIn('snapshot', { selector: sel, max: 4000 }, f.sessionId); } catch { continue; } if (s && !/^\(/.test(s)) parts.push('— frame ' + (f.url || '') + ' —\n' + s); } return parts.join('\n'); },
     async snapshot(o) { return this.domSnapshot(o); },
     async screenshot(o = {}) { const params = { format: 'png' }; if (o.fullPage) { params.captureBeyondViewport = true; const m = await cdp('Page.getLayoutMetrics').catch(() => ({})); const cs = m.cssContentSize || m.contentSize; if (cs) params.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 }; } if (o.clip) params.clip = { ...o.clip, scale: 1 }; const r = await cdp('Page.captureScreenshot', params); return { __image: r.data, mimeType: 'image/png' }; },
     // Real JS-dialog handling: read the pending alert/confirm/prompt (recorded by the extension on
@@ -335,8 +376,8 @@ export function makeBrowser(callHost, tabId) {
 
   const browser = {
     async openTabs() { const r = await callHost('getUserTabs', {}); return (r.tabs || []).map((t) => ({ id: String(t.id), title: t.title, url: t.url, tabGroup: t.tabGroup, lastOpened: t.lastAccessed })); },
-    async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id).page; },
-    async newTab(url) { const r = await callHost('createTab', { url: url || 'about:blank' }); return makeBrowser(callHost, r.id).page; },
+    async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id, abort).page; },
+    async newTab(url) { const r = await callHost('createTab', { url: url || 'about:blank' }); return makeBrowser(callHost, r.id, abort).page; },
     async nameSession() { /* no-op: our tabs aren't session-scoped */ },
     // Batch: load each URL in a background tab, extract (title + interactable snapshot + text),
     // close the tab. Does not disturb the user's selected tab. For research / multi-source reads.
@@ -349,7 +390,7 @@ export function makeBrowser(callHost, tabId) {
         try {
           const r = await callHost('createTab', { url: String(url), active: false });
           tab = r.id;
-          const p = makeBrowser(callHost, tab).page;
+          const p = makeBrowser(callHost, tab, abort).page;
           await p.waitForLoadState({ state: 'load', timeoutMs: o.timeoutMs || 15000 });
           const title = await p.title().catch(() => null);
           const snapshot = o.snapshot === false ? undefined : await p.domSnapshot({ max }).catch(() => null);
@@ -369,7 +410,8 @@ export function makeBrowser(callHost, tabId) {
 
 // Run a model-authored script with page/browser/tab/console injected. Returns { result, logs }.
 export async function runScript({ callHost, tabId, script, timeoutMs = 60000 }) {
-  const { page, browser } = makeBrowser(callHost, tabId);
+  const abort = { aborted: false }; // set on timeout so the still-running script can't keep driving the browser
+  const { page, browser } = makeBrowser(callHost, tabId, abort);
   const logs = [];
   const log = (...a) => { logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
   const console = { log, info: log, warn: log, error: log };
@@ -377,7 +419,7 @@ export async function runScript({ callHost, tabId, script, timeoutMs = 60000 }) 
   const fn = new AsyncFunction('page', 'tab', 'browser', 'console', 'log', 'sleep', `"use strict";\n${script}`);
   let result, error;
   const run = (async () => { try { result = await fn(page, page, browser, console, log, sleep); } catch (e) { error = e; } })();
-  let timer; const guard = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('run: script exceeded ' + timeoutMs + 'ms')), timeoutMs); });
+  let timer; const guard = new Promise((_, rej) => { timer = setTimeout(() => { abort.aborted = true; rej(new Error('run: script exceeded ' + timeoutMs + 'ms')); }, timeoutMs); });
   try { await Promise.race([run, guard]); } finally { clearTimeout(timer); }
   if (error) throw new Error(error && error.message ? error.message : String(error));
   return { result: result === undefined ? null : result, logs };
