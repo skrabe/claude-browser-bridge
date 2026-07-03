@@ -76,10 +76,10 @@ are for one-off actions. `cdp` is the escape hatch for anything they don't cover
 | **Downloads** | `download_wait` · `downloads_list` |
 | **Escape hatch** | `cdp` *(any raw CDP command)* |
 
-Ships with the **`browser` skill** (`skill/`) — an always-loaded navigation map that leads with
-`run`, plus on-demand reference docs (`reference/*.md`): the **scripting playbook** (`run`
-page/locator API + patterns), the interaction loop, targeting, acting, safety, CDP recipes, and
-troubleshooting. Invoke it as `/browser`.
+Ships with the **`browser` skill** — a single self-contained `skill/SKILL.md` that leads with `run`
+(the scripting playbook: page/locator API + patterns) and covers targeting, the interaction loop,
+navigation/tabs, safety, troubleshooting, and the CDP escape hatch. Invoke it as `/browser`.
+(`skill/reference/*.md` + `SKILL.split.md` are a dormant fallback of the earlier split version.)
 
 ---
 
