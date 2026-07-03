@@ -665,6 +665,7 @@ chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) sta
 // Popup ↔ worker channel for secure credential entry. Secret values arrive here and go straight to
 // the page fill (fillCredentials); they are never logged or forwarded to the host/MCP side.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) return; // only our own popup/pages — never another extension or (absent externally_connectable) a web page
   if (!msg || !msg.token) return;
   const pend = pendingCredentials.get(msg.token);
   if (msg.type === 'cbb-cred-getspec') { sendResponse(pend ? pend.spec : { error: 'This request expired.' }); return; }

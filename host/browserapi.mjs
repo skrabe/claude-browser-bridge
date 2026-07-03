@@ -140,8 +140,14 @@ if (!window.__cbb) {
     if (op === 'snapshot') {
       const root = a.selector ? document.querySelector(a.selector) : document; if (!root) return '(selector matched nothing)';
       const INT = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton', 'menuitem', 'tab', 'option', 'listbox', 'heading']);
-      const lines = []; const seen = new Set(); let ref = 0;
-      for (const e of universe(root.documentElement ? root : root)) { if (!isVisible(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; const key = r + '\\u0000' + nm; const line = '[' + (++ref) + '] ' + r + (nm ? ' "' + nm.slice(0, 160) + '"' : '') + ('value' in e && e.value ? ' =' + String(e.value).slice(0, 80) : ''); lines.push(line); if (lines.join('\\n').length > (a.max || 20000)) { lines.push('… (truncated)'); break; } }
+      const ex = a.exclude || []; // prune nav chrome / cookie banners / ads by selector
+      const excluded = (e) => { for (const sel of ex) { try { if (e.closest && e.closest(sel)) return true; } catch {} } return false; };
+      // open dialogs/dropdowns render at end-of-body (portals) → surface them first so truncation can't drop them
+      const inPortal = (e) => { let n = e; while (n && n.nodeType === 1) { const rr = n.getAttribute && n.getAttribute('role'); if (rr && /^(dialog|alertdialog|menu|listbox)$/.test(rr.trim())) return true; if (n.getAttribute && n.getAttribute('aria-modal') === 'true') return true; n = n.parentElement; } return false; };
+      const portal = [], rest = [];
+      for (const e of universe(root.documentElement ? root : root)) { if (!isVisible(e) || excluded(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; (inPortal(e) ? portal : rest).push({ e, r, nm }); }
+      const lines = []; let ref = 0;
+      for (const it of portal.concat(rest)) { const b = a.boxes ? topBox(it.e) : null; const line = '[' + (++ref) + '] ' + it.r + (it.nm ? ' "' + it.nm.slice(0, 160) + '"' : '') + ('value' in it.e && it.e.value ? ' =' + String(it.e.value).slice(0, 80) : '') + (b ? ' [box=' + Math.round(b.x) + ',' + Math.round(b.y) + ',' + Math.round(b.w) + ',' + Math.round(b.h) + ']' : ''); lines.push(line); if (lines.join('\\n').length > (a.max || 20000)) { lines.push('… (truncated)'); break; } }
       return lines.join('\\n');
     }
     if (op === 'vdom') {
@@ -183,8 +189,11 @@ const shiftChar = (c) => (/^[a-z]$/.test(c) ? c.toUpperCase() : SHIFTED[c] || c)
 // Build a driver bound to one tab. `callHost(method, params)` reaches the extension. `abort` is a
 // shared {aborted} flag: once set (on run timeout), every further CDP call throws so a timed-out
 // script cannot keep clicking/navigating the user's real browser behind our back.
-export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
+export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets = new Map()) {
   const cdp = (method, params = {}, sessionId) => { if (abort.aborted) throw new Error('run aborted (timeout)'); return callHost('executeCdp', { tabId, cdpMethod: method, cdpParams: params, ...(sessionId ? { sessionId } : {}) }); };
+  // Resolve a fill/type argument: a {secret:'NAME'} object → the registered value (never re-stated in
+  // script text); a plain value passes through. Throws on an unknown secret name.
+  const secretVal = (v) => { if (v && typeof v === 'object' && v.secret != null) { const g = secrets.get ? secrets.get(v.secret) : secrets[v.secret]; if (g == null) throw new Error('unknown secret "' + v.secret + '" — register it with secret_set first'); return g; } return v; };
   const evalIn = async (op, arg, sessionId) => { const r = await cdp('Runtime.evaluate', { expression: asExpr(op, arg), returnByValue: true, awaitPromise: true }, sessionId); if (r && r.exceptionDetails) throw new Error('page eval failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; };
 
   let framesCache = null, framesCacheAt = 0;
@@ -274,10 +283,10 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
     async click(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; const mods = (o.modifiers || []).reduce((m, k) => m | (MOD[k] || 0), 0); const button = o.button || 'left'; const clicks = o.clickCount || (o._double ? 2 : 1); await mouse('mouseMoved', b.cx, b.cy); for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); await mouse('mouseReleased', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); } }
     async dblclick(o = {}) { return this.click({ ...o, _double: true }); }
     async hover(o = {}) { const t = await this._one('visible', o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one('visible', 2000)).box; await mouse('mouseMoved', b.cx, b.cy); }
-    async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this._q, i: t.i, value: String(value) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
+    async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this._q, i: t.i, value: String(secretVal(value)) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
     // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
     // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
-    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await cdp('Input.insertText', { text: String(value) }); }
+    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await cdp('Input.insertText', { text: String(secretVal(value)) }); }
     async press(keyChord, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await pressChord(cdp, keyChord); }
     async selectOption(values, o = {}) { const t = await this._one(true, o.timeoutMs); const arr = Array.isArray(values) ? values : [values]; const r = await evalIn('select', { steps: this._q, i: t.i, values: arr }, t.sessionId); if (!r || !r.ok) throw new Error('selectOption failed: ' + (r && r.err)); return r.selected; }
     async check(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this._q, i: t.i }, t.sessionId); if (s && s.checked) return; await this.click(o); }
@@ -343,7 +352,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
     async waitForLoadState(o = {}) { const state = o.state || 'load'; if (state === 'networkidle') { await callHost('waitFor', { tabId, state: 'networkidle', timeoutMs: Math.min((o.timeoutMs || 15000), 25000) }).catch(() => {}); return; } const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const r = await cdp('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if (state === 'load' && rs === 'complete') return; await sleep(120); } },
     async waitForURL(pattern, o = {}) { const deadline = Date.now() + Math.min((o && o.timeoutMs) || 15000, 60000); const re = pattern instanceof RegExp ? pattern : null; while (Date.now() < deadline) { const u = await this.url(); if (u && (re ? re.test(u) : u.includes(pattern))) return; await sleep(150); } throw new Error('waitForURL timed out: ' + pattern); },
     async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } throw new Error('expectNavigation: no matching navigation within timeout' + (o.url ? ' (url ' + o.url + ')' : '')); },
-    async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000; const main = await evalIn('snapshot', { selector: sel, max }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; for (const f of frames) { let s; try { s = await evalIn('snapshot', { selector: sel, max: 4000 }, f.sessionId); } catch { continue; } if (s && !/^\(/.test(s)) parts.push('— frame ' + (f.url || '') + ' —\n' + s); } return parts.join('\n'); },
+    async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000, exclude = (o && o.exclude) || undefined, boxes = !!(o && o.boxes); const main = await evalIn('snapshot', { selector: sel, max, exclude, boxes }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; for (const f of frames) { let s; try { s = await evalIn('snapshot', { selector: sel, max: 4000, exclude, boxes }, f.sessionId); } catch { continue; } if (s && !/^\(/.test(s)) parts.push('— frame ' + (f.url || '') + ' —\n' + s); } return parts.join('\n'); },
     async snapshot(o) { return this.domSnapshot(o); },
     async screenshot(o = {}) { const params = { format: 'png' }; if (o.fullPage) { params.captureBeyondViewport = true; const m = await cdp('Page.getLayoutMetrics').catch(() => ({})); const cs = m.cssContentSize || m.contentSize; if (cs) params.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 }; } if (o.clip) params.clip = { ...o.clip, scale: 1 }; const r = await cdp('Page.captureScreenshot', params); return { __image: r.data, mimeType: 'image/png' }; },
     // Real JS-dialog handling: read the pending alert/confirm/prompt (recorded by the extension on
@@ -382,8 +391,8 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
 
   const browser = {
     async openTabs() { const r = await callHost('getUserTabs', {}); return (r.tabs || []).map((t) => ({ id: String(t.id), title: t.title, url: t.url, tabGroup: t.tabGroup, lastOpened: t.lastAccessed })); },
-    async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id, abort).page; },
-    async newTab(url) { const r = await callHost('createTab', { url: url || 'about:blank' }); return makeBrowser(callHost, r.id, abort).page; },
+    async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id, abort, secrets).page; },
+    async newTab(url) { const r = await callHost("createTab", { url: url || "about:blank" }); return makeBrowser(callHost, r.id, abort, secrets).page; },
     async nameSession() { /* no-op: our tabs aren't session-scoped */ },
     // Batch: load each URL in a background tab, extract (title + interactable snapshot + text),
     // close the tab. Does not disturb the user's selected tab. For research / multi-source reads.
@@ -396,7 +405,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
         try {
           const r = await callHost('createTab', { url: String(url), active: false });
           tab = r.id;
-          const p = makeBrowser(callHost, tab, abort).page;
+          const p = makeBrowser(callHost, tab, abort, secrets).page;
           await p.waitForLoadState({ state: 'load', timeoutMs: o.timeoutMs || 15000 });
           const title = await p.title().catch(() => null);
           const snapshot = o.snapshot === false ? undefined : await p.domSnapshot({ max }).catch(() => null);
@@ -415,9 +424,9 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
 }
 
 // Run a model-authored script with page/browser/tab/console injected. Returns { result, logs }.
-export async function runScript({ callHost, tabId, script, timeoutMs = 60000 }) {
+export async function runScript({ callHost, tabId, script, timeoutMs = 60000, secrets = new Map() }) {
   const abort = { aborted: false }; // set on timeout so the still-running script can't keep driving the browser
-  const { page, browser } = makeBrowser(callHost, tabId, abort);
+  const { page, browser } = makeBrowser(callHost, tabId, abort, secrets);
   const logs = [];
   const log = (...a) => { logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
   const console = { log, info: log, warn: log, error: log };
@@ -426,7 +435,10 @@ export async function runScript({ callHost, tabId, script, timeoutMs = 60000 }) 
   let result, error;
   const run = (async () => { try { result = await fn(page, page, browser, console, log, sleep); } catch (e) { error = e; } })();
   let timer; const guard = new Promise((_, rej) => { timer = setTimeout(() => { abort.aborted = true; rej(new Error('run: script exceeded ' + timeoutMs + 'ms')); }, timeoutMs); });
-  try { await Promise.race([run, guard]); } finally { clearTimeout(timer); }
-  if (error) throw new Error(error && error.message ? error.message : String(error));
+  let timedOut = false;
+  try { await Promise.race([run, guard]); } catch (e) { timedOut = true; error = e; } finally { clearTimeout(timer); }
+  // On any failure, still return the logs collected so far — partial progress the model can act on —
+  // instead of discarding them with a bare error.
+  if (error) return { error: error && error.message ? error.message : String(error), logs, ...(timedOut ? { timedOut: true } : {}) };
   return { result: result === undefined ? null : result, logs };
 }

@@ -105,6 +105,12 @@ function runMcpServer() {
     });
   }
   const num = { type: 'number' }, str = { type: 'string' };
+  // Named secrets: registered by the model (the user gave them in chat), filled into pages by NAME
+  // so the literal never re-enters script text/transcripts, and REDACTED out of every tool result so
+  // a page echo, network body, or console line can't leak them back. Defense-in-depth for logins.
+  const secrets = new Map();
+  const redact = (s) => { if (!secrets.size || typeof s !== 'string') return s; let out = s; for (const [name, val] of secrets) { if (val && out.includes(val)) out = out.split(val).join('‹secret:' + name + '›'); } return out; };
+
   const TOOLS = [
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
     { name: 'tab_claim', description: 'Take control of an EXISTING tab in place by id (from tabs_list). Attaches the debugger; does not open a new tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
@@ -122,8 +128,8 @@ function runMcpServer() {
     { name: 'read_console', description: 'Recent console messages / exceptions captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_network', description: 'Recent network requests (url, method, status) captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find), or by {x,y} coords. button:"right"|"middle" for context/aux click; double:true for double-click. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, button: str, double: { type: 'boolean' } }, required: ['tabId'] } },
-    { name: 'fill', description: 'Replace an input/textarea value by ref (clears first, fires input+change).', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
-    { name: 'type_text', description: 'Type text into the currently focused element (focus it first via click).', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
+    { name: 'fill', description: 'Replace an input/textarea value by ref (clears first, fires input+change). Pass value, OR secret:"NAME" to fill a registered secret without stating its literal.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str, secret: str }, required: ['tabId', 'ref'] } },
+    { name: 'type_text', description: 'Type text into the currently focused element (focus it first via click). Pass text, OR secret:"NAME" for a registered secret.', inputSchema: { type: 'object', properties: { tabId: num, text: str, secret: str }, required: ['tabId'] } },
     { name: 'press_key', description: 'Press a key/chord on the focused element (Enter, Tab, Escape, Arrow*, Meta+A). A single printable key also types its character.', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
     { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y}.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num }, required: ['tabId'] } },
     { name: 'hover', description: 'Move the pointer over an element by ref to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str }, required: ['tabId', 'ref'] } },
@@ -140,8 +146,11 @@ function runMcpServer() {
     { name: 'downloads_list', description: 'Recent downloads (id, url, filename, state) this session.', inputSchema: { type: 'object', properties: { limit: num } } },
     { name: 'act_batch', description: 'Run several actions in one round trip: actions=[{tool, args}] (fill/click/type_text/press_key/select_option/scroll/hover). Stops if a step navigates unexpectedly. Cuts round trips on multi-field forms.', inputSchema: { type: 'object', properties: { tabId: num, actions: { type: 'array', items: { type: 'object' } }, stopOnError: { type: 'boolean' } }, required: ['tabId', 'actions'] } },
     { name: 'credential_request', description: 'Sign in without seeing the secret: the USER types credentials into a secure popup Claude never sees; the bridge fills them into the page by selector and returns only a status (submitted/declined/origin_changed/locator_invalid/expired/submission_failed). Pass field SELECTORS + metadata, NEVER values. Use this instead of ever asking for a password/OTP in chat. fields:[{id,label,type,selector}]; optional submit:{selector,action:"click"|"enter"}.', inputSchema: { type: 'object', properties: { tabId: num, reason: str, fields: { type: 'array', items: { type: 'object' } }, submit: { type: 'object' }, timeoutMs: num }, required: ['tabId', 'fields'] } },
-    { name: 'run', description: 'THE fast path — run a JS automation script in ONE call and compose many steps with real control flow (loops, conditionals), instead of many atomic tool calls. Injected: `page` (Playwright-shaped, auto-waiting: page.getByRole/getByText/getByLabel/getByPlaceholder/getByTestId(id)/locator(css); on a locator .click()/.dblclick()/.fill(v)/.type(v)/.press("Enter")/.check()/.uncheck()/.selectOption(v)/.hover()/.focus(), and .count()/.first()/.nth(i)/.filter({hasText})/.waitFor({state})/.textContent()/.innerText()/.getAttribute(n)/.inputValue()/.isVisible()/.isChecked()/.boundingBox(); plus locator .setInputFiles(paths) (upload) and .dragTo(target); plus page.evaluate(fn,arg), page.goto(url)/url()/title()/reload()/goBack()/waitForLoadState({state})/waitForURL(p)/expectNavigation(fn,{url})/domSnapshot({selector})/screenshot({fullPage})/pdf({path})/export({format})/setViewport({width,height})/resetViewport()/getJsDialog()/consoleLogs()/waitForDownload()/elementFromPoint({x,y})/drag(from,to)/mouse.click(x,y)/mouse.wheel(x,y,dx,dy), and page.dom_cua.get_visible_dom()/click({node_id})/type({text})/scroll({x,y})); `browser` (openTabs()/claimTab(t)/newTab(url)/readUrls([urls])/history({query})); plus `log(...)` and `sleep(ms)`. Semantic locators pierce same-origin iframes + shadow DOM and reach cross-origin frames; clicks are real trusted mouse events. BULK READS: never loop nth(i)+innerText/getAttribute to scrape a list — do it in ONE page.evaluate that projects the whole array (per-element reads each cross the browser boundary). `return` any value to get it back. Use this for multi-step flows (forms, navigation, extraction); reach for atomic tools only for one-off actions.', inputSchema: { type: 'object', properties: { tabId: num, script: str, timeoutMs: num }, required: ['tabId', 'script'] } },
+    { name: 'run', description: 'THE fast path — run a JS automation script in ONE call and compose many steps with real control flow (loops, conditionals), instead of many atomic tool calls. Injected: `page` (Playwright-shaped, auto-waiting: page.getByRole/getByText/getByLabel/getByPlaceholder/getByTestId(id)/locator(css); on a locator .click()/.dblclick()/.fill(v) (or .fill({secret:"NAME"}) for a registered secret)/.type(v)/.press("Enter")/.check()/.uncheck()/.selectOption(v)/.hover()/.focus(), and .count()/.first()/.nth(i)/.filter({hasText})/.waitFor({state})/.textContent()/.innerText()/.getAttribute(n)/.inputValue()/.isVisible()/.isChecked()/.boundingBox(); plus locator .setInputFiles(paths) (upload) and .dragTo(target); plus page.evaluate(fn,arg), page.goto(url)/url()/title()/reload()/goBack()/waitForLoadState({state})/waitForURL(p)/expectNavigation(fn,{url})/domSnapshot({selector,exclude,boxes})/screenshot({fullPage})/pdf({path})/export({format})/setViewport({width,height})/resetViewport()/getJsDialog()/consoleLogs()/waitForDownload()/elementFromPoint({x,y})/drag(from,to)/mouse.click(x,y)/mouse.wheel(x,y,dx,dy), and page.dom_cua.get_visible_dom()/click({node_id})/type({text})/scroll({x,y})); `browser` (openTabs()/claimTab(t)/newTab(url)/readUrls([urls])/history({query})); plus `log(...)` and `sleep(ms)`. Semantic locators pierce same-origin iframes + shadow DOM and reach cross-origin frames; clicks are real trusted mouse events. BULK READS: never loop nth(i)+innerText/getAttribute to scrape a list — do it in ONE page.evaluate that projects the whole array (per-element reads each cross the browser boundary). `return` any value to get it back. Use this for multi-step flows (forms, navigation, extraction); reach for atomic tools only for one-off actions.', inputSchema: { type: 'object', properties: { tabId: num, script: str, timeoutMs: num }, required: ['tabId', 'script'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
+    { name: 'secret_set', description: 'Register a named secret (e.g. a password/OTP the user gave you) so you can fill it by NAME without re-stating the literal. Once set, its value is (a) fillable in run via `.fill({secret:"NAME"})` or in atomic fill via {secret:"NAME"}, and (b) auto-REDACTED from every tool result — so a page echo, network body, or console line can never leak it back. The value is not returned. Prefer this over pasting a secret into script text.', inputSchema: { type: 'object', properties: { name: str, value: str }, required: ['name', 'value'] } },
+    { name: 'secret_list', description: 'List the NAMES of registered secrets (never values).', inputSchema: { type: 'object', properties: {} } },
+    { name: 'secret_clear', description: 'Forget a registered secret by name, or all of them if no name is given.', inputSchema: { type: 'object', properties: { name: str } } },
   ];
 
   const MAP = {
@@ -161,8 +170,8 @@ function runMcpServer() {
     read_console: (a) => callHost('readConsole', a),
     read_network: (a) => callHost('readNetwork', a),
     click: (a) => callHost('click', a),
-    fill: (a) => callHost('fill', a),
-    type_text: (a) => callHost('typeText', a),
+    fill: (a) => callHost('fill', a.secret ? { ...a, value: secrets.get(String(a.secret)) ?? '' } : a),
+    type_text: (a) => callHost('typeText', a.secret ? { ...a, text: secrets.get(String(a.secret)) ?? '' } : a),
     press_key: (a) => callHost('pressKey', a),
     scroll: (a) => callHost('scroll', a),
     hover: (a) => callHost('hover', a),
@@ -178,8 +187,11 @@ function runMcpServer() {
     download_wait: (a) => callHost('waitDownload', a),
     downloads_list: (a) => callHost('listDownloads', a),
     credential_request: (a) => callHost('requestCredential', a),
-    run: async (a) => { const out = await runScript({ callHost, tabId: a.tabId, script: String(a.script || ''), timeoutMs: a.timeoutMs }); return out.result && out.result.__image ? { __image: out.result.__image, mimeType: out.result.mimeType } : out; },
+    run: async (a) => { const out = await runScript({ callHost, tabId: a.tabId, script: String(a.script || ''), timeoutMs: a.timeoutMs, secrets }); return out.result && out.result.__image ? { __image: out.result.__image, mimeType: out.result.mimeType } : out; },
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),
+    secret_set: (a) => { secrets.set(String(a.name), String(a.value ?? '')); return { ok: true, name: a.name }; },
+    secret_list: () => ({ names: [...secrets.keys()] }),
+    secret_clear: (a) => { if (a && a.name) secrets.delete(String(a.name)); else secrets.clear(); return { ok: true }; },
     // Host-side composition: run several existing tools in one round trip, aborting if a step
     // navigates unexpectedly (each action's status header carries the post-action url).
     act_batch: async (a) => {
@@ -217,10 +229,10 @@ function runMcpServer() {
         const fn = MAP[msg.params.name]; if (!fn) throw new Error('unknown tool: ' + msg.params.name);
         const r = await fn(msg.params.arguments || {});
         const content = (r && r.__image) ? [{ type: 'image', data: r.__image, mimeType: r.mimeType }]
-          : [{ type: 'text', text: typeof r === 'string' ? r : JSON.stringify(r) }];
+          : [{ type: 'text', text: redact(typeof r === 'string' ? r : JSON.stringify(r)) }];
         send({ jsonrpc: '2.0', id: msg.id, result: { content } });
       } catch (e) {
-        send({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'Error: ' + (e && e.message || e) }], isError: true } });
+        send({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: redact('Error: ' + (e && e.message || e)) }], isError: true } });
       }
     } else if (msg.id !== undefined) { send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'method not found' } }); }
   }
