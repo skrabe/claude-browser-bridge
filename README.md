@@ -31,6 +31,13 @@ compact codebase you can read in one sitting.
 
 ## Quickstart
 
+**Easiest — install it from [tweakcc-fixed](https://github.com/skrabe/tweakcc-fixed).** Run
+`npx -y tweakcc-fixed`, pick **Better Claude in Chrome**, and it fetches this repo, wires up the MCP
+server and the `/browser` skill, walks you through loading the extension once, and verifies the
+connection. Reinstall / repair / uninstall live in the same menu. No clone, no manual steps.
+
+Or install directly from a checkout of this repo:
+
 ```bash
 # 1. install the host + skill (global scope shown; --scope project also supported)
 node host/setup.mjs install --scope global
