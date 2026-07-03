@@ -44,7 +44,14 @@ survives layout shifts. Fall back to coordinates only from a `screenshot` when n
   ("Select…", "—") or a loading row means *not ready yet* — wait/re-observe, don't select it.
 - After filling a search/autocomplete field, check for a suggestions dropdown before moving on —
   many sites want an explicit pick (`click` the option, or `press_key Escape`) rather than the raw
-  typed text. This is the one fill that *does* need a follow-up check.
+  typed text. This is the one fill that *does* need a follow-up check. If the exact string yields
+  **no matching suggestion**, don't retype it identically — generalize or specialize it once (drop a
+  suffix, try the parent term), or infer from the options that *did* appear; never blind-copy a
+  wrong suggestion.
+- **A field that reformats input silently lies about success.** Phone masks, date pickers, currency
+  and card-number spacing rewrite what you typed. After filling a formatted field, read the value
+  back (`inputValue` / a scoped read) and reconcile it with what you intended — a non-empty field is
+  not proof the *right* value landed. Watch for a country-code already present before adding one.
 - Split OTP/verification-code input: focus the first box and `type_text` the **whole** code once
   before falling back to one `fill` per box — most auto-advance focus per keystroke.
 
