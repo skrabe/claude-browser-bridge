@@ -1,12 +1,15 @@
 # Scripting with `run` — the programmable primitive
 
-`run` executes one JavaScript automation script in the page's host and returns its value. It's the
-**default** way to drive the browser: compose locate + act + read + loop + branch in a single call
-instead of one MCP round trip per action. Think Playwright, scripted.
+`run` executes one JavaScript automation script and returns its value. It's the **default** way to
+drive the browser: compose locate + act + read + loop + branch in a single call instead of one MCP
+round trip per action. Think Playwright, scripted.
 
 ## The shape of a script
 
-The script body is an async function. These are in scope — no imports, no `require`:
+**The script runs in the host (Node), not in the page** — there is no `document`/`window`/`fetch` at
+the top level, and DOM access is only through locators or `page.evaluate`. (`return document.title`
+fails; use `return await page.title()`.) The body is an async function. These are in scope — no
+imports, no `require`:
 
 - **`page`** — the Playwright-shaped driver (locators, navigation, reads). `tab` is an alias.
 - **`browser`** — tabs (`openTabs`, `claimTab`, `newTab`).
@@ -69,9 +72,10 @@ you need them: `await loc.waitFor({state:'visible'|'hidden'|'attached'|'detached
 
 - Clicks are **real trusted mouse events** at the element's center (auto-scrolled into view first).
   `click({button:'right'})`, `click({modifiers:['Meta']})`, `click({clickCount:2})`.
-- `fill` clears then sets the value and fires `input`+`change` (works on input/textarea/
-  contenteditable). `type` appends via real key input without clearing — use for
-  search-as-you-type or contenteditable.
+- `fill` clears then sets the value and fires `input`+`change` (fast; works on input/textarea/
+  contenteditable). `type` appends **real per-character keystrokes** (keydown/keyup) without clearing
+  — use it when a widget reacts to keys (search-as-you-type, key-filtered inputs, per-key OTP boxes);
+  `fill` for everything else.
 - `check`/`uncheck` are **idempotent** — they read state first and no-op if already right.
 - `selectOption('US')` or `selectOption({label:'United States'})` / `{value:'us'}` / `{index:2}`
   (numbers coerce). For a **custom** (non-`<select>`) dropdown, `.selectOption` won't work — click to
@@ -86,17 +90,20 @@ you need them: `await loc.waitFor({state:'visible'|'hidden'|'attached'|'detached
 Single-value (strict, auto-wait): `textContent()` · `innerText()` · `inputValue()` ·
 `getAttribute(name)` · `boundingBox()`.
 Plural / boolean (no throw): `count()` · `all()` · `allTextContents()` · `isVisible()` ·
-`isEnabled()` · `isChecked()`.
+`isEnabled()` · `isChecked()`. (`count()`/`all()` cap at 500 matches per frame — for a bigger set,
+count in `evaluate` with `querySelectorAll().length`.)
 
 For a whole-page overview, prefer **`page.domSnapshot({selector, max, exclude, boxes})`** over the
-atomic `read_page`: a compact, **uncapped** list of visible interactables (`[n] role "name" =value`),
-scopable to a container and piercing frames/shadow — no 500-element ceiling. `exclude:['nav','.ads']`
-prunes chrome/cookie/ad noise; `boxes:true` appends `[box=x,y,w,h]` (coordinate grounding without a
-screenshot); open dialogs/dropdowns are surfaced first so truncation can't drop them. Use
-`page.evaluate(fn, arg)` to run arbitrary JS in the page and return a value (function is serialized;
-`arg` must be JSON-serializable; runs in the main frame). `evaluate` is also the **bulk-read
-primitive**: any time you'd read a property off many elements, do it in one `evaluate` that projects
-the whole array, not a locator loop.
+atomic `read_page`: a compact list of visible interactables (`[n] role "name" =value`), scopable to a
+container and piercing frames/shadow — **no element cap** (unlike `read_page`'s 500), but
+char-budgeted (default 20k, `… (truncated)` past it; raise via `max` — each cross-origin frame gets
+4k). `exclude:['nav','.ads']` prunes chrome/cookie/ad noise; `boxes:true` appends `[box=x,y,w,h]`
+(coordinate grounding without a screenshot); open dialogs/dropdowns are surfaced first so truncation
+can't drop them. Use `page.evaluate(fn, arg)` to run arbitrary JS **in the page** and return a value —
+the function is serialized (`.toString()`), so it has **no closures** (it can't see your script's
+variables; pass data via the single JSON-serializable `arg`), and it runs in the main frame.
+`evaluate` is also the **bulk-read primitive**: any time you'd read a property off many elements, do
+it in one `evaluate` that projects the whole array, not a locator loop.
 
 **Snapshot discipline.** One broad observation orients you; then narrow. Take a fresh `domSnapshot()`
 after a navigation, and after a click that timed out / a strict-mode failure / a bad selector, before
@@ -110,7 +117,9 @@ scoped check answers the question.
 `expectNavigation(action,{url})` · `screenshot({fullPage,clip})` · `close()`.
 
 - `goto` waits for `load` by default. `waitForURL('/checkout')` (substring) or `/\/orders\/\d+/`.
-- Wrap a click that triggers navigation: `await page.expectNavigation(() => btn.click(), {url:/success/})`.
+- Wrap a click that triggers navigation: `await page.expectNavigation(() => btn.click(), {url:/success/})`
+  — it detects a **URL change**, so for a same-URL reload/SPA re-render, wait on a content signal
+  (`waitForLoadState` / a `.waitFor` on the new element) instead.
 
 ## Tabs
 
@@ -211,10 +220,37 @@ if (await page.getByText('Accept cookies').isVisible()) {
 }
 ```
 
+**Fan out across tabs** (independent reads on *different* pages run concurrently — a real N× win):
+```js
+const [ordersPage, adminPage] = [await browser.claimTab(t1), await browser.newTab(u2)];
+const [orders, users] = await Promise.all([
+  ordersPage.evaluate(() => [...document.querySelectorAll('.order')].map(o => o.textContent)),
+  adminPage.evaluate(() => [...document.querySelectorAll('.user')].map(u => u.textContent)),
+]);
+```
+Never `Promise.all` actions on the **same** page — they race the shared focus/pointer. (`browser.readUrls([...])` already parallelizes multi-URL reads for you.)
+
+**A click that opens a new tab** (`target=_blank`, OAuth popup) — your `page` still points at the old
+tab; grab the new one:
+```js
+const before = new Set((await browser.openTabs()).map(t => t.id));
+await page.getByRole('link', { name: 'Open report' }).click();
+await sleep(400);
+const fresh = (await browser.openTabs()).find(t => !before.has(t.id));
+const p2 = await browser.claimTab(fresh);
+```
+
+**Virtualized / infinite lists** render only the visible rows — one `evaluate` sees a fraction, and a
+count check passes for the wrong reason. Scroll-collect-dedupe by a stable key until the set stops
+growing, rather than trusting a single projection.
+
 ## Doctrine
 
-- **One script per flow.** Multi-step interactions belong in a single `run`, not a chain of atomic
-  tool calls. That's the whole point — it's how the browser feels smooth.
+- **One script per flow — but a confirmation boundary splits it.** Multi-step interactions belong in
+  a single `run`, not a chain of atomic calls. *Except* around a consequential action (buy, send,
+  delete, submit that transmits data — see `safety.md`): end the script **before** that click, return
+  the staged state for the user to confirm, and commit in a **second** `run`. Don't let one script
+  fill *and* place the order.
 - **Semantic first.** Prefer role/text/label locators over CSS, and CSS over coordinates.
 - **Let it wait.** Don't scatter `sleep`s or pre-checks; auto-wait covers timing. Add explicit
   `waitFor` / `waitForURL` only for real async boundaries. Don't pass `timeoutMs` to routine

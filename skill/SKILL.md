@@ -44,12 +44,14 @@ return await page.getByRole('heading').first().innerText();
 - **Act:** `.click()` `.dblclick()` `.fill(v)` `.type(v)` `.press('Enter')` `.check()` `.uncheck()`
   `.selectOption(v)` `.hover()` `.focus()`. Clicks are real trusted mouse events.
 - **Read:** `.textContent()` `.innerText()` `.getAttribute(n)` `.inputValue()` `.count()`
-  `.isVisible()` `.isChecked()` `.boundingBox()`; `page.domSnapshot({selector})` for a compact,
-  uncapped view of the page's interactables; `page.evaluate(fn, arg)` to run JS in the page.
+  `.isVisible()` `.isChecked()` `.boundingBox()`; `page.domSnapshot({selector})` for a compact view of
+  the page's interactables (no 500-element cap, char-budgeted); `page.evaluate(fn, arg)` to run JS in
+  the page (and the way to bulk-read — never loop `.nth(i)` reads).
 - **Navigate/wait:** `page.goto(url)` `page.url()` `page.reload()` `page.waitForLoadState({state})`
   `page.waitForURL(p)` `page.expectNavigation(fn, {url})`.
 - **Compose:** it's real JS — loop over rows, branch on state, retry, build an array and `return`
-  it. One `run` call replaces a dozen atomic round trips.
+  it. One `run` call replaces a dozen atomic round trips. The script runs in the **host**, not the
+  page — no `document`/`window` at top level; reach the DOM via locators or `page.evaluate`.
 - **Tabs:** `browser.openTabs()`, `browser.claimTab(t)`, `browser.newTab(url)`; `screenshot`,
   `dom_cua` (coordinate/vision fallback) are on `page` too.
 

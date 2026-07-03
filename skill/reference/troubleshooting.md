@@ -23,8 +23,17 @@ The native host is spawned by the browser when the extension connects. If a tool
 
 ## Navigation seems stuck
 - The last action's status header shows the landed URL/title — a client-side route change may
-  already have happened without a full load. To poll later without acting: `cdp Runtime.evaluate
-  { expression:"location.href", returnByValue:true }`.
+  already have happened without a full load. To check the URL without acting, prefer a `run`
+  (`return await page.url()`) or `wait_for {urlIncludes}`; raw `cdp Runtime.evaluate
+  { expression:"location.href", returnByValue:true }` also works.
+
+## A `run` script failed
+- `run` returns `{error, logs}` (not a bare error) — read `logs` to see how far it got before the
+  break. `timedOut:true` means the 60s cap hit and the abort flag stopped further CDP **mid-flow**:
+  the page state is **unknown**. Re-orient (`read_page`/`domSnapshot`) before continuing, and never
+  blind-rerun a script whose committed half (a submit/click) may already have executed.
+- A `strict mode: N elements match` throw is your locator, not the page — refine it
+  (`.first()`/`.nth()`/`.filter()`), don't retry as-is.
 
 ## Screenshot is blank/stale on a background tab
 - CDP screenshots a background tab can be stale. `tab_activate` it briefly, or rely on `read_page`
