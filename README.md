@@ -61,7 +61,7 @@ installer registers with every detected Chromium browser automatically.
 
 ## Tools
 
-36 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
+39 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
 are for one-off actions. `cdp` is the escape hatch for anything they don't cover.
 
 | Group | Tools |
@@ -72,6 +72,7 @@ are for one-off actions. `cdp` is the escape hatch for anything they don't cover
 | **Read / observe** | `read_page` *(a11y tree + refs, incl. cross-origin frames)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page)* · `read_console` · `read_network` · `network_body` |
 | **Act** | `click` *(right/double)* · `fill` · `type_text` · `press_key` · `select_option` · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
 | **Auth & dialogs** | `credential_request` *(secure popup)* · `dialog_handle` |
+| **Secrets** | `secret_set` / `secret_list` / `secret_clear` *(fill by name; the literal is auto-redacted from every tool result so a page echo / network body / console line can't leak it)* |
 | **Downloads** | `download_wait` · `downloads_list` |
 | **Escape hatch** | `cdp` *(any raw CDP command)* |
 
