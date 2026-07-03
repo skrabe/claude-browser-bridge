@@ -8,8 +8,9 @@
 import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
+import { runScript } from './browserapi.mjs';
 
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -139,6 +140,7 @@ function runMcpServer() {
     { name: 'downloads_list', description: 'Recent downloads (id, url, filename, state) this session.', inputSchema: { type: 'object', properties: { limit: num } } },
     { name: 'act_batch', description: 'Run several actions in one round trip: actions=[{tool, args}] (fill/click/type_text/press_key/select_option/scroll/hover). Stops if a step navigates unexpectedly. Cuts round trips on multi-field forms.', inputSchema: { type: 'object', properties: { tabId: num, actions: { type: 'array', items: { type: 'object' } }, stopOnError: { type: 'boolean' } }, required: ['tabId', 'actions'] } },
     { name: 'credential_request', description: 'Sign in without seeing the secret: the USER types credentials into a secure popup Claude never sees; the bridge fills them into the page by selector and returns only a status (submitted/declined/origin_changed/locator_invalid/expired/submission_failed). Pass field SELECTORS + metadata, NEVER values. Use this instead of ever asking for a password/OTP in chat. fields:[{id,label,type,selector}]; optional submit:{selector,action:"click"|"enter"}.', inputSchema: { type: 'object', properties: { tabId: num, reason: str, fields: { type: 'array', items: { type: 'object' } }, submit: { type: 'object' }, timeoutMs: num }, required: ['tabId', 'fields'] } },
+    { name: 'run', description: 'THE fast path — run a JS automation script in ONE call and compose many steps with real control flow (loops, conditionals), instead of many atomic tool calls. Injected: `page` (Playwright-shaped, auto-waiting: page.getByRole/getByText/getByLabel/getByPlaceholder/getByTestId(id)/locator(css); on a locator .click()/.dblclick()/.fill(v)/.type(v)/.press("Enter")/.check()/.uncheck()/.selectOption(v)/.hover()/.focus(), and .count()/.first()/.nth(i)/.filter({hasText})/.waitFor({state})/.textContent()/.innerText()/.getAttribute(n)/.inputValue()/.isVisible()/.isChecked()/.boundingBox(); plus page.evaluate(fn,arg), page.goto(url)/url()/title()/reload()/goBack()/waitForLoadState({state})/waitForURL(p)/expectNavigation(fn,{url})/domSnapshot({selector})/screenshot({fullPage}), and page.dom_cua.get_visible_dom()/click({node_id})/type({text})/scroll({x,y})); `browser` (openTabs()/claimTab(t)/newTab(url)); plus `log(...)` and `sleep(ms)`. Semantic locators pierce same-origin iframes + shadow DOM and reach cross-origin frames; clicks are real trusted mouse events. `return` any value to get it back. Use this for multi-step flows (forms, navigation, extraction); reach for atomic tools only for one-off actions.', inputSchema: { type: 'object', properties: { tabId: num, script: str, timeoutMs: num }, required: ['tabId', 'script'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
   ];
 
@@ -176,6 +178,7 @@ function runMcpServer() {
     download_wait: (a) => callHost('waitDownload', a),
     downloads_list: (a) => callHost('listDownloads', a),
     credential_request: (a) => callHost('requestCredential', a),
+    run: async (a) => { const out = await runScript({ callHost, tabId: a.tabId, script: String(a.script || ''), timeoutMs: a.timeoutMs }); return out.result && out.result.__image ? { __image: out.result.__image, mimeType: out.result.mimeType } : out; },
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),
     // Host-side composition: run several existing tools in one round trip, aborting if a step
     // navigates unexpectedly (each action's status header carries the post-action url).
