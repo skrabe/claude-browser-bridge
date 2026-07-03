@@ -2,8 +2,8 @@
 
 **Let Claude Code drive your real, logged-in browser.** It sees and *claims* the tabs you already
 have open — your cookies, your sessions, your logins — and reads, fills, clicks, and navigates them
-over the Chrome DevTools Protocol. Owned end to end: no third-party service, no network port, ~600
-lines you can read in one sitting.
+over the Chrome DevTools Protocol. Owned end to end: no third-party service, no network port, a
+compact codebase you can read in one sitting.
 
 > A fuller, self-hosted take on "Claude in Chrome" — it works *with* your existing signed-in
 > browser instead of spinning up a fresh sandbox.
@@ -12,6 +12,10 @@ lines you can read in one sitting.
 
 ## Why it's different
 
+- **Programmable, not one-op-at-a-time.** The `run` tool executes a JavaScript automation script in
+  one call, driving a Playwright-shaped `page` with semantic, **auto-waiting** locators
+  (`getByRole`/`getByText`/`getByLabel`/…) — locate, fill, click, wait, loop, and read a whole flow
+  in a single round trip instead of a tool call per action. This is what makes it feel fast.
 - **Your real session, not a sandbox.** `tabs_list` shows every tab across every window; `tab_claim`
   takes control of one *in place*. No re-login, no fresh profile.
 - **Sees inside cross-origin iframes.** Stripe card fields, "Sign in with Google" frames, embedded
@@ -21,7 +25,7 @@ lines you can read in one sitting.
 - **Cheap by design.** Every action returns a status header (`{url, title, new console errors}`) so
   the agent usually skips a follow-up read. Screenshots auto-downscale to the model's vision limits.
 - **Private.** No TCP port anywhere — a `0600` unix socket + Chrome native messaging, with the
-  extension id pinned in the manifest. ~600 auditable lines.
+  extension id pinned in the manifest. A small, auditable codebase.
 
 ---
 
@@ -57,10 +61,12 @@ installer registers with every detected Chromium browser automatically.
 
 ## Tools
 
-35 MCP tools. Prefer the high-level ones; `cdp` is the escape hatch for anything they don't cover.
+36 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
+are for one-off actions. `cdp` is the escape hatch for anything they don't cover.
 
 | Group | Tools |
 |---|---|
+| **Programmable** | `run` *(JS script: Playwright-shaped `page`/locators — getByRole/Text/Label, click/fill/press/check/selectOption/setInputFiles/dragTo, evaluate, waitForURL, domSnapshot, pdf, screenshot; `browser` — openTabs/claimTab/newTab/readUrls/history; auto-waiting, pierces frames + shadow DOM)* |
 | **Tabs** | `tabs_list` · `tab_claim` · `tab_create` *(group by topic)* · `tab_activate` · `tab_release` · `tab_close` |
 | **Navigate** | `navigate` *(waits for load)* · `reload` · `go_back` · `go_forward` · `wait_for` |
 | **Read / observe** | `read_page` *(a11y tree + refs, incl. cross-origin frames)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page)* · `read_console` · `read_network` · `network_body` |
@@ -69,9 +75,10 @@ installer registers with every detected Chromium browser automatically.
 | **Downloads** | `download_wait` · `downloads_list` |
 | **Escape hatch** | `cdp` *(any raw CDP command)* |
 
-Ships with the **`browser` skill** (`skill/`) — an always-loaded navigation map plus on-demand
-reference docs (`reference/*.md`) for the interaction loop, targeting, acting, safety, CDP recipes,
-and troubleshooting. Invoke it as `/browser`.
+Ships with the **`browser` skill** (`skill/`) — an always-loaded navigation map that leads with
+`run`, plus on-demand reference docs (`reference/*.md`): the **scripting playbook** (`run`
+page/locator API + patterns), the interaction loop, targeting, acting, safety, CDP recipes, and
+troubleshooting. Invoke it as `/browser`.
 
 ---
 
