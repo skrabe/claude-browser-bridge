@@ -29,6 +29,12 @@ if (!window.__cbb) {
     table: () => 'table', tr: () => 'row', td: () => 'cell', th: () => 'columnheader', thead: () => null, form: () => 'form',
     select: () => 'combobox', option: () => 'option', textarea: () => 'textbox', article: () => 'article', main: () => 'main',
     dialog: () => 'dialog', summary: () => 'button', progress: () => 'progressbar', output: () => 'status',
+    // header/footer are landmarks only at the top level (generic inside a sectioning element);
+    // section is a region only when it has an accessible name (ARIA rules).
+    header: (e) => (e.closest && e.closest('article,aside,main,nav,section') ? null : 'banner'),
+    footer: (e) => (e.closest && e.closest('article,aside,main,nav,section') ? null : 'contentinfo'),
+    aside: () => 'complementary', section: (e) => (e.getAttribute('aria-label') || e.getAttribute('aria-labelledby') ? 'region' : null),
+    fieldset: () => 'group', figure: () => 'figure', hr: () => 'separator', datalist: () => 'listbox', meter: () => 'meter',
     input: (e) => { const t = (e.getAttribute('type') || 'text').toLowerCase();
       return ({ checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton', button: 'button', submit: 'button', reset: 'button', image: 'button',
         search: 'searchbox', email: 'textbox', tel: 'textbox', url: 'textbox', text: 'textbox', password: 'textbox' })[t] || (t === 'hidden' ? null : 'textbox'); },
@@ -328,7 +334,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }) {
       return null;
     },
     async url() { try { const r = await cdp('Runtime.evaluate', { expression: 'location.href', returnByValue: true }); return r.result.value; } catch { return null; } },
-    async title() { const r = await cdp('Runtime.evaluate', { expression: 'document.title', returnByValue: true }); return r.result.value; },
+    async title() { try { const r = await cdp('Runtime.evaluate', { expression: 'document.title', returnByValue: true }); return r && r.result ? r.result.value : null; } catch { return null; } },
     async reload(o = {}) { await cdp('Page.reload', {}); await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: o.timeoutMs }); },
     async goBack() { await this.evaluate(() => history.back()); await sleep(300); },
     async goForward() { await this.evaluate(() => history.forward()); await sleep(300); },
