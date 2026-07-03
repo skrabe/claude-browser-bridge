@@ -12,6 +12,7 @@ const html = `<!doctype html><html><body>
     <select id="sel"><option value="1">One</option><option value="2">Two</option></select>
   </form>
   <ul><li>alpha</li><li>beta</li><li>gamma</li></ul>
+  <div role="dialog"><button type="button">Confirm</button></div>
 </body></html>`;
 const dom = new JSDOM(html, { runScripts: 'dangerously', pretendToBeVisual: true, url: 'https://example.test/page' });
 const win = dom.window;
@@ -104,6 +105,14 @@ await check('#12 press Shift+a returns', `await page.getByLabel('Email').press('
 await check('#4 goto throws on nav failure', `try{ await page.goto('https://blocked.invalid'); return 'no-throw'; }catch(e){ return /goto failed/.test(e.message)?'threw':e.message; }`, 'threw');
 await check('#5 expectNavigation throws on timeout', `try{ await page.expectNavigation(()=>{}, {url:/nope/, timeoutMs:250}); return 'no-throw'; }catch(e){ return /no matching navigation/.test(e.message)?'threw':e.message; }`, 'threw');
 await check('#10 dom_cua.double_click guards missing node', `try{ await page.dom_cua.double_click({node_id:'99999'}); return 'no-throw'; }catch(e){ return /double_click/.test(e.message)?'threw':e.message; }`, 'threw');
+
+// ── competitor-tips features ──
+{ const r = await runScript({ callHost, tabId: 1, script: `await page.getByLabel('Email').fill({secret:'pw'}); return await page.getByLabel('Email').inputValue();`, timeoutMs: 8000, secrets: new Map([['pw', 's3cr3t!']]) }); const ok = r.result === 's3cr3t!'; console.log((ok?'  ok  ':'  FAIL')+' secret fill-by-name resolves the registered value'+(ok?'':`  got=${JSON.stringify(r)}`)); ok?pass++:fail++; }
+{ const r = await runScript({ callHost, tabId: 1, script: `try{ await page.getByLabel('Email').fill({secret:'nope'}); return 'no-throw'; }catch(e){ return /unknown secret/.test(e.message)?'threw':e.message; }`, timeoutMs: 8000, secrets: new Map() }); const ok = r.result === 'threw'; console.log((ok?'  ok  ':'  FAIL')+' unknown secret name throws a clear error'); ok?pass++:fail++; }
+{ const r = await runScript({ callHost, tabId: 1, script: `log('step-1'); throw new Error('boom');`, timeoutMs: 8000 }); const ok = r.error && /boom/.test(r.error) && Array.isArray(r.logs) && r.logs.includes('step-1'); console.log((ok?'  ok  ':'  FAIL')+' error result preserves logs (partial progress)'+(ok?'':`  got=${JSON.stringify(r)}`)); ok?pass++:fail++; }
+await check('domSnapshot boxes annotation', `return /\\[box=-?\\d+,-?\\d+,\\d+,\\d+\\]/.test(await page.domSnapshot({boxes:true}));`, true);
+await check('domSnapshot exclude prunes a subtree', `return (await page.domSnapshot({exclude:['ul']})).includes('alpha');`, false);
+await check('domSnapshot portal/overlay content sorted first', `const s = await page.domSnapshot(); return s.indexOf('Confirm')>=0 && s.indexOf('Confirm') < s.indexOf('Save changes');`, true);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
