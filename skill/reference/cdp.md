@@ -48,4 +48,5 @@ cdp DOM.querySelector { nodeId, selector }
 - `Page`/`DOM`/`Runtime`/`Accessibility`/`Network`/`Log` are pre-enabled on claim; enable any other
   domain before use. CDP is per-tab, scoped to the tab's session.
 - Before overriding device metrics / viewport via raw CDP, check whether the `screenshot` tool's
-  own options already cover the need — an override resizes the user's real browser window.
+  own options (or `page.setViewport()` in `run`) already cover the need — an override re-renders the
+  tab's viewport for emulation; it does **not** resize the user's real browser window.

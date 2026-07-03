@@ -1,11 +1,16 @@
 # Interaction loop — observe cheaply, act, verify
 
+> Written in the **atomic-tool dialect**. In a `run` script the equivalents are: `read_page`→
+> `page.domSnapshot()`, `dom_query`→`page.locator(css)`, a `ref`→a locator, `act_batch`→just one
+> script, and there is no status header (a script returns `{result, logs}`). The *principles* below
+> apply to both.
+
 The expensive mistake in browser work is over-observing: dumping the page after every action.
 Discipline here is the difference between fast/clean and slow/spammy.
 
 ## Cheapest state check
-After an action, first read its **status header** ({url, title, new console errors/warnings}) —
-often that alone answers the next question. Only then take the *single* cheapest read that answers
+After an action, first read its **status header** ({url, title, new console errors/warnings, and
+`openDialog` when an alert/confirm/prompt is up}) — often that alone answers the next question. Only then take the *single* cheapest read that answers
 it (one lens — see `reading-pages.md`; never `read_page` + `screenshot` by default).
 
 ## Reuse, don't refetch

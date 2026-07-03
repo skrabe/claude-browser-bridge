@@ -1,5 +1,9 @@
 # Reading pages — pick the right lens, don't over-read
 
+> Atomic-tool dialect. In a `run` script: `read_page`→`page.domSnapshot()`, `read_text`→
+> `page.evaluate(() => document.body.innerText)`, `dom_query`→`page.locator(css)`, and structured
+> extraction → one `page.evaluate` that projects the data. The lens-choice *principles* below apply.
+
 ## Which reader
 - **`read_page`** — accessibility tree: roles, accessible names, and a **ref** per interactable
   element. Best default for *understanding structure and building targets*. Compact vs raw DOM.
@@ -27,5 +31,6 @@
 - Scope first (find the container/table), then extract from *that*.
 - Need a link/URL? Read the element's actual `href` via `dom_query` — never reconstruct or guess
   a URL from truncated or visible anchor text.
-- For a bounded, already-identified set, a single `cdp` → `Runtime.evaluate` that queries and
-  projects exactly the fields you need (return by value, limit rows) beats many small reads.
+- For a bounded, already-identified set, a single **`run` with `page.evaluate`** that queries and
+  projects exactly the fields you need (limit rows) beats many small reads. (Raw `cdp`
+  `Runtime.evaluate` does the same but with more ceremony — prefer `run`.)

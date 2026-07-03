@@ -1,5 +1,9 @@
 # Finding elements — target before you act
 
+> Atomic-tool dialect. In a `run` script: a `ref` → a **locator**, `dom_query` count →
+> `page.locator(css).count()`, `read_page` → `page.domSnapshot()`. The targeting *principles*
+> (uniqueness, the durability ladder) apply to both — a locator is just a re-findable ref.
+
 Never act on an element you haven't located and confirmed. Acting blind (guessed coordinates,
 guessed selectors) is the top cause of wrong clicks.
 

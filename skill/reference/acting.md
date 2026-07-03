@@ -1,5 +1,9 @@
 # Acting — click, type, select, scroll, drag
 
+> Atomic-tool dialect. In a `run` script these are locator methods — `click`→`.click()`,
+> `fill`→`.fill()`, `type_text`→`.type()`, `select_option`→`.selectOption()`, `upload_file`→
+> `.setInputFiles()` — with the same semantics and the same rules below.
+
 Act **by element ref** (from `read_page`/`dom_query`) whenever possible — it's precise and
 survives layout shifts. Fall back to coordinates only from a `screenshot` when no ref exists.
 
