@@ -100,6 +100,18 @@ need a manual `sleep` or a pre-check. Explicit waits: `await loc.waitFor({state:
   the literal in your script — it's auto-redacted from every result. Prefer it for passwords/OTPs.
 - **Formatted fields lie:** after filling a phone/date/currency/card field, read `.inputValue()`
   back and reconcile — a mask silently rewrites what you typed.
+- **Choice controls: match the EXACT rendered label, never a paraphrase.** "I am not a protected
+  veteran" is not "No" — map yes/no-shaped data straight onto the matching exact-text option, and
+  **never invert it**. A checkbox/radio that reports hidden or won't change → click its scoped
+  visible `label`/enclosing control once and verify the checked state; don't hammer the hidden input.
+- **OTP / split code:** focus the first box and `type` the **whole** code once (most auto-advance per
+  keystroke) before falling back to one `fill` per box.
+- **Submit with `press('Enter')`** on the focused field when the form supports it, rather than
+  hunting for a submit button.
+- **Don't assume every click navigates.** Opening a menu/filter/accordion changes UI *state*, not the
+  page — wait for the expected element to appear, not for a page load.
+- **Scrolling:** if a page-level scroll does nothing, the content is in its own scrollable sub-panel
+  (modal body, side list, chat log) — scroll a locator/ref **inside that container**, not the page.
 
 ## Reads
 
@@ -146,7 +158,8 @@ a new one.
 - **Download:** trigger it, then `const {path} = await page.waitForDownload()` — `Read` that path.
 - **Dialogs:** a native `alert`/`confirm`/`prompt` **freezes the tab** until handled; after an
   action that may pop one, `const d = await page.getJsDialog()` → `null` or `{type, message, accept,
-  dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a "discard changes?").
+  dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a "discard changes?"). (`beforeunload`
+  is auto-accepted so it can't wedge navigation.)
 - **Console:** `await page.consoleLogs({limit})` — for debugging a local app.
 - **Save the page:** `await page.pdf({path})` or `page.export({format:'text'})` → `{path, bytes}`.
 - **Responsive:** `await page.setViewport({width:390, height:844, mobile:true})` then
@@ -166,6 +179,45 @@ pixels on Retina (use `[box]`/`elementFromPoint`, not raw screenshot coords).
 
 ---
 
+# Atomic tools — the one-off fallback
+
+For a single action or a quick look, the atomic tools are simpler than a whole `run` script. Each
+returns a **status header** ({url, title, new console errors/warnings, `openDialog`}) — usually all
+the verification you need.
+
+**See & target**
+- `tabs_list` · `tab_claim` · `tab_create` · `tab_activate` · `tab_release` · `tab_close`.
+- `read_page` — accessibility tree with a stable **ref** per interactable (role + name), including
+  cross-origin frames (tagged `frame:true`). Capped ~500 elements; on a huge page narrow first.
+- `read_text` — visible innerText, for reading prose once you're on the right page.
+- `find_text` — does a word/phrase appear **anywhere** (incl. off-screen, not yet scrolled)? Returns
+  a count + context snippets. Cheaper than a scroll+read loop. `regex:true` for a pattern.
+- `find` — keyword search over roles/names; ≤10 ranked candidate refs. Query with the element's
+  **label words** ("subscribe newsletter"), never visual descriptions ("the blue button" matches
+  nothing). Confirm the winner before acting — cheap but context-free.
+- `dom_query` — a CSS selector → match count + a ref & attrs each. **Top-document only** (a selector
+  can't cross an origin boundary — use `read_page`/`find` to target inside a frame). Confirm
+  existence/uniqueness.
+- **Lens choice:** `read_page` for structure/refs, `read_text` for prose, `find_text` for "does X
+  appear", `screenshot` for visual layout. Pick the **one** that answers the next question.
+
+**Act** (by ref): `click` (right/middle via `button:`, `double:true`) · `fill` · `type_text` ·
+`press_key` · `select_option` · `scroll` · `hover` · `drag` · `upload_file`. `fill`/`type_text` also
+take `{secret:"NAME"}`. The acting judgment above (exact labels, checkbox `label[for]`, don't-assume-
+navigation) applies here too.
+
+**Wait & compose**
+- `wait_for` — block until a condition instead of polling `read_page`: `{state:"load"|"networkidle"}`,
+  or `selector` / `text` / `textGone` / `urlIncludes` (caps at 25s). One call replaces an N-poll loop.
+- `act_batch` — run a sequence (`fill`→`fill`→`click`…) in one round trip, stopping if a step
+  navigates unexpectedly. For multi-field forms whose refs you already resolved.
+- Also: `dialog_handle`, `download_wait` / `downloads_list`, `credential_request`,
+  `secret_set` / `secret_list` / `secret_clear`, `read_console` / `read_network` / `network_body`,
+  `screenshot` (ref = just that element; `fullPage:true` = whole page), `navigate` / `reload` /
+  `go_back` / `go_forward`, `cdp`.
+
+---
+
 # The loop
 
 1. **Orient** — `tabs_list` to see real tabs; `tab_claim` an existing one, or `tab_create`.
@@ -180,7 +232,10 @@ pixels on Retina (use `[box]`/`elementFromPoint`, not raw screenshot coords).
 
 - **One broad observation to orient, then narrow.** Never grab two lenses by default (e.g.
   `read_page` + `screenshot`). On a fresh page, dismiss any blocking modal/cookie banner as part of
-  orienting before going for the target.
+  orienting before going for the target. If you're **not getting narrower**, don't scale extraction
+  across more elements — change strategy (a different lens, the site's own search, a direct URL).
+- **Search-engine fallback is one focused query.** If you drop to a web search from inside a page,
+  run one query, open the strongest result — don't loop rewriting the query.
 - **Reuse, don't refetch.** Keep the latest snapshot for building targets; refresh only after a
   navigation, a DOM-changing action, a failed target (0 or >1 matches), or a timeout.
 - **Authoritative signal wins.** One canonical signal (URL param, success toast, checked state,
@@ -252,6 +307,22 @@ await sleep(400);
 const p2 = await browser.claimTab((await browser.openTabs()).find(t => !before.has(t.id)));
 ```
 
+## Script doctrine
+
+- **One script per flow — but a confirmation boundary splits it.** Multi-step interactions belong in
+  a single `run`. *Except* around a consequential action (buy, send, delete, submit that transmits
+  data): end the script **before** that click, return the staged state for the user to confirm, and
+  commit in a **second** `run`. Don't let one script fill *and* place the order.
+- **Semantic first.** Prefer role/text/label locators over CSS, and CSS over coordinates.
+- **A mid-script action can navigate** and leave later locators pointing at a gone page. If a step
+  might navigate, wrap it in `expectNavigation`/`waitForURL`; on failure `run` returns `{error, logs}`
+  so the `log()` trail up to the break survives.
+- **Self-heal, don't hard-fail.** A locator that fails mid-script is often transient (animation,
+  re-render). Wrap risky steps in try/catch, take a fresh `domSnapshot`, re-derive the locator once
+  before giving up.
+- **Snapshot discipline.** Keep and reuse a recent `domSnapshot`; take a fresh one after a navigation,
+  and after a click that timed out / a strict-mode failure / a bad selector, before the next locator.
+
 ---
 
 # Navigation & tabs
@@ -307,6 +378,21 @@ Keep this lean — a few real rules, not paranoia.
   `page.url()` in a `run`, or `wait_for {urlIncludes}`.
 - **A click did nothing:** suspect a covering overlay/modal (a `screenshot` shows it); clear it
   before re-clicking. Don't retry the same failing selector without re-observing first.
+- **Debugger detached / the debugging banner:** claimed tabs show a "…is debugging this browser"
+  banner — expected and harmless; `tab_release` removes it. If the debugger detaches (DevTools opened
+  on that tab, tab crashed, banner cancelled), `tab_claim` the tab again to re-attach; if it keeps
+  detaching, the user likely has DevTools open — ask them to close it.
+- **Ambiguous outcome** (blank page, stuck spinner, closed popup, timeout right after a
+  state-changing action — especially after a sign-in) = **unknown**, not proof of success or failure.
+  Re-observe before deciding; don't assume success and move on, and don't blind-retry a destructive
+  action. A read returning very few elements / no accessible names right after a nav is **still
+  loading** — re-read once after a beat before concluding it's empty.
+- **Screenshot blank/stale on a background tab:** `tab_activate` it briefly, or rely on `read_page`/
+  `domSnapshot` for ground truth.
+- **Cross-origin iframes:** `read_page`/`find` and `run` locators/`domSnapshot` **do** reach into
+  out-of-process frames (elements tagged `frame:true`; clicks are coordinate-translated through the
+  frame chain) — payment widgets (Stripe), auth frames, embedded editors are reachable. `dom_query`
+  stays top-document only. A just-loaded frame may lag one read — `wait_for` or read again.
 
 ---
 
@@ -315,8 +401,12 @@ Keep this lean — a few real rules, not paranoia.
 `cdp {tabId, method, params}` sends any Chrome DevTools Protocol command to a controlled tab — the
 escape hatch for anything the high-level tools/`run` don't cover. Prefer `run`/`page.evaluate` for
 reads, the dedicated tools for dialogs/uploads/screenshots (raw `Page.captureScreenshot` returns an
-unusable base64 string). `Page`/`DOM`/`Runtime`/`Accessibility`/`Network`/`Log` are pre-enabled on
-claim; enable any other domain first. The bridge does **not** stream CDP events — poll state.
+unusable base64 string), and the `navigate` tool over raw `Page.navigate` (which reloads even when
+already on the URL, wiping in-progress input). Reach here for: DOM node ops
+(`DOM.getDocument {depth:-1}`, `DOM.querySelector`), chorded mouse gestures / pointer types `click`
+doesn't expose, or a domain not otherwise surfaced. `Page`/`DOM`/`Runtime`/`Accessibility`/`Network`/
+`Log` are pre-enabled on claim; enable any other domain first. The bridge does **not** stream CDP
+events — poll state; console/network are buffered and read via `read_console`/`read_network`.
 
 ---
 
