@@ -110,6 +110,7 @@ function runMcpServer() {
   // a page echo, network body, or console line can't leak them back. Defense-in-depth for logins.
   const secrets = new Map();
   const redact = (s) => { if (!secrets.size || typeof s !== 'string') return s; let out = s; for (const [name, val] of secrets) { if (val && out.includes(val)) out = out.split(val).join('‹secret:' + name + '›'); } return out; };
+  const reqSecret = (name) => { const v = secrets.get(String(name)); if (v == null) throw new Error('unknown secret "' + name + '" — register it with secret_set first'); return v; };
 
   const TOOLS = [
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
@@ -170,8 +171,8 @@ function runMcpServer() {
     read_console: (a) => callHost('readConsole', a),
     read_network: (a) => callHost('readNetwork', a),
     click: (a) => callHost('click', a),
-    fill: (a) => callHost('fill', a.secret ? { ...a, value: secrets.get(String(a.secret)) ?? '' } : a),
-    type_text: (a) => callHost('typeText', a.secret ? { ...a, text: secrets.get(String(a.secret)) ?? '' } : a),
+    fill: (a) => callHost('fill', a.secret ? { ...a, value: reqSecret(a.secret) } : a),
+    type_text: (a) => callHost('typeText', a.secret ? { ...a, text: reqSecret(a.secret) } : a),
     press_key: (a) => callHost('pressKey', a),
     scroll: (a) => callHost('scroll', a),
     hover: (a) => callHost('hover', a),
@@ -195,7 +196,9 @@ function runMcpServer() {
     // Host-side composition: run several existing tools in one round trip, aborting if a step
     // navigates unexpectedly (each action's status header carries the post-action url).
     act_batch: async (a) => {
-      const out = []; let lastUrl = null;
+      const out = [];
+      // seed the pre-batch URL so a FIRST step that navigates unexpectedly is caught too, not just later ones
+      let lastUrl = null; try { const u = await callHost('executeCdp', { tabId: a.tabId, cdpMethod: 'Runtime.evaluate', cdpParams: { expression: 'location.href', returnByValue: true } }); lastUrl = u && u.result && u.result.value; } catch {}
       for (let i = 0; i < (a.actions || []).length; i++) {
         const step = a.actions[i] || {}; const fn = MAP[step.tool];
         if (!fn || step.tool === 'act_batch') { out.push({ tool: step.tool, error: 'not a batchable tool' }); break; }

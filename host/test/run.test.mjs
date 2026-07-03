@@ -30,7 +30,7 @@ async function callHost(method, params) {
     if (m === 'Runtime.evaluate') { if (p.returnByValue === false) { await win.__evalExpr(p.expression); return { result: { objectId: 'obj-el-1' } }; } const v = await win.__evalExpr(p.expression); return { result: { value: v } }; }
     if (m === 'Input.dispatchMouseEvent') { mouse.push({ type: p.type, x: p.x, y: p.y, button: p.button, clickCount: p.clickCount, buttons: p.buttons }); return {}; }
     if (m === 'Input.insertText') { records.insert = { text: p.text, sessionId: params.sessionId ?? null }; return {}; }
-    if (m === 'Input.dispatchKeyEvent') { if (p.type === 'keyDown') keys.push({ key: p.key, text: p.text, modifiers: p.modifiers }); return {}; }
+    if (m === 'Input.dispatchKeyEvent') { if (p.type === 'keyDown') keys.push({ key: p.key, text: p.text, modifiers: p.modifiers, sessionId: params.sessionId ?? null }); return {}; }
     if (m === 'Page.navigate') return String(p.url || '').includes('blocked.invalid') ? { errorText: 'net::ERR_NAME_NOT_RESOLVED' } : {};
     if (m === 'DOM.setFileInputFiles') { records.setFiles = { objectId: p.objectId, files: p.files }; return {}; }
     if (m === 'Page.printToPDF') return { data: Buffer.from('%PDF-1.4 hello').toString('base64') };
@@ -98,8 +98,8 @@ await check('#3 global positional .first()', `return (await page.getByRole('list
 await check('#3 global positional .nth(1)', `return (await page.getByRole('listitem').nth(1).textContent()).trim();`, 'beta');
 await check('#3 .last() no crash on single match', `return (await page.getByRole('heading').last().textContent()).trim();`, 'Welcome back');
 await check('#9 selectOption numeric value', `return await page.locator('#sel').selectOption({value:2});`, ['2']);
-await check('#6 type runs', `await page.getByLabel('Email').type('hi'); return 'ok';`, 'ok');
-{ const ok = records.insert && records.insert.text === 'hi' && records.insert.sessionId === null; console.log((ok?'  ok  ':'  FAIL')+' #6 Input.insertText dispatched at top-level (no sessionId)'); ok?pass++:fail++; }
+await check('#6 type dispatches per-char keystrokes', `await page.getByLabel('Email').type('hi'); return 'ok';`, 'ok');
+{ const l2 = keys.slice(-2); const ok = l2.length===2 && l2[0].text==='h' && l2[1].text==='i' && l2.every(k=>k.sessionId==null); console.log((ok?'  ok  ':'  FAIL')+' #6 type → per-char keyDown(text) at top-level (H1)'+(ok?'':`  got=${JSON.stringify(l2)}`)); ok?pass++:fail++; }
 await check('#12 press Shift+a returns', `await page.getByLabel('Email').press('Shift+a'); return 'ok';`, 'ok');
 { const kd = keys[keys.length-1]; const ok = kd && kd.text === 'A' && kd.key === 'A'; console.log((ok?'  ok  ':'  FAIL')+' #12 press Shift+a → uppercase A (text/key)'); ok?pass++:fail++; }
 await check('#4 goto throws on nav failure', `try{ await page.goto('https://blocked.invalid'); return 'no-throw'; }catch(e){ return /goto failed/.test(e.message)?'threw':e.message; }`, 'threw');
