@@ -118,8 +118,10 @@ opening a new one; don't spawn duplicates.
   picker. Absolute paths; pass an array for multiple.
 - **Download:** trigger it, then `const { path, bytes } = await page.waitForDownload()` — `path` is
   the local file to `Read` in Claude Code. (`page.waitForEvent('download')` is an alias.)
-- **Dialogs:** `const d = await page.getJsDialog()` → `null` or `{type, message, accept, dismiss}`;
-  `await d.accept()` / `await d.accept('prompt text')` / `await d.dismiss()`.
+- **Dialogs:** a native `alert`/`confirm`/`prompt` **freezes the tab** until handled, so after an
+  action that may pop one, check `const d = await page.getJsDialog()` → `null` or
+  `{type, message, accept, dismiss}`; `await d.accept()` / `await d.accept('prompt text')` /
+  `await d.dismiss()`. (`beforeunload` is auto-accepted so it can't wedge navigation.)
 - **Console:** `await page.consoleLogs({limit})` — captured console messages (debugging a local app).
 - **Save the page:** `await page.pdf({path})` (via print-to-PDF) or `page.export({format:'text'})` —
   returns `{path, bytes}`.
