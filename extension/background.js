@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -533,6 +533,7 @@ async function dispatch(method, p) {
       st(p.tabId).dialog = null;
       return { ok: true };
     }
+    case 'getDialog': { return { dialog: state.get(p.tabId)?.dialog || null }; }
 
     case 'setFiles': {
       await need(p.tabId);
@@ -608,6 +609,10 @@ async function dispatch(method, p) {
     // frame sessions and get a frame's accumulated top-viewport offset for coordinate translation.
     case 'listFrames': { await need(p.tabId); return { frames: [...st(p.tabId).frames.entries()].map(([sessionId, fr]) => ({ sessionId, url: fr.url || null })) }; }
     case 'frameOffsetOf': { await need(p.tabId); return await frameOffset(p.tabId, p.sessionId); }
+    case 'getHistory': {
+      const items = await chrome.history.search({ text: p.text || '', maxResults: Math.min(p.maxResults || 50, 500), ...(p.startTime ? { startTime: p.startTime } : {}), ...(p.endTime ? { endTime: p.endTime } : {}) });
+      return { entries: (items || []).map((h) => ({ url: h.url, title: h.title, lastVisit: h.lastVisitTime, visitCount: h.visitCount })) };
+    }
 
     default: throw new Error('unknown method: ' + method);
   }
