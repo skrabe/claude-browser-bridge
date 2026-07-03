@@ -19,19 +19,52 @@ form, a live flow. Public static content: plain web fetch/search. A *different* 
 auth (an API, a CLI) is never a reason to silently fall back to the browser — ask the user to fix
 that tool's auth, or get explicit go-ahead first.
 
-## The core loop (memorize this)
+## Drive with `run` — the fast path (do this by default)
+
+**`run` is how you should drive the browser.** You write one JavaScript automation script and it
+executes in a single call, composing every step — locate, act, read, loop, branch — instead of a
+network round trip per action. It's the difference between smooth and slow. Reach for the atomic
+tools (`click`/`fill`/…) only for a genuine one-off.
+
+Inside `run` you get a Playwright-shaped `page` with **semantic, auto-waiting locators**:
+
+```js
+// one call: fill a login form, submit, confirm — with real waits, no coordinates
+await page.getByLabel('Email').fill('me@work.com');
+await page.getByLabel('Password').fill(pw);
+await page.getByRole('button', { name: 'Sign in' }).click();
+await page.waitForURL(/dashboard/);
+return await page.getByRole('heading').first().innerText();
+```
+
+- **Target by meaning, not coordinates:** `page.getByRole('button', {name:'Save'})`, `getByText`,
+  `getByLabel`, `getByPlaceholder`, `getByTestId`, or `page.locator(css)`. Locators **auto-wait**
+  for the element to be visible + actionable, pierce same-origin iframes + shadow DOM, and reach
+  cross-origin frames. A locator matching >1 element throws — add `.first()`/`.nth(i)`/`.filter()`.
+- **Act:** `.click()` `.dblclick()` `.fill(v)` `.type(v)` `.press('Enter')` `.check()` `.uncheck()`
+  `.selectOption(v)` `.hover()` `.focus()`. Clicks are real trusted mouse events.
+- **Read:** `.textContent()` `.innerText()` `.getAttribute(n)` `.inputValue()` `.count()`
+  `.isVisible()` `.isChecked()` `.boundingBox()`; `page.domSnapshot({selector})` for a compact,
+  uncapped view of the page's interactables; `page.evaluate(fn, arg)` to run JS in the page.
+- **Navigate/wait:** `page.goto(url)` `page.url()` `page.reload()` `page.waitForLoadState({state})`
+  `page.waitForURL(p)` `page.expectNavigation(fn, {url})`.
+- **Compose:** it's real JS — loop over rows, branch on state, retry, build an array and `return`
+  it. One `run` call replaces a dozen atomic round trips.
+- **Tabs:** `browser.openTabs()`, `browser.claimTab(t)`, `browser.newTab(url)`; `screenshot`,
+  `dom_cua` (coordinate/vision fallback) are on `page` too.
+
+Read **`reference/scripting.md`** for the full API + patterns (extraction loops, forms, multi-tab,
+frames, waiting, fallbacks). That doc is the playbook for writing good `run` scripts.
+
+## The loop
 
 1. **Orient** — `tabs_list` to see real tabs; `tab_claim` an existing one, or `tab_create`.
-2. **Observe (cheapest)** — after any change, take the *single* cheapest read that answers
-   the next question: `read_page` for structure + refs, `read_text` for prose, `find_text` for
-   "does X appear anywhere", `screenshot` for visual layout. **Never grab two by default.**
-3. **Target** — locate the element and confirm it's unique *before* acting (`read_page` refs,
-   `find`, or `dom_query` + a count check). Don't act on an ambiguous or unseen target.
-4. **Act** — `click`/`fill`/`type_text`/`press_key`/`select_option`/`scroll`/`hover` (prefer
-   acting by element ref over raw coordinates).
-5. **Verify** — the action's returned **status header** ({url, title, new console errors}) is
-   often all you need; re-observe only if the next decision needs more. Stop at one authoritative
-   signal (URL param, toast, checked state, line item).
+2. **Drive** — write a `run` script for the flow. Let locators auto-wait; `log()` progress,
+   `return` what you need. Only drop to atomic tools (`read_page`/`click`/`fill`) for a trivial
+   single action or a quick look.
+3. **Verify** — `run` returns your script's value; atomic actions return a status header
+   ({url, title, new console errors}). Stop at one authoritative signal (URL param, toast,
+   checked state, line item) — don't re-verify a fact you already have.
 
 ## Always-on rules
 
@@ -62,6 +95,7 @@ that tool's auth, or get explicit go-ahead first.
 
 | If you're… | Read |
 |---|---|
+| **scripting a flow with `run` — locators, actions, multi-tab, waiting** (the default) | **`reference/scripting.md`** |
 | deciding what to observe / when to stop / reusing snapshots | `reference/interaction-loop.md` |
 | finding a specific element, building a stable selector, resolving ambiguity | `reference/finding-elements.md` |
 | clicking, typing, selecting, scrolling, dragging, keyboard | `reference/acting.md` |
