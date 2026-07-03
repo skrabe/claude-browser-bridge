@@ -21,6 +21,17 @@ toast/modal, a checked/selected state, a basket line item, a selected sort — *
 answer** unless another signal directly contradicts it. Do not keep re-verifying the same fact
 through header badges, alternate surfaces, or repeated full-page reads.
 
+## Done vs. continue vs. blocked
+Before declaring a task complete, classify honestly:
+- **Compound goals** ("book A *and* B *and* email me the confirmation") — enumerate the parts and
+  verify **each** against an authoritative signal. Never report done while a required part is
+  unmet; a wrong count or a missing category is *not* satisfied.
+- **continue** — not done but achievable with more steps (most failures): re-observe and adjust,
+  don't give up.
+- **blocked** — cannot proceed without something you can't do (a CAPTCHA, missing credential, a
+  hard access-deny, a genuine dead end). Name *why* (element-not-found vs auth vs anti-bot vs
+  wrong-page) and hand back to the user rather than looping.
+
 ## Orientation, then narrowing
 - One broad observation to orient (usually one `read_page`, or one `screenshot` if the visual
   structure is clearer than the DOM).
