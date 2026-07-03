@@ -7,3 +7,4 @@ node_modules/
 
 # extension signing private key — never publish
 host/extension-private-key.pem
+package-lock.json
