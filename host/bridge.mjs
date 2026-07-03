@@ -10,7 +10,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { runScript } from './browserapi.mjs';
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
