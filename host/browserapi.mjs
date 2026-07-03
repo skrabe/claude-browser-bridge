@@ -1,5 +1,8 @@
 // Programmable browser API for the `run` tool — a Playwright-shaped page/locator engine that the
 // model scripts in a single call (compose many ops, one MCP round trip), mirroring Codex's REPL.
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 //
 // Design: everything runs in the HOST (Node can eval the model's script; the MV3 SW can't). The
 // page/locator methods drive the tab through the extension's raw-CDP passthrough (`executeCdp`).
@@ -109,8 +112,12 @@ if (!window.__cbb) {
   window.__cbb = (op, a) => {
     a = a || {};
     if (op === 'q') { const els = resolve(a.steps); return { count: els.length, matches: els.slice(0, a.cap || 200).map((e, i) => ({ i, ...meta(e) })) }; }
+    if (op === 'fromPoint') { if (!document.elementFromPoint) return null; let e = document.elementFromPoint(a.x, a.y); if (!e) return null; // pierce open shadow roots at the point
+      for (let d = 0; d < 8 && e && e.shadowRoot; d++) { const inner = e.shadowRoot.elementFromPoint(a.x, a.y); if (!inner || inner === e) break; e = inner; }
+      const tid = e.getAttribute && (e.getAttribute('data-testid') || e.getAttribute('data-test-id') || e.getAttribute('data-test')); return { ...meta(e), testid: tid || undefined, text: (e.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160) }; }
     const els = a.steps ? resolve(a.steps) : [];
     const el = els[a.i || 0];
+    if (op === 'el') return el || null; // raw element — host reads it back as a Runtime objectId (file inputs)
     if (op === 'text') { if (!el) return null; return a.kind === 'inner' ? (el.innerText != null ? el.innerText : el.textContent) : a.kind === 'value' ? ('value' in el ? String(el.value) : null) : a.kind === 'attr' ? el.getAttribute(a.name) : (el.textContent == null ? null : el.textContent); }
     if (op === 'bool') { if (!el) return false; return a.q === 'visible' ? isVisible(el) : a.q === 'enabled' ? isEnabled(el) : a.q === 'checked' ? isChecked(el) : a.q === 'editable' ? isEditable(el) : false; }
     if (op === 'fill') { if (!el) return { ok: false, err: 'not found' }; el.focus && el.focus(); if (el.isContentEditable) { el.textContent = a.value; el.dispatchEvent(new Event('input', { bubbles: true })); } else nativeSet(el, a.value); return { ok: true }; }
@@ -178,7 +185,14 @@ export function makeBrowser(callHost, tabId) {
     return out;
   }
 
-  const mouse = async (type, x, y, opts = {}) => cdp('Input.dispatchMouseEvent', { type, x, y, button: opts.button || 'left', clickCount: opts.clickCount || 1, modifiers: opts.modifiers || 0 });
+  const mouse = async (type, x, y, opts = {}) => cdp('Input.dispatchMouseEvent', { type, x, y, button: opts.button || 'left', clickCount: opts.clickCount || 1, modifiers: opts.modifiers || 0, ...(opts.buttons != null ? { buttons: opts.buttons } : {}) });
+  // real drag: press at from, glide through intermediate moves (left button held → buttons:1), release at to
+  const dragPath = async (from, to, steps = 10) => {
+    await mouse('mouseMoved', from.x, from.y);
+    await mouse('mousePressed', from.x, from.y, { button: 'left', clickCount: 1 });
+    for (let s = 1; s <= steps; s++) { const x = from.x + ((to.x - from.x) * s) / steps, y = from.y + ((to.y - from.y) * s) / steps; await mouse('mouseMoved', x, y, { button: 'left', buttons: 1 }); await sleep(8); }
+    await mouse('mouseReleased', to.x, to.y, { button: 'left', clickCount: 1 });
+  };
 
   class Locator {
     constructor(steps) { this.steps = steps; }
@@ -231,6 +245,21 @@ export function makeBrowser(callHost, tabId) {
     async uncheck(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this.steps, i: t.i }, t.sessionId); if (s && !s.checked) return; await this.click(o); }
     async setChecked(v, o = {}) { return v ? this.check(o) : this.uncheck(o); }
     async focus(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('focus', { steps: this.steps, i: t.i }, t.sessionId); }
+    // Set files on an <input type=file> without opening the native picker. Resolve the element to a
+    // Runtime objectId (returnByValue:false), then DOM.setFileInputFiles by objectId.
+    async setInputFiles(files, o = {}) {
+      const t = await this._one(false, o.timeoutMs);
+      const r = await cdp('Runtime.evaluate', { expression: asExpr('el', { steps: this.steps, i: t.i }), returnByValue: false }, t.sessionId);
+      const objectId = r && r.result && r.result.objectId;
+      if (!objectId) throw new Error('setInputFiles: could not resolve the file input element');
+      const arr = (Array.isArray(files) ? files : [files]).map(String);
+      await cdp('DOM.setFileInputFiles', { objectId, files: arr }, t.sessionId);
+      return arr;
+    }
+    async dragTo(target, o = {}) {
+      const b1 = await this.boundingBox(o); const b2 = await target.boundingBox(o);
+      await dragPath({ x: b1.x + b1.width / 2, y: b1.y + b1.height / 2 }, { x: b2.x + b2.width / 2, y: b2.y + b2.height / 2 }, o.steps || 10);
+    }
   }
   // pick() lets nth() resolve a specific global index for actions
   Object.defineProperty(Locator.prototype, '_picked', { get() { for (let k = this.steps.length - 1; k >= 0; k--) { if (this.steps[k].op === 'nth') return this.steps[k].n; if (this.steps[k].op === 'first') return 0; if (this.steps[k].op === 'last') return -1; } return null; }, configurable: true });
@@ -270,7 +299,34 @@ export function makeBrowser(callHost, tabId) {
     async domSnapshot(o = {}) { return evalIn('snapshot', { selector: o && o.selector, max: (o && o.max) || 20000 }); },
     async snapshot(o) { return this.domSnapshot(o); },
     async screenshot(o = {}) { const params = { format: 'png' }; if (o.fullPage) { params.captureBeyondViewport = true; const m = await cdp('Page.getLayoutMetrics').catch(() => ({})); const cs = m.cssContentSize || m.contentSize; if (cs) params.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 }; } if (o.clip) params.clip = { ...o.clip, scale: 1 }; const r = await cdp('Page.captureScreenshot', params); return { __image: r.data, mimeType: 'image/png' }; },
-    async getJsDialog() { return null; },
+    // Real JS-dialog handling: read the pending alert/confirm/prompt (recorded by the extension on
+    // Page.javascriptDialogOpening) and return an object that can accept/dismiss it.
+    async getJsDialog() {
+      const r = await callHost('getDialog', { tabId }).catch(() => ({ dialog: null }));
+      const d = r && r.dialog;
+      if (!d) return null;
+      return { type: d.type, message: d.message, defaultValue: d.defaultPrompt,
+        accept: (promptText) => callHost('handleDialog', { tabId, accept: true, ...(promptText != null ? { promptText: String(promptText) } : {}) }),
+        dismiss: () => callHost('handleDialog', { tabId, accept: false }) };
+    },
+    async consoleLogs(o = {}) { const r = await callHost('readConsole', { tabId, limit: (o && o.limit) || 100, clear: !!(o && o.clear) }); return (r && r.messages) || []; },
+    dev: { logs: async (o = {}) => { const r = await callHost('readConsole', { tabId, limit: (o && o.limit) || 100, clear: !!(o && o.clear) }); return (r && r.messages) || []; } },
+    async waitForDownload(o = {}) { const r = await callHost('waitDownload', { tabId, timeoutMs: (o && o.timeoutMs) || 30000 }); if (!r || !r.ok) throw new Error('waitForDownload timed out'); return { path: r.path, url: r.url, bytes: r.bytes }; },
+    async waitForEvent(event, o = {}) { if (event === 'download') return this.waitForDownload(o); if (event === 'filechooser') throw new Error('filechooser events are not modeled here — call locator.setInputFiles(paths) on the <input type=file> directly'); throw new Error('waitForEvent: unsupported event "' + event + '"'); },
+    async setInputFiles(selector, files, o = {}) { return rootLoc({ by: 'css', selector }).setInputFiles(files, o); },
+    async elementFromPoint(pt) { return evalIn('fromPoint', { x: pt.x, y: pt.y }); },
+    // coordinate mouse primitive (fallback for painted/canvas UIs; prefer semantic locators)
+    mouse: {
+      async move(x, y) { await mouse('mouseMoved', x, y); },
+      async click(x, y, o = {}) { const button = o.button || 'left'; await mouse('mouseMoved', x, y); const clicks = o.clickCount || 1; for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', x, y, { button, clickCount: c }); await mouse('mouseReleased', x, y, { button, clickCount: c }); } },
+      async dblclick(x, y, o = {}) { return this.click(x, y, { ...o, clickCount: 2 }); },
+      async wheel(x, y, dx = 0, dy = 0) { await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy }); },
+    },
+    async drag(from, to, o = {}) { const pt = async (v) => (v && typeof v.boundingBox === 'function' ? (async () => { const b = await v.boundingBox(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; })() : { x: v.x, y: v.y }); await dragPath(await pt(from), await pt(to), o.steps || 10); },
+    async setViewport(o = {}) { await cdp('Emulation.setDeviceMetricsOverride', { width: o.width || 1280, height: o.height || 800, deviceScaleFactor: o.deviceScaleFactor || 0, mobile: !!o.mobile }); },
+    async resetViewport() { await cdp('Emulation.clearDeviceMetricsOverride', {}); },
+    async pdf(o = {}) { const r = await cdp('Page.printToPDF', { printBackground: o.printBackground !== false, ...(o.landscape ? { landscape: true } : {}) }); const buf = Buffer.from(r.data, 'base64'); const p = o.path || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.pdf'); await writeFile(p, buf); return { path: p, bytes: buf.length }; },
+    async export(o = {}) { const fmt = (o && o.format) || 'pdf'; if (fmt === 'pdf') return this.pdf(o); if (fmt === 'text' || fmt === 'md' || fmt === 'markdown') { const text = await this.evaluate(() => (document.body ? document.body.innerText : '')); const p = (o && o.path) || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.txt'); await writeFile(p, text || ''); return { path: p, bytes: Buffer.byteLength(text || '') }; } throw new Error('export: unsupported format "' + fmt + '"'); },
     dom_cua,
     cua: dom_cua,
     capabilities: { async list() { return ['viewport', 'screenshot', 'domSnapshot']; }, async get() { return null; } },
@@ -282,6 +338,29 @@ export function makeBrowser(callHost, tabId) {
     async claimTab(t) { const id = typeof t === 'string' ? Number(t) : Number(t.id); await callHost('claimTab', { tabId: id }); return makeBrowser(callHost, id).page; },
     async newTab(url) { const r = await callHost('createTab', { url: url || 'about:blank' }); return makeBrowser(callHost, r.id).page; },
     async nameSession() { /* no-op: our tabs aren't session-scoped */ },
+    // Batch: load each URL in a background tab, extract (title + interactable snapshot + text),
+    // close the tab. Does not disturb the user's selected tab. For research / multi-source reads.
+    async readUrls(urls, o = {}) {
+      const list = Array.isArray(urls) ? urls : [urls];
+      const max = Math.min(o.max || 20000, 50000);
+      const out = [];
+      for (const url of list) {
+        let tab = null;
+        try {
+          const r = await callHost('createTab', { url: String(url), active: false });
+          tab = r.id;
+          const p = makeBrowser(callHost, tab).page;
+          await p.waitForLoadState({ state: 'load', timeoutMs: o.timeoutMs || 15000 });
+          const title = await p.title().catch(() => null);
+          const snapshot = o.snapshot === false ? undefined : await p.domSnapshot({ max }).catch(() => null);
+          const text = await p.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => null);
+          out.push({ url, title, ...(snapshot !== undefined ? { snapshot } : {}), text: text ? String(text).slice(0, max) : null });
+        } catch (e) { out.push({ url, error: e && e.message ? e.message : String(e) }); }
+        finally { if (tab != null) await callHost('closeAgentTab', { tabId: tab }).catch(() => {}); }
+      }
+      return out;
+    },
+    async history(o = {}) { const r = await callHost('getHistory', { text: o.query || o.text || '', maxResults: o.maxResults || 50, ...(o.startTime ? { startTime: o.startTime } : {}), ...(o.endTime ? { endTime: o.endTime } : {}) }).catch((e) => ({ error: e && e.message })); return (r && r.entries) || []; },
     documentation: async () => 'See the /browser skill.',
   };
   page.browser = browser;

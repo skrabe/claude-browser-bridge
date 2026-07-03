@@ -6,6 +6,7 @@ const html = `<!doctype html><html><body>
   <h2>Welcome back</h2>
   <form>
     <label for="email">Email</label><input id="email" name="email" type="email">
+    <input id="file" type="file">
     <button type="submit" data-testid="submit">Save changes</button>
   </form>
   <ul><li>alpha</li><li>beta</li><li>gamma</li></ul>
@@ -18,12 +19,17 @@ win.Element.prototype.getClientRects = function(){ return [rect]; };
 const inj = win.document.createElement('script'); inj.textContent = _ENGINE + '\nwindow.__evalExpr = async (code) => await eval(code);'; win.document.body.appendChild(inj);
 
 const mouse = [];
+const records = {};
 async function callHost(method, params) {
   if (method === 'executeCdp') {
     const m = params.cdpMethod, p = params.cdpParams || {};
-    if (m === 'Runtime.evaluate') { const v = await win.__evalExpr(p.expression); return { result: { value: v } }; }
-    if (m === 'Input.dispatchMouseEvent') { mouse.push({ type: p.type, x: p.x, y: p.y, button: p.button, clickCount: p.clickCount }); return {}; }
+    if (m === 'Runtime.evaluate') { if (p.returnByValue === false) { await win.__evalExpr(p.expression); return { result: { objectId: 'obj-el-1' } }; } const v = await win.__evalExpr(p.expression); return { result: { value: v } }; }
+    if (m === 'Input.dispatchMouseEvent') { mouse.push({ type: p.type, x: p.x, y: p.y, button: p.button, clickCount: p.clickCount, buttons: p.buttons }); return {}; }
     if (m === 'Input.insertText' || m === 'Input.dispatchKeyEvent') return {};
+    if (m === 'DOM.setFileInputFiles') { records.setFiles = { objectId: p.objectId, files: p.files }; return {}; }
+    if (m === 'Page.printToPDF') return { data: Buffer.from('%PDF-1.4 hello').toString('base64') };
+    if (m === 'Emulation.setDeviceMetricsOverride') { records.viewport = p; return {}; }
+    if (m === 'Emulation.clearDeviceMetricsOverride') { records.viewportReset = true; return {}; }
     if (m === 'Page.captureScreenshot') return { data: 'BASE64PNG' };
     if (m === 'Page.getLayoutMetrics') return { cssContentSize: { width: 800, height: 600 } };
     if (m === 'Page.navigate' || m === 'Page.reload') return {};
@@ -32,6 +38,13 @@ async function callHost(method, params) {
   if (method === 'listFrames') return { frames: [] };
   if (method === 'frameOffsetOf') return { ox: 0, oy: 0 };
   if (method === 'getUserTabs') return { tabs: [] };
+  if (method === 'readConsole') return { messages: ['log: hi', 'error: boom'] };
+  if (method === 'waitDownload') return { ok: true, path: '/tmp/dl.txt', url: 'https://x/dl.txt', bytes: 12 };
+  if (method === 'getDialog') return { dialog: { type: 'confirm', message: 'Sure?', defaultPrompt: '' } };
+  if (method === 'handleDialog') { records.dialogHandled = params; return { ok: true }; }
+  if (method === 'getHistory') return { entries: [{ url: 'https://a', title: 'A', lastVisit: 1, visitCount: 2 }] };
+  if (method === 'createTab') return { id: 2 };
+  if (method === 'closeAgentTab') { records.closed = params.tabId; return { ok: true }; }
   return { ok: true };
 }
 
@@ -51,5 +64,25 @@ await check('strict mode violation on 3 matches', `try { await page.getByRole('l
 
 const clicked = mouse.some(m=>m.type==='mousePressed' && m.x===60 && m.y===20);
 console.log((clicked?'  ok  ':'  FAIL')+' real click landed at element center (60,20)'); clicked?pass++:fail++;
+
+// ── v0.9.0 additive capabilities ──
+await check('setInputFiles returns paths', `return await page.setInputFiles('#file', ['/a.txt','/b.txt']);`, ['/a.txt','/b.txt']);
+{ const ok = records.setFiles && records.setFiles.objectId==='obj-el-1' && JSON.stringify(records.setFiles.files)===JSON.stringify(['/a.txt','/b.txt']); console.log((ok?'  ok  ':'  FAIL')+' setInputFiles → DOM.setFileInputFiles by objectId'); ok?pass++:fail++; }
+await check('mouse.click at coords', `await page.mouse.click(123,45); return 'ok';`, 'ok');
+{ const ok = mouse.some(m=>m.type==='mousePressed'&&m.x===123&&m.y===45); console.log((ok?'  ok  ':'  FAIL')+' mouse.click dispatched at (123,45)'); ok?pass++:fail++; }
+await check('drag press/release endpoints', `await page.drag({x:5,y:6},{x:90,y:80}); return 'ok';`, 'ok');
+{ const ok = mouse.some(m=>m.type==='mousePressed'&&m.x===5&&m.y===6) && mouse.some(m=>m.type==='mouseReleased'&&m.x===90&&m.y===80) && mouse.some(m=>m.type==='mouseMoved'&&m.buttons===1); console.log((ok?'  ok  ':'  FAIL')+' drag: press@from, held moves, release@to'); ok?pass++:fail++; }
+await check('consoleLogs', `return await page.consoleLogs();`, ['log: hi','error: boom']);
+await check('waitForDownload', `return await page.waitForDownload();`, {path:'/tmp/dl.txt',url:'https://x/dl.txt',bytes:12});
+await check('getJsDialog type', `const d = await page.getJsDialog(); await d.accept(); return d.type;`, 'confirm');
+{ const ok = records.dialogHandled && records.dialogHandled.accept===true; console.log((ok?'  ok  ':'  FAIL')+' dialog.accept() → handleDialog(accept:true)'); ok?pass++:fail++; }
+await check('browser.history', `return await browser.history({query:'a'});`, [{url:'https://a',title:'A',lastVisit:1,visitCount:2}]);
+await check('setViewport records metrics', `await page.setViewport({width:390,height:844,mobile:true}); return 'ok';`, 'ok');
+{ const ok = records.viewport && records.viewport.width===390 && records.viewport.mobile===true; console.log((ok?'  ok  ':'  FAIL')+' setViewport → Emulation.setDeviceMetricsOverride'); ok?pass++:fail++; }
+await check('pdf writes file (bytes>0)', `const r = await page.pdf(); return r.bytes>0;`, true);
+await check('readUrls batch shape', `const r = await browser.readUrls(['https://example.test/page']); return r.length===1 && r[0].url==='https://example.test/page';`, true);
+{ const ok = records.closed===2; console.log((ok?'  ok  ':'  FAIL')+' readUrls closes the background tab'); ok?pass++:fail++; }
+await check('elementFromPoint plumbing (jsdom→null)', `return await page.elementFromPoint({x:5,y:5});`, null);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

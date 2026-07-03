@@ -86,7 +86,14 @@ For a whole-page overview, prefer **`page.domSnapshot({selector, max})`** over t
 `read_page`: it returns a compact, **uncapped** list of visible interactables
 (`[n] role "name" =value`), scopable to a container and piercing frames/shadow — no 500-element
 ceiling. Use `page.evaluate(fn, arg)` to run arbitrary JS in the page and return a value (function
-is serialized; `arg` must be JSON-serializable; runs in the main frame).
+is serialized; `arg` must be JSON-serializable; runs in the main frame). `evaluate` is also the
+**bulk-read primitive**: any time you'd read a property off many elements, do it in one `evaluate`
+that projects the whole array, not a locator loop.
+
+**Snapshot discipline.** One broad observation orients you; then narrow. Take a fresh `domSnapshot()`
+after a navigation, and after a click that timed out / a strict-mode failure / a bad selector, before
+building the next locator. Don't re-dump the full snapshot when a `count()`, one attribute, or a
+scoped check answers the question.
 
 ## Navigation & page state
 
@@ -104,6 +111,28 @@ is serialized; `arg` must be JSON-serializable; runs in the main frame).
 tab — hold several handles to work multiple tabs in one script. Claim an existing tab before
 opening a new one; don't spawn duplicates.
 
+## More capabilities
+
+- **Upload:** `await page.getByLabel('Resume').setInputFiles('/abs/file.pdf')` (or
+  `page.setInputFiles(cssSelector, paths)`) — sets files on an `<input type=file>` directly, no OS
+  picker. Absolute paths; pass an array for multiple.
+- **Download:** trigger it, then `const { path, bytes } = await page.waitForDownload()` — `path` is
+  the local file to `Read` in Claude Code. (`page.waitForEvent('download')` is an alias.)
+- **Dialogs:** `const d = await page.getJsDialog()` → `null` or `{type, message, accept, dismiss}`;
+  `await d.accept()` / `await d.accept('prompt text')` / `await d.dismiss()`.
+- **Console:** `await page.consoleLogs({limit})` — captured console messages (debugging a local app).
+- **Save the page:** `await page.pdf({path})` (via print-to-PDF) or `page.export({format:'text'})` —
+  returns `{path, bytes}`.
+- **Responsive:** `await page.setViewport({width:390, height:844, mobile:true})`, then
+  `page.resetViewport()` when done. Only for device/breakpoint testing — default is fine otherwise.
+- **Coordinate ops (fallback):** `page.mouse.click(x,y)` / `move` / `wheel(x,y,dx,dy)`;
+  `page.drag(from, to)` and `locator.dragTo(target)` for sliders / reordering / canvas.
+  `page.elementFromPoint({x,y})` maps a screenshot coordinate back to an element's role/name/testid.
+- **Batch read:** `await browser.readUrls([url1, url2])` loads each in a **background** tab, extracts
+  `{title, snapshot, text}`, and closes it — without disturbing the user's tab. For multi-source
+  research. `await browser.history({query, maxResults})` lists recent history (use only when the task
+  needs it).
+
 ## Coordinate / vision fallback (`page.dom_cua`)
 
 When semantics fail (canvas apps, painted UIs, an element with no stable role/name), drop to
@@ -113,19 +142,21 @@ When semantics fail (canvas apps, painted UIs, an element with no stable role/na
 
 ## Patterns
 
-**Extract a list in one call** (loop, don't round-trip per row):
+**Extract a list — project in ONE `evaluate`, don't read per-row.** Each locator read
+(`innerText`/`getAttribute`/…) is a separate round trip into the page; looping them over N rows is
+the single most expensive thing you can do (worse on big pages). Pull everything in one
+`page.evaluate` that queries and projects, then return the array:
 ```js
-const rows = page.getByRole('row').filter({ hasText: 'INV-' });
-const out = [];
-for (let i = 0; i < await rows.count(); i++) {
-  const r = rows.nth(i);
-  out.push({
-    id: (await r.getByRole('cell').first().innerText()).trim(),
-    amount: (await r.getByTestId('amount').innerText()).trim(),
-  });
-}
-return out;
+return await page.evaluate(() => {
+  const rows = [...document.querySelectorAll('tr')].filter(r => r.textContent.includes('INV-'));
+  return rows.map(r => ({
+    id: r.querySelector('td')?.innerText.trim(),
+    amount: r.querySelector('[data-testid=amount]')?.innerText.trim(),
+  }));
+});
 ```
+Reserve per-element locator reads for a **small, already-scoped** set (a handful of known
+candidates), never as a way to discover or scrape a whole page.
 
 **Login form, submit, confirm:**
 ```js
@@ -166,7 +197,11 @@ if (await page.getByText('Accept cookies').isVisible()) {
   tool calls. That's the whole point — it's how the browser feels smooth.
 - **Semantic first.** Prefer role/text/label locators over CSS, and CSS over coordinates.
 - **Let it wait.** Don't scatter `sleep`s or pre-checks; auto-wait covers timing. Add explicit
-  `waitFor` / `waitForURL` only for real async boundaries.
+  `waitFor` / `waitForURL` only for real async boundaries. Don't pass `timeoutMs` to routine
+  click/fill/check — reserve it for known-slow navigation or state transitions.
+- **Bulk reads go through `evaluate`.** Never loop `nth(i)` + `innerText()`/`getAttribute()` to
+  scrape a list — project it all in one `evaluate`. Per-element locator reads are for a small,
+  already-scoped candidate set only.
 - **Return small.** Distill to the answer. Don't return page HTML or giant arrays; `log()` progress
   and `return` the result.
 - **Refine on strict-mode throws** rather than defaulting to the first match blindly — but a
