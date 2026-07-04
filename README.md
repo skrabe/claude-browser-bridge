@@ -60,9 +60,11 @@ Installing globally also **disables the built-in Claude in Chrome** so you have 
 `--scope project` scopes that to a single project. Uninstall restores it — but only if *we* turned
 it off. Reload the extension after any code change (a browser restart is **not** needed).
 
-**Requirements:** macOS · Node 18+ · a Chromium browser (Brave / Chrome / Edge) on **v125+** (for
-cross-origin-iframe support). Brave reads native-messaging manifests from Chrome's directory, so the
-installer registers with every detected Chromium browser automatically.
+**Requirements:** macOS · Node 18+ · any Chromium-family browser on **v125+** (for
+cross-origin-iframe support). The installer detects browsers structurally — every Chromium
+user-data dir that has actually run (Chrome, Brave, Edge, Chromium, Arc, Aside, Helium, and
+any future fork) gets the native-messaging manifest; each fork reads manifests only from its
+own dir, so all of them are registered automatically.
 
 ---
 
