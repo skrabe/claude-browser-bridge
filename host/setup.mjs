@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Claude Browser Bridge installer.
-//   install  --scope global|project [--project <path>] [--browsers brave,chrome,edge]
+//   install  --scope global|project [--project <path>]   (registers with every detected Chromium browser)
 //   uninstall
 //   status
 //   verify
@@ -24,7 +24,9 @@ const NH_NAME = 'com.claude.browserbridge';
 const MCP_NAME = 'claude-browser';
 const CIC = 'claude-in-chrome';
 
-const BROWSERS = {
+// Pre-0.10.2 install-state files stored these keys in `browsers` instead of home-relative
+// paths; kept ONLY so uninstall can resolve them. Detection is fully structural (below).
+const LEGACY_STATE_DIRS = {
   brave: 'Library/Application Support/BraveSoftware/Brave-Browser',
   chrome: 'Library/Application Support/Google/Chrome',
   edge: 'Library/Application Support/Microsoft Edge',
@@ -46,15 +48,41 @@ function extensionId() {
   let id = ''; for (let i = 0; i < 16; i++) id += String.fromCharCode(97 + (h[i] >> 4)) + String.fromCharCode(97 + (h[i] & 0xf));
   return id;
 }
-function detectedBrowsers() { return Object.entries(BROWSERS).filter(([, rel]) => fs.existsSync(path.join(HOME, rel))).map(([k]) => k); }
+// Detect every Chromium-family browser on this machine by structure, not by name — a
+// hardcoded list silently breaks on each new fork (Arc, Aside, Helium, …), and each fork
+// reads native-messaging manifests ONLY from its own user-data dir. A qualifying dir
+// (≤2 levels under the platform config root) has all three Chromium runtime artifacts:
+//   Local State           — the browser has actually run here
+//   Default / "Profile N"  — a real user profile (Electron apps fail this or the next)
+//   NativeMessagingHosts  — the native-messaging surface, created by Chromium on first run
+// Firefox fails the first (and uses a different manifest schema anyway); phantom dirs that
+// other installers created just to drop a manifest into fail all three.
+function isUserDataDir(d) {
+  try {
+    if (!fs.statSync(path.join(d, 'Local State')).isFile()) return false;
+    if (!fs.statSync(path.join(d, 'NativeMessagingHosts')).isDirectory()) return false;
+    if (fs.existsSync(path.join(d, 'Default'))) return true;
+    return fs.readdirSync(d).some(n => /^Profile \d+$/.test(n));
+  } catch { return false; }
+}
+function detectedBrowsers() {
+  const root = process.platform === 'darwin'
+    ? path.join(HOME, 'Library', 'Application Support')
+    : path.join(HOME, '.config');
+  const subdirs = (d) => { try { return fs.readdirSync(d, { withFileTypes: true }).filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => path.join(d, e.name)); } catch { return []; } };
+  const found = [];
+  for (const d1 of subdirs(root))
+    for (const c of [d1, ...subdirs(d1)])
+      if (isUserDataDir(c)) found.push(path.relative(HOME, c));
+  return found.sort();
+}
 const log = (...a) => console.error('[bridge]', ...a);
 
 function parseArgs(argv) {
-  const o = { browsers: null, scope: null, project: process.cwd() };
+  const o = { scope: null, project: process.cwd() };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--scope') o.scope = argv[++i];
     else if (argv[i] === '--project') o.project = path.resolve(argv[++i]);
-    else if (argv[i] === '--browsers') o.browsers = argv[++i].split(',').map(s => s.trim());
   }
   return o;
 }
@@ -64,9 +92,8 @@ function install(opts) {
   const scope = opts.scope || 'global';
   const extId = extensionId();
   const node = process.execPath;
-  // Always register with EVERY detected Chromium browser. Some (notably Brave) read
-  // native-messaging manifests from Chrome's directory, not their own — so writing only to
-  // the "selected" browser silently breaks discovery. The manifest is inert where unused.
+  // Register with EVERY detected Chromium browser — the manifest is inert where unused,
+  // and per-browser selection just creates "works in Chrome, dead in the fork" bugs.
   const browsers = detectedBrowsers();
   if (browsers.length === 0) throw new Error('no Chromium-family browser found');
 
@@ -75,14 +102,11 @@ function install(opts) {
   fs.writeFileSync(wrap, `#!/bin/sh\nexec "${node}" "${path.join(ROOT, 'host', 'bridge.mjs')}" --native-host\n`);
   fs.chmodSync(wrap, 0o755);
 
-  // 2) native-messaging manifest per browser
+  // 2) native-messaging manifest per browser (detection guarantees NativeMessagingHosts exists)
   const manifest = { name: NH_NAME, description: 'Claude Browser Bridge native host', path: wrap, type: 'stdio', allowed_origins: [`chrome-extension://${extId}/`] };
   const wroteBrowsers = [];
   for (const b of browsers) {
-    const dir = path.join(HOME, BROWSERS[b], 'NativeMessagingHosts');
-    if (!fs.existsSync(path.dirname(dir))) continue;
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, NH_NAME + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+    fs.writeFileSync(path.join(HOME, b, 'NativeMessagingHosts', NH_NAME + '.json'), JSON.stringify(manifest, null, 2) + '\n');
     wroteBrowsers.push(b);
   }
 
@@ -151,9 +175,9 @@ function install(opts) {
 function uninstall() {
   const state = readJSON(STATE, null);
   if (!state) { log('no install state found; nothing to uninstall'); return; }
-  // native host manifests
+  // native host manifests — state stores home-relative dirs; pre-0.10.2 states stored keys
   for (const b of state.browsers || []) {
-    const f = path.join(HOME, BROWSERS[b], 'NativeMessagingHosts', NH_NAME + '.json');
+    const f = path.join(HOME, LEGACY_STATE_DIRS[b] || b, 'NativeMessagingHosts', NH_NAME + '.json');
     try { fs.unlinkSync(f); } catch {}
   }
   // MCP entry
@@ -226,5 +250,5 @@ try {
   else if (cmd === 'uninstall') uninstall();
   else if (cmd === 'status') status();
   else if (cmd === 'verify') verify().then(r => { log('verify:', JSON.stringify(r)); process.exit(r.ok ? 0 : 1); });
-  else { console.error('usage: setup.mjs install|uninstall|status|verify [--scope global|project] [--project <path>] [--browsers a,b]'); process.exit(2); }
+  else { console.error('usage: setup.mjs install|uninstall|status|verify [--scope global|project] [--project <path>]'); process.exit(2); }
 } catch (e) { log('ERROR:', e.message); process.exit(1); }

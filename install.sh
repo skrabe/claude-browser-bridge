@@ -33,15 +33,27 @@ MANIFEST_JSON=$(cat <<EOF
 EOF
 )
 
-for base in \
-  "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" \
-  "$HOME/Library/Application Support/Google/Chrome" ; do
-  if [ -d "$base" ]; then
-    mkdir -p "$base/NativeMessagingHosts"
-    printf '%s\n' "$MANIFEST_JSON" > "$base/NativeMessagingHosts/com.claude.browserbridge.json"
-    echo "installed manifest -> $base/NativeMessagingHosts/com.claude.browserbridge.json"
+# Detected by structure, not by name — every Chromium fork (Chrome, Brave, Arc, Aside, …)
+# reads manifests ONLY from its own user-data dir. A qualifying dir has run at least once
+# (Local State), owns a real profile (Default / "Profile N"), and has the native-messaging
+# surface (NativeMessagingHosts, created by Chromium on first run). Electron apps and
+# Firefox fail these checks. Mirrors isUserDataDir() in host/setup.mjs.
+CONFIG_ROOT="$HOME/Library/Application Support"
+[ "$(uname)" = "Linux" ] && CONFIG_ROOT="$HOME/.config"
+
+FOUND=0
+for base in "$CONFIG_ROOT"/*/ "$CONFIG_ROOT"/*/*/ ; do
+  base="${base%/}"
+  [ -f "$base/Local State" ] || continue
+  [ -d "$base/NativeMessagingHosts" ] || continue
+  if [ ! -d "$base/Default" ]; then
+    ls -d "$base"/Profile\ * >/dev/null 2>&1 || continue
   fi
+  printf '%s\n' "$MANIFEST_JSON" > "$base/NativeMessagingHosts/com.claude.browserbridge.json"
+  echo "installed manifest -> $base/NativeMessagingHosts/com.claude.browserbridge.json"
+  FOUND=$((FOUND+1))
 done
+if [ "$FOUND" -eq 0 ]; then echo "no Chromium-family browser found"; exit 1; fi
 
 echo
 echo "Done. Now register the MCP server with Claude Code:"
