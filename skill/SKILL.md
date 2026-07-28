@@ -161,21 +161,70 @@ a new one.
   dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a "discard changes?"). (`beforeunload`
   is auto-accepted so it can't wedge navigation.)
 - **Console:** `await page.consoleLogs({limit})` — for debugging a local app.
+- **Screenshot:** `await page.screenshot({fullPage, marks, boxes, ref})` — same capture path as the
+  atomic tool, so it returns the same `{scale, origin, space, …}` mapping and can draw marks.
 - **Save the page:** `await page.pdf({path})` or `page.export({format:'text'})` → `{path, bytes}`.
 - **Responsive:** `await page.setViewport({width:390, height:844, mobile:true})` then
   `page.resetViewport()`. Only for device/breakpoint testing.
 - **Batch read:** `await browser.readUrls([url1, url2])` loads each in a **background** tab
   (bounded-parallel), extracts `{title, snapshot, text}`, and closes it — for multi-source research.
   `await browser.history({query})` lists recent history (only when the task needs it).
+- **Only as atomic tools** (no `page.` equivalent): `clipboard_read`/`clipboard_write`,
+  `page_assets`/`bundle_assets`, `webmcp_tools`/`webmcp_call`, `probe_point`, `credential_request`.
+  Call them before or after a `run`, not inside it.
 
-## Coordinate / vision fallback (`page.dom_cua`)
+## Working from what you can see
 
-When semantics fail (canvas apps, painted UIs, an element with no stable role/name), drop to
-`page.dom_cua`: `get_visible_dom()` (numbered nodes with boxes), then `click({node_id})` ·
-`double_click({node_id})` · `type({text})` · `keypress({keys})` · `scroll({node_id,x,y})`; or raw
-`page.mouse.click(x,y)`/`wheel`, `page.drag(from,to)`, `page.elementFromPoint({x,y})`. Last resort.
-Coordinate acting is unreliable — **verify after every step** and remember screenshot pixels ≠ CSS
-pixels on Retina (use `[box]`/`elementFromPoint`, not raw screenshot coords).
+Sometimes the page is the picture: a canvas app, a painted UI, a chart, an element with no stable
+role or name — or you simply want to act on the thing you can see rather than hunt for its label.
+That's fine. The rule is only ever **don't guess a raw pixel**, because a pixel you read off a
+screenshot is not a CSS pixel and clicking it as one lands somewhere else.
+
+**`screenshot({marks:true}) → click{ref}` is the way to act visually.** Marks draw a labelled badge
+on every interactable element, and the badge text *is* the ref `click` takes. You look at the
+picture, read the badge on the thing you want, and click that. No arithmetic, no drift — it resolves
+through the element, so it cannot land on the wrong thing. Use it freely; it is not a fallback.
+
+When you do need a genuine coordinate — a point on a canvas, a chart position, a spot with no
+element of its own — every screenshot returns its exact mapping alongside the image:
+
+```json
+{"space":"viewport","scale":0.62,"origin":{"x":0,"y":0},
+ "imageSize":{"width":1568,"height":940},"viewport":{"width":2528,"height":1516},
+ "scroll":{"x":0,"y":0}}
+```
+
+Pass the pixel back **in the space you read it in** and the bridge converts it:
+
+- `click{x, y, space:"image"}` — a pixel measured on the last screenshot. Almost always what you want.
+- `click{x, y, space:"page"}` — document coordinates (what a `fullPage:true` shot is in).
+- `click{x, y}` — CSS viewport pixels, the default. Only correct if you computed them yourself.
+
+Sending an image pixel without `space:"image"` is the classic miss: at `scale` 0.62 every coordinate
+lands ~1.6× short. A point outside the viewport is rejected with a message rather than silently
+clamped, so a wrong space usually announces itself on the first try.
+
+**`probe_point{x, y, space}` answers "what is actually there?"** — it returns the element under that
+point (tag, role, label, selector, box) plus a **ref you can click**. That turns a coordinate guess
+into a reliable semantic target. Add `annotate:true` to get a picture back with a crosshair on the
+probed point, which is how you *see* a misplacement instead of inferring it from a failed action.
+
+**Every `click` returns a receipt.** `landedOn` names the element the click actually reached, and
+`intercepted` appears when an overlay covered the element your ref pointed at:
+
+> `click at (412,388) was over <div> "Accept cookies", not the ref's <button> "Add to cart" —
+> something is covering the target. Clear it and retry.`
+
+That is the signal to dismiss the modal/banner and retry — not to retry the same click harder.
+
+Inside `run`, the same ideas: `page.dom_cua.get_visible_dom()` (numbered nodes with boxes) then
+`click({node_id})` · `double_click({node_id})` · `type({text})` · `keypress({keys})` ·
+`scroll({node_id,x,y})`; plus `page.elementFromPoint({x,y})`, `page.mouse.click(x,y)`/`wheel`,
+`page.drag(from,to)`. `run`'s mouse helpers take CSS viewport pixels — get them from a locator's
+`.boundingBox()` or a `domSnapshot({boxes:true})`, never off a screenshot.
+
+Whatever the route: **verify with page state**, not with the click's own success. A selected option,
+a checked box, a toast, a cart line, a URL parameter — one authoritative signal, then move on.
 
 ---
 
@@ -198,6 +247,11 @@ the verification you need.
 - `dom_query` — a CSS selector → match count + a ref & attrs each. **Top-document only** (a selector
   can't cross an origin boundary — use `read_page`/`find` to target inside a frame). Confirm
   existence/uniqueness.
+- `screenshot` — visual layout. `marks:true` badges every interactable with its ref (act on what you
+  see); `ref:` = just that element; `fullPage:true` = the whole page. Always reports its
+  image↔CSS mapping — see "Working from what you can see".
+- `probe_point` — what element is at `{x,y,space}`? Returns it plus a clickable ref; `annotate:true`
+  draws a crosshair on the point so a misplacement is visible.
 - **Lens choice:** `read_page` for structure/refs, `read_text` for prose, `find_text` for "does X
   appear", `screenshot` for visual layout. Pick the **one** that answers the next question.
 
@@ -213,8 +267,18 @@ navigation) applies here too.
   navigates unexpectedly. For multi-field forms whose refs you already resolved.
 - Also: `dialog_handle`, `download_wait` / `downloads_list`, `credential_request`,
   `secret_set` / `secret_list` / `secret_clear`, `read_console` / `read_network` / `network_body`,
-  `screenshot` (ref = just that element; `fullPage:true` = whole page), `navigate` / `reload` /
-  `go_back` / `go_forward`, `cdp`.
+  `clipboard_read` / `clipboard_write`, `navigate` / `reload` / `go_back` / `go_forward`, `cdp`.
+
+**The page's own API and assets**
+- `webmcp_tools` — does this page publish its own tools (WebMCP `document.modelContext`, plus
+  declarative `[toolname]` forms)? When one covers what you need, `webmcp_call` it instead of
+  driving the UI: it's the app's own semantic operation, so it can't misclick and doesn't care about
+  layout. Still rare in the wild — worth one check on an unfamiliar app before a long flow, not on
+  every page.
+- `page_assets` — inventory the files the page actually rendered (images incl. `srcset` and CSS
+  backgrounds, video, stylesheets, scripts, loaded fonts, inline SVG markup). Load the UI state you
+  care about first; it reports what's currently observable. `bundle_assets` downloads them and
+  returns local paths to Read. Don't navigate to an asset URL just to fetch it.
 
 ---
 
@@ -263,8 +327,9 @@ navigation) applies here too.
   it once — don't retype it identically. **Virtualized/infinite lists** render only visible rows —
   scroll-collect-dedupe by a stable key until the set stops growing.
 - Same target failed twice → stop escalating on role/text; switch to the most stable attribute from a
-  fresh snapshot, or fall back to a `screenshot` + coordinate click. A single opaque `canvas` where
-  you expect many rows means the content is painted, not in the DOM → go straight to coordinates.
+  fresh snapshot, or to `screenshot({marks:true})` and click the badge on the thing you can see. A
+  single opaque `canvas` where you expect many rows means the content is painted, not in the DOM →
+  go visual, and use `probe_point` to name what's under a point before acting on it.
 
 ---
 
@@ -313,7 +378,8 @@ const p2 = await browser.claimTab((await browser.openTabs()).find(t => !before.h
   a single `run`. *Except* around a consequential action (buy, send, delete, submit that transmits
   data): end the script **before** that click, return the staged state for the user to confirm, and
   commit in a **second** `run`. Don't let one script fill *and* place the order.
-- **Semantic first.** Prefer role/text/label locators over CSS, and CSS over coordinates.
+- **Semantic first.** Prefer role/text/label locators over CSS, CSS over marks, marks over raw
+  coordinates. Every step down that ladder is still exact — it's raw pixels that carry risk.
 - **A mid-script action can navigate** and leave later locators pointing at a gone page. If a step
   might navigate, wrap it in `expectNavigation`/`waitForURL`; on failure `run` returns `{error, logs}`
   so the `log()` trail up to the break survives.
@@ -365,6 +431,39 @@ Keep this lean — a few real rules, not paranoia.
 
 ---
 
+# Non-obvious behaviour
+
+Things that are easy to get wrong from first principles, because this bridge drives a **real running
+browser** rather than a headless one you own.
+
+- **A screenshot pixel is not a CSS pixel.** Images are downscaled to fit vision limits, so the
+  `scale` in every screenshot's metadata is usually < 1. Pass a measured pixel back as
+  `space:"image"` — see "Working from what you can see". This is the single most common way to act
+  on the wrong thing.
+- **Don't read the clipboard from page JS.** `navigator.clipboard.readText()` needs the
+  `clipboard-read` permission, and on a tab the user isn't looking at that permission sits in the
+  `prompt` state, the prompt can never be shown, and the promise **never settles** — your `run`
+  script just hangs until it times out. Use the `clipboard_read` tool, which pastes via a trusted
+  browser command and needs no permission.
+- **Background tabs work.** The bridge emulates focus and keeps the tab lifecycle active, so SPAs
+  that gate rendering on visibility still load. `tab_activate` is for when the *user* should watch,
+  not to make a page work.
+- **The "…is debugging this browser" banner is expected** on any claimed tab. It's how Chrome shows
+  the attach; `tab_release` removes it. Don't apologise for it or work around it.
+- **Refs belong to the snapshot that produced them.** `read_page`/`find`/`dom_query`/`marks` hand out
+  refs; after a navigation or a DOM-changing action, take a fresh read rather than reusing an old
+  ref. A stale ref errors clearly rather than clicking the wrong thing.
+- **`marks` omits geometry by default.** You click a badge by its ref, so boxes aren't included —
+  pass `boxes:true` only when you actually need coordinates.
+- **Downloads land in the user's real Downloads folder**, not a sandbox. `download_wait` /
+  `bundle_assets` return absolute paths you can `Read`.
+- **WebMCP is still rare.** `webmcp_tools` is worth one check on an unfamiliar app before committing
+  to a long UI flow, not a reflex on every page.
+- **`dom_query` is top-document only** — a CSS selector can't cross an origin boundary. Use
+  `read_page`/`find` to target inside a cross-origin frame.
+
+---
+
 # Troubleshooting
 
 - **"host not running" / timeouts:** the browser must be open with the extension loaded & enabled,
@@ -376,8 +475,12 @@ Keep this lean — a few real rules, not paranoia.
   submit) may already have executed. A `strict mode` throw is your locator, not the page — refine it.
 - **Navigation seems stuck:** a client-side route may have changed without a full load — check
   `page.url()` in a `run`, or `wait_for {urlIncludes}`.
-- **A click did nothing:** suspect a covering overlay/modal (a `screenshot` shows it); clear it
-  before re-clicking. Don't retry the same failing selector without re-observing first.
+- **A click did nothing:** check the click's own receipt first — `intercepted` names the overlay that
+  swallowed it, and `landedOn` names what it actually reached. Clear the blocker, then retry. Don't
+  retry the same failing selector without re-observing first.
+- **A coordinate click landed in the wrong place:** you almost certainly sent an image pixel without
+  `space:"image"`. Compare `scale` in the screenshot's metadata — at scale 0.62 a click lands ~1.6×
+  short of where you aimed. `probe_point{...,annotate:true}` shows you exactly where the point is.
 - **Debugger detached / the debugging banner:** claimed tabs show a "…is debugging this browser"
   banner — expected and harmless; `tab_release` removes it. If the debugger detaches (DevTools opened
   on that tab, tab crashed, banner cancelled), `tab_claim` the tab again to re-attach; if it keeps

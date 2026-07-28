@@ -3,7 +3,10 @@
   "private": true,
   "description": "Programmable browser bridge for Claude Code. Runtime uses only Node builtins; jsdom is a dev-only dependency for the engine tests.",
   "scripts": {
-    "test": "node host/test/engine.test.mjs && node host/test/run.test.mjs"
+    "test": "node host/test/engine.test.mjs && node host/test/run.test.mjs",
+    "test:coordinates": "node test/run-coordinates.mjs"
   },
-  "devDependencies": { "jsdom": "^29.1.1" }
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
 }

@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.10.1';
+const VERSION = '0.11.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -147,16 +147,147 @@ async function frameOffset(tabId, sessionId) {
   }
   return { ox, oy };
 }
+// Axis-aligned box of a node in top-level viewport CSS px (translated through any OOPIF chain).
+// Does NOT scroll — callers that need the element on screen scroll it themselves first, so this
+// stays safe to fan out over every element on the page.
+async function nodeBox(tabId, backendNodeId, sessionId, which = 'content') {
+  const dbg = dbgOf(tabId, sessionId);
+  let model;
+  try { ({ model } = await cmd(dbg, 'DOM.getBoxModel', { backendNodeId })); } catch { return null; }
+  const q = model[which] || model.content;
+  if (!q) return null;
+  const { ox, oy } = sessionId ? await frameOffset(tabId, sessionId) : { ox: 0, oy: 0 };
+  const xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+  const x = Math.min(...xs) + ox, y = Math.min(...ys) + oy;
+  return { x, y, width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+}
+// Box + scroll offset read in ONE evaluation, so the pair is always internally consistent even
+// while a smooth scroll is still settling. Returns viewport-space and document-space rects.
+// Cross-origin frames fall back to the CDP path, which is the only thing that can reach them.
+const MEASURE_FN = `function(){
+  const r=this.getBoundingClientRect();
+  const sx=window.scrollX||0, sy=window.scrollY||0;
+  return { viewport:{x:r.left,y:r.top}, page:{x:r.left+sx,y:r.top+sy},
+           width:r.width, height:r.height, scroll:{x:Math.round(sx),y:Math.round(sy)} };
+}`;
+async function measureNode(tabId, backendNodeId, sessionId) {
+  if (!sessionId) {
+    try {
+      const objectId = await objectFor(tabId, backendNodeId);
+      const r = await cmd(tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: MEASURE_FN, returnByValue: true });
+      const v = r.result?.value;
+      if (v && v.width > 0 && v.height > 0) return v;
+      if (v) return v; // zero-sized is a real answer; the caller decides what to do with it
+    } catch { /* fall through to the CDP path */ }
+  }
+  const box = await nodeBox(tabId, backendNodeId, sessionId, 'border');
+  if (!box) return null;
+  const { scroll } = await pageGeometry(tabId);
+  return { viewport: { x: box.x, y: box.y }, page: { x: box.x + scroll.x, y: box.y + scroll.y }, width: box.width, height: box.height, scroll };
+}
 // Center of a ref in top-level viewport coords (translates through any OOPIF chain).
 async function absCenter(tabId, backendNodeId, sessionId) {
-  const dbg = dbgOf(tabId, sessionId);
-  await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
-  const { model } = await cmd(dbg, 'DOM.getBoxModel', { backendNodeId });
-  const q = model.content;
-  const { ox, oy } = sessionId ? await frameOffset(tabId, sessionId) : { ox: 0, oy: 0 };
-  return { x: (q[0] + q[2] + q[4] + q[6]) / 4 + ox, y: (q[1] + q[3] + q[5] + q[7]) / 4 + oy };
+  await cmd(dbgOf(tabId, sessionId), 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+  const b = await nodeBox(tabId, backendNodeId, sessionId, 'content');
+  if (!b) throw new Error('element has no layout box (display:none or detached) — take a fresh read_page');
+  return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
 }
 async function refPoint(tabId, ref) { const { backendNodeId, sessionId } = refNode(tabId, ref); return absCenter(tabId, backendNodeId, sessionId); }
+
+// ---- hit testing ----
+// What the browser would actually deliver a click at this point to. Pierces open shadow roots and
+// same-origin iframes so the answer names the real target, not the outer host/frame element.
+const HIT_TEST_FN = `function(x,y){
+  const desc=(e)=>{ if(!e) return null;
+    const a=(n)=>e.getAttribute&&e.getAttribute(n)||null;
+    const label=(a('aria-label')||e.title||(e.tagName==='INPUT'?(a('placeholder')||a('name')||''):'')||(e.innerText||e.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,120);
+    // Build the most specific selector the element actually supports, preferring stable hooks.
+    // A bare tag+class is often ambiguous, so try distinguishing attributes before falling back,
+    // and report how many elements the result matches so ambiguity is visible rather than assumed.
+    const tag=e.tagName?e.tagName.toLowerCase():'';
+    const q=(s)=>{try{return document.querySelectorAll(s).length}catch{return null}};
+    const cand=[];
+    if(e.id&&!/^[0-9]/.test(e.id)&&/^[\\w-]+$/.test(e.id)) cand.push('#'+CSS.escape(e.id));
+    for(const at of ['data-testid','data-test-id','data-test','data-qa','name']){ const v=a(at); if(v) cand.push(tag+'['+at+'="'+CSS.escape(v)+'"]'); }
+    // any other data-* attribute with a short, distinctive value
+    if(e.attributes) for(const at of e.attributes){ if(/^data-/.test(at.name)&&at.value&&at.value.length<=40&&!/^data-(testid|test-id|test|qa)$/.test(at.name)) cand.push(tag+'['+at.name+'="'+CSS.escape(at.value)+'"]'); }
+    const ar=a('aria-label'); if(ar&&ar.length<=60) cand.push(tag+'[aria-label="'+CSS.escape(ar)+'"]');
+    if(e.classList&&e.classList.length){const c=[...e.classList].filter(c=>/^[\\w-]+$/.test(c)).slice(0,3);if(c.length)cand.push(tag+'.'+c.map(x=>CSS.escape(x)).join('.'));}
+    cand.push(tag);
+    let sel=cand[cand.length-1], n=q(sel);
+    for(const c of cand){ const k=q(c); if(k===1){ sel=c; n=1; break; } if(k!=null&&(n==null||k<n)){ sel=c; n=k; } }
+    const r=e.getBoundingClientRect?e.getBoundingClientRect():null;
+    return { tag, role:a('role')||null, label:label||null, selector:sel, selectorMatches:n,
+             href:a('href'), disabled:!!(e.disabled),
+             box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
+  };
+  let doc=document, el=doc.elementFromPoint(x,y), fx=x, fy=y, frames=0;
+  if(!el) return { hit:null, outside:true };
+  // descend through same-origin iframes and open shadow roots to the innermost real target
+  for(let i=0;i<12;i++){
+    if(el.shadowRoot){ const inner=el.shadowRoot.elementFromPoint(fx,fy); if(inner&&inner!==el){ el=inner; continue; } }
+    if((el.tagName==='IFRAME'||el.tagName==='FRAME')&&el.contentDocument){
+      const r=el.getBoundingClientRect(); const inner=el.contentDocument.elementFromPoint(fx-r.left,fy-r.top);
+      if(inner){ fx-=r.left; fy-=r.top; el=inner; frames++; continue; }
+    }
+    break;
+  }
+  // the nearest clickable ancestor is usually what the user "meant" (text node inside a button)
+  let act=el; for(let i=0;i<8&&act;i++){ const t=act.tagName; if(t==='A'||t==='BUTTON'||t==='INPUT'||t==='SELECT'||t==='TEXTAREA'||t==='LABEL'||act.getAttribute('role')||act.onclick||act.tabIndex>=0) break; act=act.parentElement; }
+  const out={ hit:desc(el) };
+  if(act&&act!==el) out.clickable=desc(act);
+  if(frames) out.crossedFrames=frames;
+  return out;
+}`;
+async function hitTest(tabId, x, y) {
+  try {
+    const r = await cmd(tabId, 'Runtime.evaluate', {
+      expression: `(${HIT_TEST_FN})(${Number(x)},${Number(y)})`, returnByValue: true,
+    });
+    return r.result?.value ?? null;
+  } catch { return null; } // hit-testing is advisory — never fail an action because it didn't work
+}
+// Same shape as a hitTest entry, for the element a ref points at — so the two are comparable.
+const DESCRIBE_FN = `function(){
+  const e=this,a=(n)=>e.getAttribute&&e.getAttribute(n)||null;
+  const label=(a('aria-label')||e.title||(e.tagName==='INPUT'?(a('placeholder')||a('name')||''):'')||(e.innerText||e.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,120);
+  const r=e.getBoundingClientRect?e.getBoundingClientRect():null;
+  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null,
+           box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
+}`;
+async function describeNode(tabId, backendNodeId, sessionId) {
+  try {
+    const dbg = dbgOf(tabId, sessionId);
+    const objectId = await objectFor(dbg, backendNodeId);
+    const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: DESCRIBE_FN, returnByValue: true });
+    return r.result?.value ?? null;
+  } catch { return null; }
+}
+// Would a click at this point actually reach the ref's element?
+//
+// Judged by DOM relationship, not geometry: an overlay that covers the target CONTAINS its area, so
+// an overlap test calls that a hit and misses the very case worth reporting. Whereas the element
+// really under the cursor is either the target, inside it (its own label/icon), or the wrapper
+// around it — anything else is something sitting on top.
+const COVERED_FN = `function(x,y){
+  const hit=document.elementFromPoint(x,y);
+  if(!hit) return {covered:true,by:null};
+  if(hit===this||this.contains(hit)||hit.contains(this)) return {covered:false};
+  const a=(n)=>hit.getAttribute&&hit.getAttribute(n)||null;
+  const label=(a('aria-label')||hit.title||(hit.innerText||hit.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,80);
+  return {covered:true,by:{tag:hit.tagName?hit.tagName.toLowerCase():'',label:label||null}};
+}`;
+async function checkCovered(tabId, backendNodeId, sessionId, x, y) {
+  if (sessionId) return null; // cross-origin frame: the point would need frame-local coords — skip
+  try {
+    const objectId = await objectFor(tabId, backendNodeId);
+    const r = await cmd(tabId, 'Runtime.callFunctionOn', {
+      objectId, functionDeclaration: COVERED_FN,
+      arguments: [{ value: Number(x) }, { value: Number(y) }], returnByValue: true,
+    });
+    return r.result?.value ?? null;
+  } catch { return null; }
+}
 
 // Fill user-entered secrets into the page by selector (top document). Values arrive only here from
 // the popup; never logged or returned. Returns a status code (browserAuth-style).
@@ -213,19 +344,239 @@ function cleanName(s) {
   return String(s || '').replace(/[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]+/gu, '[icon]');
 }
 
-// Clamp screenshots to Claude's vision limits (~1568px longest edge / ~1.15MP) to cut token cost. Best-effort.
-async function downscaleImage(b64) {
-  const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  const bmp = await createImageBitmap(new Blob([bin], { type: 'image/png' }));
-  const w = bmp.width, h = bmp.height;
-  const scale = Math.min(1, 1568 / Math.max(w, h), Math.sqrt(1.15e6 / (w * h)));
-  if (scale >= 1) { bmp.close && bmp.close(); return b64; } // already within limits
-  const nw = Math.max(1, Math.round(w * scale)), nh = Math.max(1, Math.round(h * scale));
-  const canvas = new OffscreenCanvas(nw, nh);
-  canvas.getContext('2d').drawImage(bmp, 0, 0, nw, nh); bmp.close && bmp.close();
-  const buf = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer());
-  let s = ''; for (let i = 0; i < buf.length; i++) s += String.fromCharCode(buf[i]);
+// ---- screenshot geometry ----
+// Claude's vision limits (~1568px longest edge / ~1.15MP): we downscale to stay under them.
+const VISION_MAX_EDGE = 1568, VISION_MAX_PIXELS = 1.15e6;
+
+const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+function bytesToB64(buf) { // chunked — a per-byte string concat is quadratic on megapixel PNGs
+  let s = ''; const CH = 0x8000;
+  for (let i = 0; i < buf.length; i += CH) s += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
   return btoa(s);
+}
+const decodePng = (b64) => createImageBitmap(new Blob([b64ToBytes(b64)], { type: 'image/png' }));
+async function canvasToB64(canvas) {
+  return bytesToB64(new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer()));
+}
+
+// Page geometry in CSS px: viewport size, scroll offset, full document size.
+async function pageGeometry(tabId) {
+  const m = await cmd(tabId, 'Page.getLayoutMetrics').catch(() => ({}));
+  const lv = m.cssLayoutViewport || m.layoutViewport || {};
+  const vv = m.cssVisualViewport || m.visualViewport || {};
+  const cs = m.cssContentSize || m.contentSize || {};
+  return {
+    viewport: { width: Math.round(vv.clientWidth ?? lv.clientWidth ?? 0), height: Math.round(vv.clientHeight ?? lv.clientHeight ?? 0) },
+    scroll: { x: Math.round(vv.pageX ?? lv.pageX ?? 0), y: Math.round(vv.pageY ?? lv.pageY ?? 0) },
+    content: { width: Math.round(cs.width ?? 0), height: Math.round(cs.height ?? 0) },
+  };
+}
+
+// Capture a screenshot AND the exact mapping from its pixels back to CSS pixels.
+//
+// The scale factor is MEASURED from the decoded bitmap (imageWidth / sourceCssWidth) rather than
+// assumed, so device pixel ratio, browser zoom, and CDP's clip semantics can't silently skew it —
+// which is the whole reason coordinates read off a screenshot used to miss. `origin` is where the
+// image's top-left sits in the space named by `space`, so:
+//     cssViewportX = origin.x + imageX / scale   (space "viewport")
+//     pageX        = origin.x + imageX / scale   (space "page" — subtract scroll for a click)
+async function captureShot(tabId, p = {}) {
+  const geo = await pageGeometry(tabId);
+  const opts = { format: 'png' };
+  let space = 'viewport', origin = { x: 0, y: 0 }, srcW = geo.viewport.width, srcH = geo.viewport.height;
+
+  if (p.ref != null) { // just this element
+    const { backendNodeId, sessionId } = refNode(tabId, p.ref);
+    const dbg = dbgOf(tabId, sessionId);
+    await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
+    // captureScreenshot's clip is in DOCUMENT space while getBoxModel reports VIEWPORT space, so the
+    // scroll offset has to be added or a scrolled page captures the wrong region entirely.
+    //
+    // Box and scroll must be read together: scrollIntoViewIfNeeded above settles asynchronously, so
+    // two separate reads can straddle it and produce a mismatched pair. One evaluation gets both
+    // from the same frame.
+    const m = await measureNode(tabId, backendNodeId, sessionId);
+    if (!m) throw new Error(`ref "${p.ref}" has no layout box (display:none or detached)`);
+    geo.scroll = m.scroll;
+    opts.clip = { x: m.page.x, y: m.page.y, width: m.width, height: m.height, scale: 1 };
+    // origin stays viewport-relative — that is the space the returned coordinates are declared in
+    origin = { x: m.viewport.x, y: m.viewport.y }; srcW = m.width; srcH = m.height;
+  } else if (p.fullPage) { // whole scrollable page, not just the viewport
+    opts.captureBeyondViewport = true;
+    if (geo.content.width) opts.clip = { x: 0, y: 0, width: geo.content.width, height: geo.content.height, scale: 1 };
+    space = 'page'; srcW = geo.content.width || geo.viewport.width; srcH = geo.content.height || geo.viewport.height;
+  }
+
+  const raw = (await cmd(tabId, 'Page.captureScreenshot', opts)).data;
+  let bmp = null, data = raw, imgW = srcW, imgH = srcH, marks = null;
+  try {
+    bmp = await decodePng(raw);
+    imgW = bmp.width; imgH = bmp.height;
+    if (p.marks) marks = await collectMarks(tabId, { space, origin, srcW, srcH, scroll: geo.scroll });
+    // One canvas pass does both the downscale and the mark overlay, so badges stay crisp and the
+    // annotation is drawn in FINAL image coordinates (what the model will actually read off).
+    const fit = Math.min(1, VISION_MAX_EDGE / Math.max(imgW, imgH), Math.sqrt(VISION_MAX_PIXELS / (imgW * imgH)));
+    const needsDraw = fit < 1 || (marks && marks.length) || p.point;
+    if (needsDraw) {
+      const outW = Math.max(1, Math.round(imgW * fit)), outH = Math.max(1, Math.round(imgH * fit));
+      const canvas = new OffscreenCanvas(outW, outH);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bmp, 0, 0, outW, outH);
+      const toImg = (outW / srcW); // CSS px in the captured rect -> final image px
+      if (marks && marks.length) drawMarks(ctx, marks, origin, toImg, outW, outH);
+      if (p.point) drawProbePoint(ctx, (p.point.x - origin.x) * toImg, (p.point.y - origin.y) * toImg);
+      data = await canvasToB64(canvas);
+      imgW = outW; imgH = outH;
+    }
+  } catch { data = raw; /* fall back to the raw capture on any decode/resize failure */ }
+  finally { bmp && bmp.close && bmp.close(); }
+
+  const scale = srcW ? imgW / srcW : 1;
+  const shot = {
+    space, origin, scale: Number(scale.toFixed(6)),
+    imageSize: { width: imgW, height: imgH },
+    capturedCssSize: { width: srcW, height: srcH },
+    viewport: geo.viewport, scroll: geo.scroll, ts: Date.now(),
+  };
+  st(tabId).lastShot = shot; // lets a later {space:"image"} coordinate be translated exactly
+  return { image: data, shot, marks };
+}
+
+// ---- coordinate spaces ----
+// "viewport" (default) = CSS px from the viewport's top-left — what CDP Input actually consumes.
+// "page"              = CSS px from the document's top-left (a full-page screenshot's space).
+// "image"             = pixels in the last screenshot returned for this tab.
+async function toViewport(tabId, x, y, space) {
+  const sp = space || 'viewport';
+  if (sp === 'viewport') return { x, y };
+  if (sp === 'page') { // document coords — the LIVE scroll offset, not whatever a stale shot recorded
+    const { scroll } = await pageGeometry(tabId);
+    return { x: x - scroll.x, y: y - scroll.y };
+  }
+  if (sp === 'image') {
+    const shot = state.get(tabId)?.lastShot;
+    if (!shot) throw new Error('space:"image" refers to the last screenshot of this tab — take one first');
+    const cx = shot.origin.x + x / shot.scale, cy = shot.origin.y + y / shot.scale;
+    if (shot.space !== 'page') return { x: cx, y: cy };
+    // The shot was document-space; convert through the live scroll so a scroll since the capture
+    // shifts the point instead of silently aiming at the wrong row.
+    const { scroll } = await pageGeometry(tabId);
+    return { x: cx - scroll.x, y: cy - scroll.y };
+  }
+  throw new Error(`unknown coordinate space "${sp}" — use "viewport", "page" or "image"`);
+}
+// Resolve a tool's target point to viewport CSS px, whatever space it was expressed in.
+async function pointOf(tabId, p) {
+  if (p.x == null || p.y == null) return null;
+  return toViewport(tabId, p.x, p.y, p.space);
+}
+
+// ---- set-of-mark annotation ----
+// Label every interactable element in the shot with the SAME ref that `click{ref}` takes. This
+// turns "read a pixel off the picture and hope" into "name the badge you can see" — the model gets
+// to work visually while the actual click still resolves through the element, so it cannot miss.
+const MARK_COLORS = ['#e11d48', '#2563eb', '#059669', '#d97706', '#7c3aed', '#0891b2'];
+
+async function collectMarks(tabId, { space, origin, srcW, srcH, scroll }) {
+  const s = st(tabId);
+  const cands = [];
+  for (const sessionId of [undefined, ...s.frames.keys()]) {
+    let nodes;
+    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    for (const n of nodes) {
+      if (n.ignored || n.backendDOMNodeId == null) continue;
+      const role = n.role?.value; if (!role || !INTERACTIVE.has(role)) continue;
+      if (n.properties?.some((pr) => pr.name === 'hidden' && pr.value?.value === true)) continue;
+      cands.push({ role, name: cleanName((n.name?.value || '').trim()).slice(0, 120), backendNodeId: n.backendDOMNodeId, sessionId });
+      if (cands.length >= 300) break;
+    }
+  }
+  // Boxes in parallel — each is an in-process CDP call, so a page full of controls stays fast.
+  const boxes = await Promise.all(cands.map((c) => nodeBox(tabId, c.backendNodeId, c.sessionId, 'border').catch(() => null)));
+  const out = [];
+  for (let i = 0; i < cands.length; i++) {
+    const b = boxes[i]; if (!b || b.width <= 0 || b.height <= 0) continue;
+    // Boxes come back viewport-relative; a full-page capture is document-space, so add the scroll.
+    const bx = space === 'page' ? b.x + scroll.x : b.x;
+    const by = space === 'page' ? b.y + scroll.y : b.y;
+    if (bx + b.width < origin.x || by + b.height < origin.y) continue; // fully above/left of the capture
+    if (bx > origin.x + srcW || by > origin.y + srcH) continue;        // fully below/right of it
+    const c = cands[i];
+    const ref = 'm' + (++s.seq);
+    s.refs.set(ref, { backendNodeId: c.backendNodeId, sessionId: c.sessionId });
+    out.push({ ref, role: c.role, name: c.name, x: Math.round(bx), y: Math.round(by), width: Math.round(b.width), height: Math.round(b.height) });
+  }
+  return out;
+}
+
+// Draw the badges onto the final (already-downscaled) canvas, in image pixels.
+//
+// A badge that sits ON the element hides the very text that identifies it, which makes the
+// screenshot worse than an unmarked one. So each badge is placed OUTSIDE its element's box —
+// preferring the left margin, then above, then below — and only lands on top of the element as a
+// last resort when nothing else is free.
+function drawMarks(ctx, marks, origin, toImg, outW, outH) {
+  const F = 10, PAD = 2;
+  ctx.font = `bold ${F}px -apple-system, "Segoe UI", system-ui, sans-serif`;
+  ctx.textBaseline = 'top';
+  const placed = [];
+  const free = (x, y, w, h) => x >= 0 && y >= 0 && x + w <= outW && y + h <= outH
+    && !placed.some((q) => x < q.x + q.w && x + w > q.x && y < q.y + q.h && y + h > q.y);
+
+  const boxes = marks.map((m) => ({
+    x: (m.x - origin.x) * toImg, y: (m.y - origin.y) * toImg,
+    w: m.width * toImg, h: m.height * toImg,
+  }));
+  // Place the small elements first: they have the fewest viable spots, and a big element's badge
+  // can always fall back to its own wide margin.
+  const order = marks.map((_, i) => i).sort((a, b) => (boxes[a].w * boxes[a].h) - (boxes[b].w * boxes[b].h));
+
+  for (const i of order) {
+    const m = marks[i], b = boxes[i];
+    const bw = ctx.measureText(m.ref).width + PAD * 2, bh = F + PAD * 2;
+    const cand = [
+      [b.x - bw - 1, b.y + (b.h - bh) / 2],   // left margin — best for wide inline text
+      [b.x, b.y - bh - 1],                    // above, left-aligned
+      [b.x, b.y + b.h + 1],                   // below, left-aligned
+      [b.x + b.w + 1, b.y + (b.h - bh) / 2],  // right margin
+      [b.x - bw - 1, b.y - bh - 1],           // diagonally outside the corner
+      [b.x, b.y],                             // give up and overlay it
+    ];
+    let spot = cand.find(([x, y]) => free(x, y, bw, bh)) || cand[cand.length - 1];
+    const bx = Math.min(Math.max(0, spot[0]), outW - bw), by = Math.min(Math.max(0, spot[1]), outH - bh);
+    placed.push({ x: bx, y: by, w: bw, h: bh, i });
+  }
+
+  // Outlines under every badge, so a badge sitting in the margin still reads as belonging to its box.
+  for (const p of placed) {
+    const b = boxes[p.i], color = MARK_COLORS[p.i % MARK_COLORS.length];
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeRect(b.x + 0.5, b.y + 0.5, Math.max(1, b.w - 1), Math.max(1, b.h - 1));
+    // a hairline from badge to box when the badge had to sit away from it
+    const bcx = p.x + p.w / 2, bcy = p.y + p.h / 2;
+    if (bcx < b.x - 2 || bcx > b.x + b.w + 2 || bcy < b.y - 2 || bcy > b.y + b.h + 2) {
+      ctx.globalAlpha = 0.45; ctx.beginPath();
+      ctx.moveTo(bcx, bcy); ctx.lineTo(Math.max(b.x, Math.min(bcx, b.x + b.w)), Math.max(b.y, Math.min(bcy, b.y + b.h)));
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+  }
+  for (const p of placed) {
+    const color = MARK_COLORS[p.i % MARK_COLORS.length];
+    ctx.fillStyle = color; ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.fillStyle = '#fff'; ctx.fillText(marks[p.i].ref, p.x + PAD, p.y + PAD);
+  }
+}
+
+// Crosshair + ring marking exactly where a probed/clicked point landed.
+function drawProbePoint(ctx, x, y) {
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+  for (const r of [11, 9]) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke(); ctx.strokeStyle = '#e11d48'; }
+  ctx.beginPath();
+  ctx.moveTo(x - 18, y); ctx.lineTo(x - 4, y); ctx.moveTo(x + 4, y); ctx.lineTo(x + 18, y);
+  ctx.moveTo(x, y - 18); ctx.lineTo(x, y - 4); ctx.moveTo(x, y + 4); ctx.lineTo(x, y + 18);
+  ctx.stroke();
+  ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
 // Actions that change page/UI state — attach a cheap status header (post-action url/title + new
@@ -391,16 +742,75 @@ async function dispatch(method, p) {
 
     case 'click': {
       await need(p.tabId);
-      let x = p.x, y = p.y;
-      if (p.ref != null) { const c = await refPoint(p.tabId, p.ref); x = c.x; y = c.y; }
-      if (x == null || y == null) throw new Error('click needs a ref or {x,y}');
+      let x, y, node = null, intended = null;
+      if (p.ref != null) {
+        node = refNode(p.tabId, p.ref);
+        const c = await absCenter(p.tabId, node.backendNodeId, node.sessionId);
+        x = c.x; y = c.y;
+        intended = await describeNode(p.tabId, node.backendNodeId, node.sessionId);
+      } else {
+        const pt = await pointOf(p.tabId, p);
+        if (!pt) throw new Error('click needs a ref or {x,y}');
+        x = pt.x; y = pt.y;
+      }
+      const geo = await pageGeometry(p.tabId);
+      if (x < 0 || y < 0 || x > geo.viewport.width || y > geo.viewport.height) {
+        throw new Error(`point (${Math.round(x)},${Math.round(y)}) is outside the ${geo.viewport.width}x${geo.viewport.height} viewport`
+          + ' — scroll it into view, or pass space:"image"/"page" if the coordinate came from a screenshot');
+      }
+      // What is really under the cursor BEFORE we press. This is the receipt: a click swallowed by
+      // an overlay/cookie banner says so instead of reporting a bare ok.
+      const [before, covered] = await Promise.all([
+        hitTest(p.tabId, x, y),
+        node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y) : Promise.resolve(null),
+      ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }); // settle :hover before pressing
       for (const clickCount of (p.double ? [1, 2] : [1])) {
         await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount });
         await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount });
       }
-      return { ok: true };
+      const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: before?.hit || null };
+      if (before?.clickable) out.nearestClickable = before.clickable;
+      if (covered?.covered) {
+        const by = covered.by;
+        out.intercepted = `click at (${Math.round(x)},${Math.round(y)}) was over `
+          + (by ? `<${by.tag}>${by.label ? ` "${by.label}"` : ''}` : 'nothing hit-testable')
+          + `, not the ref's <${intended?.tag || '?'}>${intended?.label ? ` "${intended.label}"` : ''}`
+          + ' — something is covering the target (modal, cookie banner, sticky header). Clear it and retry.';
+      }
+      return out;
+    }
+
+    case 'probePoint': {
+      // Point-to-element: hand back what is really at a coordinate, with a ref you can click and a
+      // selector you can reuse — so a coordinate guess converts into a reliable semantic target
+      // instead of a blind retry.
+      await need(p.tabId);
+      const pt = await pointOf(p.tabId, p);
+      if (!pt) throw new Error('probe_point needs {x,y}');
+      const geo = await pageGeometry(p.tabId);
+      const outside = pt.x < 0 || pt.y < 0 || pt.x > geo.viewport.width || pt.y > geo.viewport.height;
+      const info = outside ? null : await hitTest(p.tabId, pt.x, pt.y);
+      const out = {
+        requested: { x: p.x, y: p.y, space: p.space || 'viewport' },
+        viewportPoint: { x: Math.round(pt.x), y: Math.round(pt.y) },
+        viewport: geo.viewport, scroll: geo.scroll,
+        ...(outside ? { outsideViewport: true } : {}),
+        ...(info || {}),
+      };
+      // Register a ref for the element actually there, so the next call can target it properly.
+      if (info?.hit) {
+        try {
+          const { backendNodeId } = await cmd(p.tabId, 'DOM.getNodeForLocation', { x: Math.round(pt.x), y: Math.round(pt.y), includeUserAgentShadowDOM: false });
+          if (backendNodeId != null) { const s = st(p.tabId); const ref = 'p' + (++s.seq); s.refs.set(ref, { backendNodeId, sessionId: undefined }); out.ref = ref; }
+        } catch {}
+      }
+      if (p.annotate) { // picture of exactly where that point is, so a miss is visible not inferred
+        const shot = await captureShot(p.tabId, { point: pt, marks: !!p.marks });
+        return { __image: shot.image, mimeType: 'image/png', __meta: { ...out, screenshot: shot.shot, ...(shot.marks ? { marks: shot.marks } : {}) } };
+      }
+      return out;
     }
 
     case 'fill': {
@@ -446,8 +856,8 @@ async function dispatch(method, p) {
     case 'scroll': {
       await need(p.tabId);
       if (p.ref != null) { const { backendNodeId, sessionId } = refNode(p.tabId, p.ref); await cmd(dbgOf(p.tabId, sessionId), 'DOM.scrollIntoViewIfNeeded', { backendNodeId }); return { ok: true }; }
-      const x = p.x ?? 100, y = p.y ?? 100;
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: p.dx || 0, deltaY: p.dy || 300 });
+      const pt = (await pointOf(p.tabId, p)) || { x: 100, y: 100 };
+      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: pt.x, y: pt.y, deltaX: p.dx || 0, deltaY: p.dy || 300 });
       return { ok: true };
     }
     case 'selectOption': {
@@ -466,8 +876,8 @@ async function dispatch(method, p) {
     }
     case 'drag': {
       await need(p.tabId);
-      const from = p.fromRef != null ? await refPoint(p.tabId, p.fromRef) : { x: p.fromX, y: p.fromY };
-      const to = p.toRef != null ? await refPoint(p.tabId, p.toRef) : { x: p.toX, y: p.toY };
+      const from = p.fromRef != null ? await refPoint(p.tabId, p.fromRef) : await toViewport(p.tabId, p.fromX, p.fromY, p.space);
+      const to = p.toRef != null ? await refPoint(p.tabId, p.toRef) : await toViewport(p.tabId, p.toX, p.toY, p.space);
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'left' });
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
@@ -476,26 +886,16 @@ async function dispatch(method, p) {
 
     case 'screenshot': {
       await need(p.tabId);
-      const opts = { format: 'png' };
-      if (p.ref != null) { // just this element
-        const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
-        const dbg = dbgOf(p.tabId, sessionId);
-        await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
-        const { model } = await cmd(dbg, 'DOM.getBoxModel', { backendNodeId });
-        const q = model.border, xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
-        const { ox, oy } = sessionId ? await frameOffset(p.tabId, sessionId) : { ox: 0, oy: 0 };
-        const x0 = Math.min(...xs), y0 = Math.min(...ys);
-        opts.clip = { x: x0 + ox, y: y0 + oy, width: Math.max(...xs) - x0, height: Math.max(...ys) - y0, scale: 1 };
-      } else if (p.fullPage) { // whole scrollable page, not just the viewport
-        opts.captureBeyondViewport = true;
-        const m = await cmd(p.tabId, 'Page.getLayoutMetrics').catch(() => ({}));
-        const cs = m.cssContentSize || m.contentSize;
-        if (cs) opts.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 };
-      }
-      const r = await cmd(p.tabId, 'Page.captureScreenshot', opts);
-      let data = r.data;
-      try { data = await downscaleImage(r.data); } catch { data = r.data; } // fall back to raw on any decode/resize failure
-      return { __image: data, mimeType: 'image/png' };
+      const shot = await captureShot(p.tabId, p);
+      // Geometry per mark is only useful for coordinate work; the badge is clicked by ref. Dropping
+      // it by default roughly halves the payload on a link-dense page — pass boxes:true to get it.
+      const marks = shot.marks && (p.boxes
+        ? shot.marks
+        : shot.marks.map((m) => ({ ref: m.ref, role: m.role, ...(m.name ? { name: m.name } : {}) })));
+      return {
+        __image: shot.image, mimeType: 'image/png',
+        __meta: { screenshot: shot.shot, ...(marks ? { markCount: marks.length, marks } : {}) },
+      };
     }
 
     case 'findText': {
@@ -518,7 +918,8 @@ async function dispatch(method, p) {
 
     case 'hover': {
       await need(p.tabId);
-      const c = await refPoint(p.tabId, p.ref);
+      const c = p.ref != null ? await refPoint(p.tabId, p.ref) : await pointOf(p.tabId, p);
+      if (!c) throw new Error('hover needs a ref or {x,y}');
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: c.x, y: c.y });
       return { ok: true };
     }
@@ -621,6 +1022,207 @@ async function dispatch(method, p) {
     case 'getHistory': {
       const items = await chrome.history.search({ text: p.text || '', maxResults: Math.min(p.maxResults || 50, 500), ...(p.startTime ? { startTime: p.startTime } : {}), ...(p.endTime ? { endTime: p.endTime } : {}) });
       return { entries: (items || []).map((h) => ({ url: h.url, title: h.title, lastVisit: h.lastVisitTime, visitCount: h.visitCount })) };
+    }
+
+    case 'clipboardRead':
+    case 'clipboardWrite': {
+      await need(p.tabId);
+      // The async clipboard API is the wrong tool here. `navigator.clipboard.readText()` requires
+      // the clipboard-read permission, and when that permission is in the "prompt" state on a tab
+      // the user isn't looking at, the prompt never appears and the promise NEVER SETTLES — the call
+      // just hangs until something else times out. (Browser.grantPermissions can't rescue it either:
+      // it's a browser-level command that isn't routable on a page-target debugger session.)
+      //
+      // A real editing command dispatched through CDP is a trusted user action, so it needs no
+      // permission at all and always completes. It operates on the focused editable, hence the
+      // throwaway textarea.
+      const writing = method === 'clipboardWrite';
+      const text = String(p.text ?? '');
+      const mac = /Mac/i.test(navigator.userAgent);
+      const evalIn = (expression) => cmd(p.tabId, 'Runtime.evaluate', { expression, returnByValue: true });
+
+      const ready = await evalIn(`(()=>{
+        if(!document.body) return false;
+        let ta=document.getElementById('__cbb_clip');
+        if(!ta){ ta=document.createElement('textarea'); ta.id='__cbb_clip'; ta.setAttribute('aria-hidden','true');
+          ta.style.cssText='position:fixed;left:-9999px;top:0;width:10px;height:10px;opacity:0';
+          document.body.appendChild(ta); }
+        window.__cbbPrev=document.activeElement;
+        ta.value=${JSON.stringify(writing ? text : '')};
+        ta.focus(); ta.select();
+        return document.activeElement===ta;
+      })()`);
+      if (!ready.result?.value) throw new Error('could not focus a scratch field for the clipboard (page has no body yet?)');
+
+      const restore = () => evalIn(`(()=>{const ta=document.getElementById('__cbb_clip'); if(ta)ta.remove();
+        try{ window.__cbbPrev&&window.__cbbPrev.focus&&window.__cbbPrev.focus(); }catch{}
+        delete window.__cbbPrev; return true;})()`).catch(() => {});
+      try {
+        await cmd(p.tabId, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', key: writing ? 'c' : 'v', code: writing ? 'KeyC' : 'KeyV',
+          windowsVirtualKeyCode: writing ? 67 : 86, nativeVirtualKeyCode: writing ? 67 : 86,
+          modifiers: mac ? 4 : 2, commands: [writing ? 'copy' : 'paste'],
+        });
+        await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: writing ? 'c' : 'v', code: writing ? 'KeyC' : 'KeyV', windowsVirtualKeyCode: writing ? 67 : 86, modifiers: mac ? 4 : 2 });
+        if (writing) { await restore(); return { ok: true, length: text.length }; }
+        const got = await evalIn(`(document.getElementById('__cbb_clip')||{}).value ?? ''`);
+        await restore();
+        return { text: got.result?.value ?? '' };
+      } catch (e) { await restore(); throw e; }
+    }
+
+    case 'pageAssets': {
+      await need(p.tabId);
+      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+        expression: `(()=>{
+          const abs=(u)=>{try{return new URL(u,location.href).href}catch{return null}};
+          const seen=new Map(), svgs=[];
+          const add=(url,kind,name)=>{const u=abs(url); if(!u||u.startsWith('data:')&&u.length>512) return;
+            if(!seen.has(u)) seen.set(u,{url:u,kind,name:name||u.split('/').pop().split('?')[0]||kind});};
+          for(const e of document.querySelectorAll('img')){ add(e.currentSrc||e.src,'image',e.alt||null);
+            if(e.srcset) for(const part of e.srcset.split(',')) add(part.trim().split(/\\s+/)[0],'image',e.alt||null); }
+          for(const e of document.querySelectorAll('video,audio,source')) add(e.currentSrc||e.src,'video',null);
+          for(const e of document.querySelectorAll('link[rel~="stylesheet"]')) add(e.href,'stylesheet',null);
+          for(const e of document.querySelectorAll('link[rel~="icon"],link[rel~="apple-touch-icon"]')) add(e.href,'image',null);
+          for(const e of document.querySelectorAll('script[src]')) add(e.src,'script',null);
+          // CSS background images and @font-face files actually in use
+          for(const e of document.querySelectorAll('*')){
+            const bg=getComputedStyle(e).backgroundImage;
+            if(bg&&bg!=='none') for(const m of bg.matchAll(/url\\(["']?([^"')]+)["']?\\)/g)) add(m[1],'image',null);
+          }
+          try{ for(const f of document.fonts){ if(f.status==='loaded'&&f.family) seen.set('font:'+f.family+f.weight+f.style,{url:null,kind:'font',name:f.family+' '+f.style+' '+f.weight}); } }catch{}
+          document.querySelectorAll('svg').forEach((s,i)=>{ if(svgs.length<40){const m=s.outerHTML; if(m.length<20000) svgs.push({name:(s.getAttribute('aria-label')||s.id||'svg-'+i),markup:m});} });
+          const assets=[...seen.values()].slice(0,400);
+          const byKind={}; for(const a of assets) byKind[a.kind]=(byKind[a.kind]||0)+1;
+          return {pageUrl:location.href,assets,inlineSvgs:svgs,summary:{byKind,total:assets.length,inlineSvgCount:svgs.length}};
+        })()`,
+        returnByValue: true,
+      });
+      const v = r.result?.value || { assets: [], inlineSvgs: [] };
+      const s = st(p.tabId);
+      v.assets.forEach((a, i) => { a.id = 'a' + i; });
+      s.assets = new Map(v.assets.filter((a) => a.url).map((a) => [a.id, a]));
+      if (p.kinds && p.kinds.length) v.assets = v.assets.filter((a) => p.kinds.includes(a.kind));
+      return v;
+    }
+    case 'bundleAssets': {
+      // Download previously-inventoried assets to disk so Claude Code can Read them locally.
+      const s = st(p.tabId);
+      if (!s.assets || !s.assets.size) throw new Error('no asset inventory for this tab — call page_assets first');
+      let picked = [...s.assets.values()];
+      if (p.assetIds && p.assetIds.length) picked = picked.filter((a) => p.assetIds.includes(a.id));
+      else if (p.kinds && p.kinds.length) picked = picked.filter((a) => p.kinds.includes(a.kind));
+      picked = picked.filter((a) => a.url).slice(0, Math.min(p.limit || 60, 200));
+      const dir = String(p.directory || 'claude-page-assets').replace(/[^\w.-]+/g, '-');
+      const started = [], failures = [];
+      // Inline data: URIs are ordinary assets from the page's point of view (icons, small graphics
+      // are routinely inlined), so they get bundled too — with a filename synthesised from the
+      // declared MIME type, since the URI carries no name of its own.
+      const extOf = (u) => (u.match(/^data:([\w.+-]+)\/([\w.+-]+)/) || [])[2]?.replace(/^svg\+xml$/, 'svg') || 'bin';
+      for (const a of picked) {
+        let name = (a.name || 'asset').replace(/[^\w.-]+/g, '-').slice(0, 80) || 'asset';
+        if (a.url.startsWith('data:')) {
+          if (a.url.length > 8 * 1024 * 1024) { failures.push({ id: a.id, url: a.url.slice(0, 60) + '…', reason: 'inline data: URI over 8 MB' }); continue; }
+          if (!/\.[\w]{1,5}$/.test(name)) name = `${name}.${extOf(a.url)}`;
+        }
+        try { started.push({ id: a.id, url: a.url, downloadId: await chrome.downloads.download({ url: a.url, filename: `${dir}/${name}`, conflictAction: 'uniquify' }) }); }
+        catch (e) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: String(e && e.message || e) }); }
+      }
+      const deadline = Date.now() + Math.min(p.timeoutMs || 60000, 180000);
+      const done = [];
+      while (started.length && Date.now() < deadline) {
+        const pending = started.filter((x) => !done.some((d) => d.id === x.id));
+        if (!pending.length) break;
+        for (const x of pending) {
+          let rec; try { rec = (await chrome.downloads.search({ id: x.downloadId }))[0]; } catch {}
+          if (!rec) continue;
+          if (rec.state === 'complete') done.push({ id: x.id, url: x.url, path: rec.filename, bytes: rec.fileSize });
+          else if (rec.state === 'interrupted') { done.push({ id: x.id, url: x.url, failed: true }); failures.push({ id: x.id, url: x.url, reason: rec.error || 'interrupted' }); }
+        }
+        if (done.length >= started.length) break;
+        await new Promise((res) => setTimeout(res, 250));
+      }
+      const files = done.filter((d) => !d.failed);
+      const stalled = started.filter((x) => !done.some((d) => d.id === x.id)).map((x) => ({ id: x.id, url: x.url.slice(0, 120), reason: 'still downloading when the timeout elapsed' }));
+      return {
+        requested: picked.length, downloaded: files.length, files,
+        failures: [...failures, ...stalled],
+        ...(files[0] ? { directory: files[0].path.replace(/[\\/][^\\/]*$/, '') } : {}),
+        ...(picked.length === 0 ? { note: 'no assets matched — check the kinds/assetIds filter against the page_assets inventory' } : {}),
+      };
+    }
+
+    case 'webmcpTools': {
+      // WebMCP (W3C proposal): a page publishes its own semantic tools. When one covers the task,
+      // calling it beats driving the UI entirely.
+      //
+      // Agent-side surface is document.modelContext.getTools() / .executeTool(tool, params). The
+      // spec moved from navigator to document, and the MCP-B polyfill still ships the older
+      // listTools/callTool pair, so probe both rather than betting on either.
+      await need(p.tabId);
+      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+        expression: `(async()=>{
+          const ctx = (typeof document!=='undefined'&&document.modelContext)
+                   || (typeof navigator!=='undefined'&&navigator.modelContext) || null;
+          const surface = (typeof document!=='undefined'&&document.modelContext) ? 'document.modelContext'
+                        : (typeof navigator!=='undefined'&&navigator.modelContext) ? 'navigator.modelContext' : null;
+          let tools=[], error=null;
+          if(ctx){
+            try{
+              // also reach tools registered inside cross-origin iframes on this page
+              const origins=[...new Set([...document.querySelectorAll('iframe[src]')]
+                .map(f=>{try{return new URL(f.src).origin}catch{return null}}).filter(Boolean))];
+              let t;
+              if(ctx.getTools) t = await (origins.length ? ctx.getTools({fromOrigins:origins}).catch(()=>ctx.getTools()) : ctx.getTools());
+              else if(ctx.listTools) t = await ctx.listTools();
+              else t = ctx.tools;
+              if(Array.isArray(t)) tools=t;
+              else if(t&&Array.isArray(t.tools)) tools=t.tools;
+            }catch(e){ error=String(e&&e.message||e); }
+          }
+          const declarative=[...document.querySelectorAll('[toolname]')].map(e=>({
+            name:e.getAttribute('toolname'), description:e.getAttribute('tooldescription')||null,
+            autoSubmit:e.hasAttribute('toolautosubmit'), declarative:true,
+            fields:[...e.querySelectorAll('input,select,textarea')].map(i=>({
+              name:i.name||i.id||null, type:i.type||i.tagName.toLowerCase(), required:!!i.required,
+              description:i.getAttribute('toolparamdescription')||null,
+            })).filter(f=>f.name),
+          })).filter(t=>t.name);
+          return { supported: !!ctx || declarative.length>0, surface, ...(error?{error}:{}),
+                   tools: tools.map(t=>({name:t.name,description:t.description||null,
+                                         inputSchema:t.inputSchema||t.input_schema||null})),
+                   declarative };
+        })()`,
+        awaitPromise: true, returnByValue: true,
+      });
+      return r.result?.value || { supported: false, tools: [], declarative: [] };
+    }
+    case 'webmcpCall': {
+      await need(p.tabId);
+      // executeTool takes the registered tool OBJECT, not its name — so discovery and invocation
+      // have to happen inside one evaluation; the object cannot survive the CDP boundary.
+      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+        expression: `(async()=>{
+          const ctx=(document.modelContext)||(navigator.modelContext)||null;
+          if(!ctx) throw new Error('this page does not expose WebMCP tools');
+          const name=${JSON.stringify(String(p.name || ''))}, args=${JSON.stringify(p.arguments || {})};
+          if(ctx.getTools&&ctx.executeTool){
+            const origins=[...new Set([...document.querySelectorAll('iframe[src]')]
+              .map(f=>{try{return new URL(f.src).origin}catch{return null}}).filter(Boolean))];
+            const tools=await (origins.length ? ctx.getTools({fromOrigins:origins}).catch(()=>ctx.getTools()) : ctx.getTools());
+            const tool=(tools||[]).find(t=>t.name===name);
+            if(!tool) throw new Error('no WebMCP tool named "'+name+'" on this page (have: '+(tools||[]).map(t=>t.name).join(', ')+')');
+            // the typings say params is a string; the reference agent passes the object — try both
+            try { return await ctx.executeTool(tool,args); }
+            catch(e){ return await ctx.executeTool(tool,JSON.stringify(args)); }
+          }
+          if(ctx.callTool) return await ctx.callTool({name,arguments:args}); // MCP-B polyfill
+          throw new Error('this page exposes modelContext but neither executeTool nor callTool');
+        })()`,
+        awaitPromise: true, returnByValue: true, userGesture: true,
+      });
+      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'WebMCP call failed');
+      return { result: r.result?.value ?? null };
     }
 
     default: throw new Error('unknown method: ' + method);
