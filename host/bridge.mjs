@@ -29,6 +29,22 @@ function extFor(contentType, url) {
   return m ? m[1].toLowerCase() : 'bin';
 }
 
+// Bundled assets are scratch: one root under the OS temp dir, which the system reclaims on its own.
+// Stale bundles are also swept on each run so a long-lived machine doesn't quietly accrue them.
+const BUNDLE_ROOT = path.join(os.tmpdir(), 'claude-browser-bridge-assets');
+const BUNDLE_TTL_MS = 12 * 60 * 60 * 1000;
+async function sweepOldBundles() {
+  try {
+    const cutoff = Date.now() - BUNDLE_TTL_MS;
+    for (const e of await fsp.readdir(BUNDLE_ROOT, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(BUNDLE_ROOT, e.name);
+      const st = await fsp.stat(full).catch(() => null);
+      if (st && st.mtimeMs < cutoff) await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
+    }
+  } catch { /* nothing to sweep yet */ }
+}
+
 const MAX_FRAME = 256 * 1024 * 1024; // sanity cap; a corrupt/misaligned prefix must not stall the leg
 function framer(onMsg) {
   let buf = Buffer.alloc(0);
@@ -155,7 +171,7 @@ function runMcpServer() {
     { name: 'clipboard_read', description: "Read the browser clipboard as text (e.g. after the page's own 'Copy' button).", inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'clipboard_write', description: 'Put text on the browser clipboard, so the page can paste it.', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
     { name: 'page_assets', description: "Inventory the files the page actually rendered — images (incl. srcset + CSS backgrounds), video, stylesheets, scripts, loaded fonts — plus inline SVG markup. Load the UI state you care about first; this reports what's currently observable. Don't navigate to asset URLs just to fetch them; use bundle_assets.", inputSchema: { type: 'object', properties: { tabId: num, kinds: { type: 'array', items: str } }, required: ['tabId'] } },
-    { name: 'bundle_assets', description: "Save assets from the last page_assets inventory to disk and return their local paths, so you can Read them. Fetched with the user's session, so assets behind a login work. Writes to a temp dir by default (pass an absolute `directory` to choose); does NOT touch the browser's download UI or the user's Downloads folder. Filter by kinds or assetIds.", inputSchema: { type: 'object', properties: { tabId: num, assetIds: { type: 'array', items: str }, kinds: { type: 'array', items: str }, directory: str, limit: num }, required: ['tabId'] } },
+    { name: 'bundle_assets', description: "Save assets from the last page_assets inventory to disk and return their local paths, so you can Read them. Fetched with the user's session, so assets behind a login work. Always writes to scratch space under the OS temp dir (swept automatically, gone after a reboot) — never the user's Downloads folder, and never a path you choose; `directory` is just a folder NAME. These are working copies to Read, so copy anything you want to keep somewhere permanent. Filter by kinds or assetIds.", inputSchema: { type: 'object', properties: { tabId: num, assetIds: { type: 'array', items: str }, kinds: { type: 'array', items: str }, directory: str, limit: num }, required: ['tabId'] } },
     { name: 'webmcp_tools', description: 'Does this page publish its OWN tools (WebMCP / document.modelContext, plus declarative [toolname] forms)? When a page tool covers what you need, call it with webmcp_call instead of driving the UI — it is the page\'s own semantic API. Worth one check on an unfamiliar app.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'webmcp_call', description: 'Invoke a page-published WebMCP tool by name (from webmcp_tools).', inputSchema: { type: 'object', properties: { tabId: num, name: str, arguments: { type: 'object' } }, required: ['tabId', 'name'] } },
     { name: 'upload_file', description: 'Set files on an <input type=file> by ref (no native picker). Absolute paths.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, paths: { type: 'array', items: str } }, required: ['tabId', 'ref', 'paths'] } },
@@ -221,9 +237,12 @@ function runMcpServer() {
     // "ask where to save" setting and dumps files into their real Downloads folder.
     bundle_assets: async (a) => {
       const r = await callHost('fetchAssets', a);
-      const dir = a.directory && path.isAbsolute(a.directory)
-        ? a.directory
-        : path.join(os.tmpdir(), String(a.directory || 'claude-page-assets').replace(/[^\w.-]+/g, '-'));
+      // Always scratch space, never a path the caller chooses: these are working copies for reading,
+      // not deliverables, so they belong somewhere the OS reclaims rather than accumulating in the
+      // user's filesystem. `directory` is a NAME, sanitised — a path separator or .. can't escape.
+      const name = String(a.directory || 'page-assets').replace(/[^\w.-]+/g, '-').replace(/^\.+/, '') || 'page-assets';
+      const dir = path.join(BUNDLE_ROOT, name);
+      await sweepOldBundles();
       await fsp.mkdir(dir, { recursive: true });
       const files = [], failures = [...(r.failures || [])];
       const used = new Set();

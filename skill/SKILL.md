@@ -456,11 +456,14 @@ browser** rather than a headless one you own.
 - **`marks` omits geometry by default.** You click a badge by its ref, so boxes aren't included —
   pass `boxes:true` only when you actually need coordinates.
 - **Downloads land in the user's real Downloads folder**, not a sandbox. `download_wait` /
-  `bundle_assets` return absolute paths you can `Read`. `bundle_assets` suppresses the save-location
-  panel, but a download the **page** starts is the browser's own UI — if the user has "ask where to
-  save each file" on, it opens a native save dialog and the download sits at `in_progress` with an
-  empty filename until they click Save. So a `download_wait` that times out is not necessarily a
-  failure: say a dialog may be waiting rather than retrying blindly.
+  `bundle_assets` return absolute paths you can `Read`. **`bundle_assets` writes to scratch space**
+  under the OS temp dir — swept after 12h and gone on reboot — never the user's Downloads folder and
+  never a path you pick (`directory` is just a folder name). They're working copies: if the user
+  wants one kept, copy it somewhere permanent and say where.
+- **A download the *page* starts is the browser's own UI**, which an extension can't suppress. If the
+  user has "ask where to save each file" on, a native save dialog opens and the download sits at
+  `in_progress` with an empty filename until they click Save. So a `download_wait` timeout isn't
+  necessarily a failure — say a dialog may be waiting rather than retrying blindly.
 - **WebMCP is still rare.** `webmcp_tools` is worth one check on an unfamiliar app before committing
   to a long UI flow, not a reflex on every page.
 - **`dom_query` is top-document only** — a CSS selector can't cross an origin boundary. Use

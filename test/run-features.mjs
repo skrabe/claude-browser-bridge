@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import { execSync } from 'node:child_process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -93,7 +94,19 @@ async function main() {
   // No browser download UI is involved, so this must be I/O-fast. Anything near a second means
   // something is waiting on a human again.
   check('completes without any user interaction', bundleMs < 1500, `${bundleMs}ms`);
-  check('writes outside the user\'s Downloads folder', !!b?.directory && !b.directory.includes('Downloads'), b?.directory);
+  check('writes to scratch space, not the user\'s Downloads folder',
+    !!b?.directory && !b.directory.includes('Downloads') && b.directory.startsWith(os.tmpdir()), b?.directory);
+  // An absolute directory must NOT escape scratch space — it is a name, not a path.
+  const esc = (await call('bundle_assets', { tabId, kinds: ['image'], directory: '/Users/' + (process.env.USER || 'x') + '/Desktop/escape' })).data;
+  // Correct containment test: the result must sit exactly one level under the scratch root, so a
+  // path separator or .. in the name cannot traverse out of it. (The flattened name may still
+  // CONTAIN words from the input — that is fine; what matters is where the directory actually is.)
+  const scratchRoot = path.join(os.tmpdir(), 'claude-browser-bridge-assets');
+  check('an absolute directory cannot escape scratch space',
+    !!esc?.directory && path.dirname(path.resolve(esc.directory)) === scratchRoot, esc?.directory);
+  const trav = (await call('bundle_assets', { tabId, kinds: ['image'], directory: '../../../../etc/evil' })).data;
+  check('a traversal directory cannot escape either',
+    !!trav?.directory && path.dirname(path.resolve(trav.directory)) === scratchRoot, trav?.directory);
   check('bundles inline data: assets too, not silently skipping them',
     (b?.files || []).some((f) => /\.(png|svg)$/.test(f.path)) && (b?.downloaded || 0) >= 3,
     `${b?.downloaded} files; failures: ${JSON.stringify(b?.failures || [])}`.slice(0, 140));
