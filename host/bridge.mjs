@@ -8,6 +8,8 @@
 import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { runScript } from './browserapi.mjs';
 
 const VERSION = '0.11.0';
@@ -18,6 +20,15 @@ function encode(obj) {
   const h = Buffer.alloc(4); h.writeUInt32LE(b.length, 0);
   return Buffer.concat([h, b]);
 }
+// Best-effort file extension for a bundled asset: the served content-type first, then the URL.
+const MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif', 'image/svg+xml': 'svg', 'image/x-icon': 'ico', 'text/css': 'css', 'text/javascript': 'js', 'application/javascript': 'js', 'font/woff2': 'woff2', 'font/woff': 'woff', 'font/ttf': 'ttf', 'video/mp4': 'mp4', 'video/webm': 'webm' };
+function extFor(contentType, url) {
+  const mime = String(contentType || '').split(';')[0].trim().toLowerCase();
+  if (MIME_EXT[mime]) return MIME_EXT[mime];
+  const m = String(url || '').split('?')[0].match(/\.([a-z0-9]{1,5})$/i);
+  return m ? m[1].toLowerCase() : 'bin';
+}
+
 const MAX_FRAME = 256 * 1024 * 1024; // sanity cap; a corrupt/misaligned prefix must not stall the leg
 function framer(onMsg) {
   let buf = Buffer.alloc(0);
@@ -96,7 +107,7 @@ function runMcpServer() {
   }
   // Tools that legitimately outlast the default budget — a 30s cap here used to abort them from the
   // host side while the extension was still working, so their own timeouts never got to apply.
-  const SLOW = { waitDownload: 130000, bundleAssets: 190000, requestCredential: 310000, waitFor: 35000 };
+  const SLOW = { waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000, waitFor: 35000 };
   async function callHost(method, params) {
     let s; try { s = await connectSocket(); }
     catch { throw new Error('browser bridge host not running — open your browser with the Better Claude in Chrome extension loaded & enabled'); }
@@ -144,7 +155,7 @@ function runMcpServer() {
     { name: 'clipboard_read', description: "Read the browser clipboard as text (e.g. after the page's own 'Copy' button).", inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'clipboard_write', description: 'Put text on the browser clipboard, so the page can paste it.', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
     { name: 'page_assets', description: "Inventory the files the page actually rendered — images (incl. srcset + CSS backgrounds), video, stylesheets, scripts, loaded fonts — plus inline SVG markup. Load the UI state you care about first; this reports what's currently observable. Don't navigate to asset URLs just to fetch them; use bundle_assets.", inputSchema: { type: 'object', properties: { tabId: num, kinds: { type: 'array', items: str } }, required: ['tabId'] } },
-    { name: 'bundle_assets', description: 'Download assets from the last page_assets inventory to disk and return their local paths, so Claude Code can Read them. Filter by kinds or assetIds.', inputSchema: { type: 'object', properties: { tabId: num, assetIds: { type: 'array', items: str }, kinds: { type: 'array', items: str }, directory: str, limit: num, timeoutMs: num }, required: ['tabId'] } },
+    { name: 'bundle_assets', description: "Save assets from the last page_assets inventory to disk and return their local paths, so you can Read them. Fetched with the user's session, so assets behind a login work. Writes to a temp dir by default (pass an absolute `directory` to choose); does NOT touch the browser's download UI or the user's Downloads folder. Filter by kinds or assetIds.", inputSchema: { type: 'object', properties: { tabId: num, assetIds: { type: 'array', items: str }, kinds: { type: 'array', items: str }, directory: str, limit: num }, required: ['tabId'] } },
     { name: 'webmcp_tools', description: 'Does this page publish its OWN tools (WebMCP / document.modelContext, plus declarative [toolname] forms)? When a page tool covers what you need, call it with webmcp_call instead of driving the UI — it is the page\'s own semantic API. Worth one check on an unfamiliar app.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'webmcp_call', description: 'Invoke a page-published WebMCP tool by name (from webmcp_tools).', inputSchema: { type: 'object', properties: { tabId: num, name: str, arguments: { type: 'object' } }, required: ['tabId', 'name'] } },
     { name: 'upload_file', description: 'Set files on an <input type=file> by ref (no native picker). Absolute paths.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, paths: { type: 'array', items: str } }, required: ['tabId', 'ref', 'paths'] } },
@@ -205,7 +216,29 @@ function runMcpServer() {
     clipboard_read: (a) => callHost('clipboardRead', a),
     clipboard_write: (a) => callHost('clipboardWrite', a),
     page_assets: (a) => callHost('pageAssets', a),
-    bundle_assets: (a) => callHost('bundleAssets', a),
+    // The extension fetches the bytes; the host writes them. Going through chrome.downloads instead
+    // would put every asset through the browser's save-file UI, which stalls on the user's
+    // "ask where to save" setting and dumps files into their real Downloads folder.
+    bundle_assets: async (a) => {
+      const r = await callHost('fetchAssets', a);
+      const dir = a.directory && path.isAbsolute(a.directory)
+        ? a.directory
+        : path.join(os.tmpdir(), String(a.directory || 'claude-page-assets').replace(/[^\w.-]+/g, '-'));
+      await fsp.mkdir(dir, { recursive: true });
+      const files = [], failures = [...(r.failures || [])];
+      const used = new Set();
+      for (const asset of r.assets || []) {
+        let name = String(asset.name || 'asset').replace(/[^\w.-]+/g, '-').slice(0, 80) || 'asset';
+        if (!/\.[\w]{1,5}$/.test(name)) name += '.' + extFor(asset.contentType, asset.url);
+        let unique = name;
+        for (let n = 1; used.has(unique); n++) unique = name.replace(/(\.[^.]*)?$/, `-${n}$1`);
+        used.add(unique);
+        const full = path.join(dir, unique);
+        try { await fsp.writeFile(full, Buffer.from(asset.b64, 'base64')); files.push({ id: asset.id, url: asset.url, kind: asset.kind, path: full, bytes: asset.bytes }); }
+        catch (e) { failures.push({ id: asset.id, url: asset.url, reason: 'could not write to disk: ' + e.message }); }
+      }
+      return { requested: r.requested, downloaded: files.length, directory: dir, files, failures };
+    },
     webmcp_tools: (a) => callHost('webmcpTools', a),
     webmcp_call: (a) => callHost('webmcpCall', a),
     secret_set: (a) => { secrets.set(String(a.name), String(a.value ?? '')); return { ok: true, name: a.name }; },

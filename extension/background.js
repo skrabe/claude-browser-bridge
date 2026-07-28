@@ -1105,74 +1105,38 @@ async function dispatch(method, p) {
       if (p.kinds && p.kinds.length) v.assets = v.assets.filter((a) => p.kinds.includes(a.kind));
       return v;
     }
-    case 'bundleAssets': {
-      // Download previously-inventoried assets to disk so Claude Code can Read them locally.
+    case 'fetchAssets': {
+      // Fetch asset BYTES and hand them back for the host to write.
+      //
+      // This deliberately does not use chrome.downloads. That API drives the browser's user-facing
+      // download machinery, which means the user's own "ask where to save each file" setting opens a
+      // native save panel per asset — and nobody is there to answer it during an automated bundle.
+      // Fetching here and writing in the host has no UI, no permission gate, and doesn't litter the
+      // user's Downloads folder. credentials:'include' so assets behind the user's session still
+      // resolve, which is the whole point of driving their real browser.
       const s = st(p.tabId);
       if (!s.assets || !s.assets.size) throw new Error('no asset inventory for this tab — call page_assets first');
       let picked = [...s.assets.values()];
       if (p.assetIds && p.assetIds.length) picked = picked.filter((a) => p.assetIds.includes(a.id));
       else if (p.kinds && p.kinds.length) picked = picked.filter((a) => p.kinds.includes(a.kind));
       picked = picked.filter((a) => a.url).slice(0, Math.min(p.limit || 60, 200));
-      const dir = String(p.directory || 'claude-page-assets').replace(/[^\w.-]+/g, '-');
-      const started = [], failures = [];
-      // Chrome gates multi-file downloads behind an "automatic downloads" permission. Unanswered,
-      // every download after the first sits at in_progress with an empty filename FOREVER — no
-      // error, no completion — so bundling silently burns its whole timeout. The prompt can't be
-      // answered on a tab the user isn't watching, so grant it for this origin up front.
-      try {
-        const origin = new URL((await chrome.tabs.get(p.tabId)).url).origin;
-        await chrome.contentSettings.automaticDownloads.set({
-          primaryPattern: origin.replace(/:\d+$/, '') + '/*', setting: 'allow',
-        });
-      } catch (e) { failures.push({ id: null, url: null, reason: 'could not grant automatic-downloads for this origin: ' + String(e && e.message || e) }); }
-      // Inline data: URIs are ordinary assets from the page's point of view (icons, small graphics
-      // are routinely inlined), so they get bundled too — with a filename synthesised from the
-      // declared MIME type, since the URI carries no name of its own.
-      const extOf = (u) => (u.match(/^data:([\w.+-]+)\/([\w.+-]+)/) || [])[2]?.replace(/^svg\+xml$/, 'svg') || 'bin';
+
+      const PER_ASSET_CAP = 12 * 1024 * 1024, TOTAL_CAP = 64 * 1024 * 1024;
+      const out = [], failures = [];
+      let total = 0;
       for (const a of picked) {
-        let name = (a.name || 'asset').replace(/[^\w.-]+/g, '-').slice(0, 80) || 'asset';
-        if (a.url.startsWith('data:')) {
-          if (a.url.length > 8 * 1024 * 1024) { failures.push({ id: a.id, url: a.url.slice(0, 60) + '…', reason: 'inline data: URI over 8 MB' }); continue; }
-          if (!/\.[\w]{1,5}$/.test(name)) name = `${name}.${extOf(a.url)}`;
-        }
-        try { started.push({ id: a.id, url: a.url, downloadId: await chrome.downloads.download({ url: a.url, filename: `${dir}/${name}`, conflictAction: 'uniquify' }) }); }
-        catch (e) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: String(e && e.message || e) }); }
+        try {
+          const res = await fetch(a.url, { credentials: 'include' });
+          if (!res.ok) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: `HTTP ${res.status}` }); continue; }
+          const buf = new Uint8Array(await res.arrayBuffer());
+          if (buf.length > PER_ASSET_CAP) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: `${(buf.length / 1e6).toFixed(1)} MB exceeds the 12 MB per-asset cap` }); continue; }
+          if (total + buf.length > TOTAL_CAP) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: 'total bundle size cap (64 MB) reached' }); continue; }
+          total += buf.length;
+          out.push({ id: a.id, url: a.url.slice(0, 300), kind: a.kind, name: a.name || 'asset',
+            contentType: res.headers.get('content-type') || null, bytes: buf.length, b64: bytesToB64(buf) });
+        } catch (e) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: String(e && e.message || e) }); }
       }
-      const deadline = Date.now() + Math.min(p.timeoutMs || 60000, 180000);
-      const done = [];
-      while (started.length && Date.now() < deadline) {
-        const pending = started.filter((x) => !done.some((d) => d.id === x.id));
-        if (!pending.length) break;
-        for (const x of pending) {
-          let rec; try { rec = (await chrome.downloads.search({ id: x.downloadId }))[0]; } catch {}
-          if (!rec) continue;
-          if (rec.state === 'complete') done.push({ id: x.id, url: x.url, path: rec.filename, bytes: rec.fileSize });
-          else if (rec.state === 'interrupted') { done.push({ id: x.id, url: x.url, failed: true }); failures.push({ id: x.id, url: x.url, reason: rec.error || 'interrupted' }); }
-        }
-        if (done.length >= started.length) break;
-        await new Promise((res) => setTimeout(res, 250));
-      }
-      const files = done.filter((d) => !d.failed);
-      // A stalled download with no filename never actually started — cancel it rather than leaving
-      // it wedged in the browser's download list, and say what almost certainly blocked it.
-      const stalled = [];
-      for (const x of started.filter((s) => !done.some((d) => d.id === s.id))) {
-        let rec; try { rec = (await chrome.downloads.search({ id: x.downloadId }))[0]; } catch {}
-        const neverStarted = !rec || (!rec.filename && rec.state === 'in_progress');
-        try { await chrome.downloads.cancel(x.downloadId); } catch {}
-        stalled.push({
-          id: x.id, url: x.url.slice(0, 120),
-          reason: neverStarted
-            ? "never started — the browser is holding it behind its automatic-downloads permission for this site; grant it once in the site's permissions and retry"
-            : 'still downloading when the timeout elapsed (raise timeoutMs)',
-        });
-      }
-      return {
-        requested: picked.length, downloaded: files.length, files,
-        failures: [...failures, ...stalled],
-        ...(files[0] ? { directory: files[0].path.replace(/[\\/][^\\/]*$/, '') } : {}),
-        ...(picked.length === 0 ? { note: 'no assets matched — check the kinds/assetIds filter against the page_assets inventory' } : {}),
-      };
+      return { requested: picked.length, assets: out, failures, totalBytes: total };
     }
 
     case 'webmcpTools': {

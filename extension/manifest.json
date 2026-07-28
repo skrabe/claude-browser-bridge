@@ -15,8 +15,7 @@
     "storage",
     "alarms",
     "downloads",
-    "history",
-    "contentSettings"
+    "history"
   ],
   "host_permissions": [
     "<all_urls>"

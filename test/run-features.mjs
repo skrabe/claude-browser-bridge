@@ -86,8 +86,14 @@ async function main() {
   check('catches the network <img> and stylesheet',
     (a.assets || []).some((x) => x.url?.includes('/logo.png')) && (a.assets || []).some((x) => x.kind === 'stylesheet'),
     JSON.stringify(a.summary?.byKind));
-  const b = (await call('bundle_assets', { tabId, kinds: ['image'], directory: 'cbb-feature-test', timeoutMs: 30000 })).data;
-  check('bundles them to disk', (b?.downloaded || 0) > 0, `${b?.downloaded}/${b?.requested} → ${b?.directory || '—'}`);
+  const t0 = Date.now();
+  const b = (await call('bundle_assets', { tabId, kinds: ['image'], directory: 'cbb-feature-test' })).data;
+  const bundleMs = Date.now() - t0;
+  check('bundles them to disk', (b?.downloaded || 0) > 0, `${b?.downloaded}/${b?.requested} in ${bundleMs}ms → ${b?.directory || '—'}`);
+  // No browser download UI is involved, so this must be I/O-fast. Anything near a second means
+  // something is waiting on a human again.
+  check('completes without any user interaction', bundleMs < 1500, `${bundleMs}ms`);
+  check('writes outside the user\'s Downloads folder', !!b?.directory && !b.directory.includes('Downloads'), b?.directory);
   check('bundles inline data: assets too, not silently skipping them',
     (b?.files || []).some((f) => /\.(png|svg)$/.test(f.path)) && (b?.downloaded || 0) >= 3,
     `${b?.downloaded} files; failures: ${JSON.stringify(b?.failures || [])}`.slice(0, 140));
