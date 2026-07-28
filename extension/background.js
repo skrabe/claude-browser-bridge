@@ -1115,6 +1115,16 @@ async function dispatch(method, p) {
       picked = picked.filter((a) => a.url).slice(0, Math.min(p.limit || 60, 200));
       const dir = String(p.directory || 'claude-page-assets').replace(/[^\w.-]+/g, '-');
       const started = [], failures = [];
+      // Chrome gates multi-file downloads behind an "automatic downloads" permission. Unanswered,
+      // every download after the first sits at in_progress with an empty filename FOREVER — no
+      // error, no completion — so bundling silently burns its whole timeout. The prompt can't be
+      // answered on a tab the user isn't watching, so grant it for this origin up front.
+      try {
+        const origin = new URL((await chrome.tabs.get(p.tabId)).url).origin;
+        await chrome.contentSettings.automaticDownloads.set({
+          primaryPattern: origin.replace(/:\d+$/, '') + '/*', setting: 'allow',
+        });
+      } catch (e) { failures.push({ id: null, url: null, reason: 'could not grant automatic-downloads for this origin: ' + String(e && e.message || e) }); }
       // Inline data: URIs are ordinary assets from the page's point of view (icons, small graphics
       // are routinely inlined), so they get bundled too — with a filename synthesised from the
       // declared MIME type, since the URI carries no name of its own.
@@ -1143,7 +1153,20 @@ async function dispatch(method, p) {
         await new Promise((res) => setTimeout(res, 250));
       }
       const files = done.filter((d) => !d.failed);
-      const stalled = started.filter((x) => !done.some((d) => d.id === x.id)).map((x) => ({ id: x.id, url: x.url.slice(0, 120), reason: 'still downloading when the timeout elapsed' }));
+      // A stalled download with no filename never actually started — cancel it rather than leaving
+      // it wedged in the browser's download list, and say what almost certainly blocked it.
+      const stalled = [];
+      for (const x of started.filter((s) => !done.some((d) => d.id === s.id))) {
+        let rec; try { rec = (await chrome.downloads.search({ id: x.downloadId }))[0]; } catch {}
+        const neverStarted = !rec || (!rec.filename && rec.state === 'in_progress');
+        try { await chrome.downloads.cancel(x.downloadId); } catch {}
+        stalled.push({
+          id: x.id, url: x.url.slice(0, 120),
+          reason: neverStarted
+            ? "never started — the browser is holding it behind its automatic-downloads permission for this site; grant it once in the site's permissions and retry"
+            : 'still downloading when the timeout elapsed (raise timeoutMs)',
+        });
+      }
       return {
         requested: picked.length, downloaded: files.length, files,
         failures: [...failures, ...stalled],
