@@ -13,7 +13,9 @@ import path from 'node:path';
 import { runScript } from './browserapi.mjs';
 
 const VERSION = '0.11.0';
-const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
+// Overridable so tests can run against their own socket instead of borrowing (and breaking) the
+// live one — a unix socket is bound to its path, so moving the real one aside is not reversible.
+const SOCK = process.env.CBB_SOCK || `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
   const b = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -128,9 +130,23 @@ function runMcpServer() {
     let s; try { s = await connectSocket(); }
     catch { throw new Error('browser bridge host not running — open your browser with the Better Claude in Chrome extension loaded & enabled'); }
     const id = `m${idc++}`;
-    const budget = SLOW[method] || 30000;
+    const budget = Number(process.env.CBB_TIMEOUT_MS) || SLOW[method] || 30000;
     return new Promise((resolve, reject) => {
-      const to = setTimeout(() => { if (reqs.has(id)) { reqs.delete(id); reject(new Error('browser bridge timed out — no response from the host/extension')); } }, budget);
+      const to = setTimeout(() => {
+        if (!reqs.has(id)) return;
+        reqs.delete(id);
+        // A timeout means this socket's far end stopped answering — the extension's service worker
+        // was reloaded or died while the host kept the connection open. The socket still looks
+        // healthy, so without dropping it EVERY later call writes into the void and times out too,
+        // wedging the whole bridge until the process restarts. Destroying it makes the next call
+        // reconnect, so one visible failure self-heals instead of becoming permanent.
+        try { s.destroy(); } catch {}
+        if (sock === s) sock = null;
+        reject(new Error(
+          `browser bridge timed out after ${Math.round(budget / 1000)}s with no response from the extension `
+          + '(its service worker was probably reloaded or evicted). The connection has been dropped — '
+          + 'retry the call and it will reconnect. If it keeps timing out, reload the extension.'));
+      }, budget);
       reqs.set(id, (msg) => { clearTimeout(to); if (msg.error) reject(new Error(msg.error)); else resolve(msg.result); });
       s.write(encode({ id, method, params }));
     });

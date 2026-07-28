@@ -33,6 +33,34 @@ function st(tabId) {
   if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set(), frames: new Map() }; state.set(tabId, s); }
   return s;
 }
+// Which tabs the agent opened, persisted in session storage.
+//
+// This cannot live only in `state`: an MV3 service worker is evicted or reloaded routinely, and when
+// it comes back that map is empty — so tab_close would refuse to close a tab the agent itself had
+// opened, orphaning it in the user's window with no way to clean up. storage.session survives worker
+// restarts and is cleared when the browser closes, which is exactly the right lifetime.
+const AGENT_TABS_KEY = 'cbb.agentTabs';
+async function markAgentTab(tabId) {
+  st(tabId).createdByAgent = true;
+  try {
+    const cur = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || [];
+    if (!cur.includes(tabId)) await chrome.storage.session.set({ [AGENT_TABS_KEY]: [...cur, tabId] });
+  } catch {}
+}
+async function isAgentTab(tabId) {
+  if (state.get(tabId)?.createdByAgent) return true;
+  try { return ((await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || []).includes(tabId); }
+  catch { return false; }
+}
+async function forgetAgentTab(tabId) {
+  try {
+    const cur = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || [];
+    if (cur.includes(tabId)) await chrome.storage.session.set({ [AGENT_TABS_KEY]: cur.filter((t) => t !== tabId) });
+  } catch {}
+}
+// Don't let the set grow stale as the user closes tabs themselves.
+try { chrome.tabs.onRemoved.addListener((tabId) => { forgetAgentTab(tabId); state.delete(tabId); }); } catch {}
+
 // Route a CDP command to a tab (number) or a specific frame session ({tabId, sessionId}). Chrome 125+
 // flat sessions: sendCommand takes {tabId, sessionId} to address an out-of-process child frame.
 const dbgOf = (tabId, sessionId) => (sessionId ? { tabId, sessionId } : tabId);
@@ -633,7 +661,7 @@ async function dispatch(method, p) {
     case 'createTab': {
       const tab = await chrome.tabs.create({ url: p.url || 'about:blank', active: !!p.active });
       await attach(tab.id);
-      st(tab.id).createdByAgent = true; // tab_close may only close tabs the agent opened
+      await markAgentTab(tab.id); // tab_close may only close tabs the agent opened
       let grouped = null;
       if (p.group) { // put the tab in a topic group — reuse an existing group of that name, else create one
         try {
@@ -647,7 +675,6 @@ async function dispatch(method, p) {
     case 'activateTab': { const t = await chrome.tabs.get(p.tabId); await chrome.windows.update(t.windowId, { focused: true }); await chrome.tabs.update(p.tabId, { active: true }); return { ok: true }; }
     case 'reload': { await need(p.tabId); await cmd(p.tabId, 'Page.reload', {}); return { ok: true }; }
     case 'release': { await detach(p.tabId); return { ok: true }; }
-    case 'closeTab': { await detach(p.tabId).catch(() => {}); await chrome.tabs.remove(p.tabId); return { ok: true }; }
 
     case 'navigate': {
       await need(p.tabId);
@@ -954,10 +981,10 @@ async function dispatch(method, p) {
     }
 
     case 'closeAgentTab': {
-      const s = state.get(p.tabId);
-      if (!s?.createdByAgent) throw new Error('refusing to close a tab the agent did not open — use tab_release to hand it back');
+      if (!(await isAgentTab(p.tabId))) throw new Error('refusing to close a tab the agent did not open — use tab_release to hand it back');
       await detach(p.tabId).catch(() => {});
       await chrome.tabs.remove(p.tabId);
+      await forgetAgentTab(p.tabId);
       return { ok: true, closed: p.tabId };
     }
 
