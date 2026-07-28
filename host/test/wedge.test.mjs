@@ -44,6 +44,7 @@ function framer(onMsg) {
 // switches back on would let the buggy code pass by simply reusing the dead socket.
 let connections = 0;
 const live = new Set();
+const stalled = new Set(); // methods the (living) far end will not answer — models a busy page
 const killExistingConnections = () => live.clear();
 function startFakeHost() {
   const server = net.createServer((client) => {
@@ -52,7 +53,9 @@ function startFakeHost() {
     client.on('error', () => {});
     client.on('close', () => live.delete(client));
     client.on('data', framer((cmd) => {
-      if (live.has(client)) client.write(encode({ id: cmd.id, result: { pong: true } }));
+      if (!live.has(client)) return;                       // connection is dead: never answers again
+      if (stalled.has(cmd.method)) return;                  // alive, but this operation is stuck
+      client.write(encode({ id: cmd.id, result: { pong: true } }));
     }));
   });
   return new Promise((res) => { try { fs.unlinkSync(SOCK); } catch {} server.listen(SOCK, () => res(server)); });
@@ -109,6 +112,19 @@ async function main() {
     `${recoveredMs}ms`);
   ok('it recovered by opening a NEW connection', connections > afterFirst, `${connections} total connections`);
   ok('recovery is immediate, not another full timeout', recoveredMs < 500, `${recoveredMs}ms`);
+
+  // 4. Alive but BUSY: the operation must fail on its own budget WITHOUT tearing down a healthy
+  //    connection. Getting this wrong is what broke a real session — a slow page load was treated as
+  //    a dead worker, so the drop punished callers whose extension was fine.
+  stalled.add('readPage');
+  const beforeBusy = connections;
+  const busy = await call('read_page', { tabId: 1 });
+  ok('a busy page fails its own call', busy.isError && /exceeded/.test(busy.text), busy.text.slice(0, 70));
+  ok('the busy message does NOT blame the service worker',
+    !/service worker/.test(busy.text) && /connection is fine/.test(busy.text), busy.text.slice(0, 90));
+  const afterBusy = await call('tabs_list', {});
+  ok('the connection survives a busy-page timeout', !afterBusy.isError && afterBusy.text.includes('pong'));
+  ok('no reconnect was needed', connections === beforeBusy, `${connections} total connections`);
 
   mcp.kill(); server.close();
   try { fs.unlinkSync(SOCK); } catch {}
