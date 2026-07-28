@@ -123,31 +123,72 @@ function runMcpServer() {
     });
     return connecting;
   }
-  // Tools that legitimately outlast the default budget — a 30s cap here used to abort them from the
-  // host side while the extension was still working, so their own timeouts never got to apply.
-  const SLOW = { waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000, waitFor: 35000 };
+  // How long an operation may legitimately take. These are generous because a slow call is no longer
+  // how we detect a dead connection — the liveness probe below does that independently, so waiting
+  // longer costs nothing when the extension is actually alive. Navigation waits for load, which on a
+  // dev server's first compile of a heavy route really can run past a minute.
+  const SLOW = {
+    getUserTabs: 10000, listDownloads: 10000, activateTab: 10000, release: 10000,
+    navigate: 180000, reload: 180000, executeCdp: 120000, waitFor: 35000,
+    waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000,
+  };
+  const DEFAULT_BUDGET = 60000;
+
+  // Is the extension still answering at all? A cheap tab query touches no debugger and no page, so
+  // it returns promptly even while a tab is pinned compiling. This is what separates "the worker is
+  // gone" from "the page is busy" — a distinction the previous code got wrong by assuming every
+  // timeout meant death, and dropping the connection out from under callers whose page was merely
+  // slow.
+  function probeAlive(s, ms = 6000) {
+    return new Promise((resolve) => {
+      const pid = `p${idc++}`;
+      const t = setTimeout(() => { reqs.delete(pid); resolve(false); }, ms);
+      reqs.set(pid, () => { clearTimeout(t); resolve(true); });
+      try { s.write(encode({ id: pid, method: 'getUserTabs', params: {} })); }
+      catch { clearTimeout(t); reqs.delete(pid); resolve(false); }
+    });
+  }
+  const dropSocket = (s) => { try { s.destroy(); } catch {} if (sock === s) sock = null; };
+
   async function callHost(method, params) {
     let s; try { s = await connectSocket(); }
     catch { throw new Error('browser bridge host not running — open your browser with the Better Claude in Chrome extension loaded & enabled'); }
     const id = `m${idc++}`;
-    const budget = Number(process.env.CBB_TIMEOUT_MS) || SLOW[method] || 30000;
+    const budget = Number(process.env.CBB_TIMEOUT_MS) || SLOW[method] || DEFAULT_BUDGET;
+    const probeEvery = Math.max(2000, Math.min(10000, Math.floor(budget / 3)));
     return new Promise((resolve, reject) => {
-      const to = setTimeout(() => {
-        if (!reqs.has(id)) return;
-        reqs.delete(id);
-        // A timeout means this socket's far end stopped answering — the extension's service worker
-        // was reloaded or died while the host kept the connection open. The socket still looks
-        // healthy, so without dropping it EVERY later call writes into the void and times out too,
-        // wedging the whole bridge until the process restarts. Destroying it makes the next call
-        // reconnect, so one visible failure self-heals instead of becoming permanent.
-        try { s.destroy(); } catch {}
-        if (sock === s) sock = null;
-        reject(new Error(
-          `browser bridge timed out after ${Math.round(budget / 1000)}s with no response from the extension `
-          + '(its service worker was probably reloaded or evicted). The connection has been dropped — '
-          + 'retry the call and it will reconnect. If it keeps timing out, reload the extension.'));
+      let settled = false;
+      const done = (fn, arg) => {
+        if (settled) return;
+        settled = true; clearTimeout(hard); clearInterval(watch); reqs.delete(id); fn(arg);
+      };
+      // Watchdog: while this call is outstanding, keep checking that the extension still responds.
+      // A dead connection is caught in seconds instead of burning the whole budget, and a live one
+      // is left alone no matter how long its page takes.
+      const watch = setInterval(async () => {
+        if (settled) return;
+        if (await probeAlive(s)) return; // alive — the page is just busy, keep waiting
+        if (settled) return;
+        dropSocket(s);
+        done(reject, new Error(
+          'browser bridge lost its connection to the extension mid-call (its service worker was '
+          + 'reloaded or evicted). The connection has been dropped — retry and it will reconnect.'));
+      }, probeEvery);
+      const hard = setTimeout(async () => {
+        if (settled) return;
+        // Budget spent. Only tear down the connection if the far end is genuinely gone; a slow page
+        // must not cost other callers their working connection.
+        const alive = await probeAlive(s, 3000);
+        if (!alive) dropSocket(s);
+        done(reject, new Error(alive
+          ? `"${method}" exceeded ${Math.round(budget / 1000)}s while the extension stayed responsive — `
+            + 'the page is still busy (a heavy first compile, a stalled request, or a load that never '
+            + 'settles). The connection is fine; narrow the step or wait for a specific condition '
+            + 'instead of a full load.'
+          : `browser bridge timed out after ${Math.round(budget / 1000)}s and the extension is not `
+            + 'responding. The connection has been dropped — retry and it will reconnect.'));
       }, budget);
-      reqs.set(id, (msg) => { clearTimeout(to); if (msg.error) reject(new Error(msg.error)); else resolve(msg.result); });
+      reqs.set(id, (msg) => { if (msg.error) done(reject, new Error(msg.error)); else done(resolve, msg.result); });
       s.write(encode({ id, method, params }));
     });
   }

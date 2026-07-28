@@ -607,6 +607,20 @@ function drawProbePoint(ctx, x, y) {
   ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
+// chrome.tabs.get() reports an EMPTY url for a tab whose navigation hasn't committed yet — which is
+// exactly the moment after a fresh attach or a just-started load, so the status header could come
+// back with url:null and read as "we lost the page" when nothing was wrong. Fall back to the
+// pending url, then to what the page itself says.
+async function tabUrl(tabId, tab) {
+  const t = tab || await chrome.tabs.get(tabId).catch(() => null);
+  if (t?.url) return t.url;
+  if (t?.pendingUrl) return t.pendingUrl;
+  try {
+    const r = await cmd(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true });
+    return r.result?.value || null;
+  } catch { return null; }
+}
+
 // Actions that change page/UI state — attach a cheap status header (post-action url/title + new
 // console error/warning counts) so the model can often skip a follow-up read_page. Best-effort:
 // a failure here never affects the action's own result.
@@ -623,7 +637,7 @@ async function handle(method, p) {
       const errs = fresh.filter((m) => m.level === 'error').length;
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
-      result.status = { url: tab.url, title: tab.title, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}) };
+      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
   return result;
@@ -670,7 +684,7 @@ async function dispatch(method, p) {
           else { const gid = await chrome.tabs.group({ tabIds: [tab.id] }); await chrome.tabGroups.update(gid, { title: String(p.group) }); grouped = String(p.group); }
         } catch {}
       }
-      return { id: tab.id, url: tab.url, ...(grouped ? { group: grouped } : {}) };
+      return { id: tab.id, url: await tabUrl(tab.id, tab), ...(grouped ? { group: grouped } : {}) };
     }
     case 'activateTab': { const t = await chrome.tabs.get(p.tabId); await chrome.windows.update(t.windowId, { focused: true }); await chrome.tabs.update(p.tabId, { active: true }); return { ok: true }; }
     case 'reload': { await need(p.tabId); await cmd(p.tabId, 'Page.reload', {}); return { ok: true }; }
