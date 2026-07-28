@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bridge feature harness — WebMCP, assets, clipboard</title>
+<link rel="stylesheet" href="/extra.css">
+<style>
+  body { font: 14px/1.5 system-ui; margin: 0; padding: 24px; background: #fff; color: #16161a; }
+  h1 { font-size: 15px; text-transform: uppercase; letter-spacing: .05em; color: #6b6b78; margin: 0 0 16px; }
+  section { margin-bottom: 28px; }
+  .swatch { width: 90px; height: 60px; display: inline-block; margin-right: 8px; border-radius: 6px; }
+  #todos li { margin: 2px 0; }
+  form { border: 1px solid #e3e3ea; padding: 12px; border-radius: 8px; max-width: 420px; }
+  label { display: block; margin: 6px 0 2px; font-size: 12px; color: #6b6b78; }
+  input { width: 100%; padding: 6px 8px; border: 1px solid #d6d6de; border-radius: 5px; }
+</style>
+</head>
+<body>
+<h1>Feature harness</h1>
+
+<section>
+  <!-- assets: an <img>, a srcset, a CSS background, and an inline SVG -->
+  <img id="png" width="90" height="60"
+       src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFoAAAA8CAYAAADrO9YkAAAAOklEQVR4nO3PMQEAAAjAILV/aM3g4QcJqE1n0y8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB4NRe4AAFY5T0kAAAAAElFTkSuQmCC"
+       alt="flat png">
+  <div class="swatch" id="bg" style="background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2290%22 height=%2260%22><rect width=%2290%22 height=%2260%22 fill=%22%232563eb%22/></svg>')"></div>
+  <img id="net" src="/logo.png" width="40" height="40" alt="network png">
+  <svg id="inline" width="60" height="60" aria-label="inline-diamond"><polygon points="30,4 56,30 30,56 4,30" fill="#059669"/></svg>
+</section>
+
+<section>
+  <h1>WebMCP tools</h1>
+  <ul id="todos"></ul>
+  <!-- declarative form tool -->
+  <form toolname="search-cars" tooldescription="Perform a car make/model search" onsubmit="return false">
+    <label>Make</label>
+    <input type="text" name="make" toolparamdescription="The vehicle's make (e.g. BMW, Ford)" required>
+    <label>Model</label>
+    <input type="text" name="model" toolparamdescription="The vehicle's model (e.g. 330i, F-150)" required>
+    <button type="submit">Search</button>
+  </form>
+</section>
+
+<section>
+  <h1>Clipboard</h1>
+  <div id="pasted" style="min-height:20px;font-family:ui-monospace,monospace"></div>
+</section>
+
+<script>
+// ── WebMCP shim ───────────────────────────────────────────────────────────────
+// Brave has no native document.modelContext yet (Chrome ships it behind an origin trial), so this
+// implements the SPEC'd agent-side shape — registerTool / getTools / executeTool — to exercise the
+// bridge's WebMCP client against the documented contract. It is a test double, not a polyfill.
+if (!document.modelContext) {
+  const registered = [];
+  Object.defineProperty(document, 'modelContext', {
+    configurable: true,
+    value: {
+      async registerTool(tool) { registered.push(tool); },
+      async getTools() { return registered.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema, __impl: t })); },
+      async executeTool(tool, params) {
+        const impl = tool && tool.__impl;
+        if (!impl) throw new Error('unknown tool');
+        const args = typeof params === 'string' ? JSON.parse(params || '{}') : (params || {});
+        return impl.execute(args);
+      },
+    },
+  });
+}
+
+document.modelContext.registerTool({
+  name: 'add-todo',
+  description: "Add a new item to the user's active todo list",
+  inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'The todo text' } }, required: ['text'] },
+  async execute({ text }) {
+    const li = document.createElement('li'); li.textContent = text;
+    document.getElementById('todos').appendChild(li);
+    return { content: [{ type: 'text', text: `Added todo item: "${text}" successfully.` }] };
+  },
+});
+document.modelContext.registerTool({
+  name: 'count-todos',
+  description: 'How many todo items are on the list',
+  inputSchema: { type: 'object', properties: {} },
+  async execute() { return { count: document.querySelectorAll('#todos li').length }; },
+});
+
+// clipboard: surface whatever gets pasted so a write can be observed from the page side
+addEventListener('paste', (e) => { document.getElementById('pasted').textContent = e.clipboardData.getData('text'); });
+// NOTE: navigator.clipboard.readText() is deliberately NOT used here — it needs the clipboard-read
+// permission and never settles when that permission is in the "prompt" state on a background tab.
+// The bridge reads the clipboard with a trusted CDP paste command instead.
+</script>
+</body>
+</html>

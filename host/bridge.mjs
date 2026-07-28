@@ -10,7 +10,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { runScript } from './browserapi.mjs';
 
-const VERSION = '0.10.1';
+const VERSION = '0.11.0';
 const SOCK = `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
 
 function encode(obj) {
@@ -94,12 +94,16 @@ function runMcpServer() {
     });
     return connecting;
   }
+  // Tools that legitimately outlast the default budget — a 30s cap here used to abort them from the
+  // host side while the extension was still working, so their own timeouts never got to apply.
+  const SLOW = { waitDownload: 130000, bundleAssets: 190000, requestCredential: 310000, waitFor: 35000 };
   async function callHost(method, params) {
     let s; try { s = await connectSocket(); }
     catch { throw new Error('browser bridge host not running — open your browser with the Better Claude in Chrome extension loaded & enabled'); }
     const id = `m${idc++}`;
+    const budget = SLOW[method] || 30000;
     return new Promise((resolve, reject) => {
-      const to = setTimeout(() => { if (reqs.has(id)) { reqs.delete(id); reject(new Error('browser bridge timed out — no response from the host/extension')); } }, 30000);
+      const to = setTimeout(() => { if (reqs.has(id)) { reqs.delete(id); reject(new Error('browser bridge timed out — no response from the host/extension')); } }, budget);
       reqs.set(id, (msg) => { clearTimeout(to); if (msg.error) reject(new Error(msg.error)); else resolve(msg.result); });
       s.write(encode({ id, method, params }));
     });
@@ -125,17 +129,24 @@ function runMcpServer() {
     { name: 'dom_query', description: 'Run a CSS selector in a controlled tab; returns match count and a "ref" + basic attrs per match. Use to check existence/uniqueness or target by selector.', inputSchema: { type: 'object', properties: { tabId: num, selector: str, limit: num }, required: ['tabId', 'selector'] } },
     { name: 'find', description: "Keyword search over visible element roles/names (a11y tree); returns ranked candidate refs. Query with the element's label words, not visual descriptions.", inputSchema: { type: 'object', properties: { tabId: num, query: str }, required: ['tabId', 'query'] } },
     { name: 'find_text', description: 'Does a word/phrase appear ANYWHERE in the page text (incl. off-screen, not yet scrolled)? Returns a count + context snippets. Cheap — beats a scroll+read_text loop. Set regex:true for a regex query.', inputSchema: { type: 'object', properties: { tabId: num, query: str, regex: { type: 'boolean' }, limit: num }, required: ['tabId', 'query'] } },
-    { name: 'screenshot', description: 'PNG screenshot of a controlled tab, auto-downscaled to vision limits. ref: just that element; fullPage:true: the whole scrollable page, not just the viewport.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, fullPage: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'screenshot', description: 'PNG screenshot of a controlled tab. marks:true labels every interactable element with the SAME ref click{ref} takes (add boxes:true for per-mark geometry) — USE THIS whenever you want to act on what you can see, then click the badge you see rather than guessing a pixel. ref: just that element; fullPage:true: the whole scrollable page. The image is downscaled to vision limits, so the accompanying JSON reports the exact {scale, origin, space, imageSize, viewport, scroll} mapping: a pixel you read off the image is NOT a CSS pixel — pass it back as {x,y,space:"image"} and the bridge converts it.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, fullPage: { type: 'boolean' }, marks: { type: 'boolean' }, boxes: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'probe_point', description: 'What is ACTUALLY at a coordinate? Returns the element there (tag, role, label, selector, box) plus a "ref" you can click — so a coordinate you guessed off a screenshot converts into a reliable semantic target instead of a blind retry. Pass space:"image" for a pixel read off the last screenshot. annotate:true also returns a picture with a crosshair on the probed point, which is how you SEE a mispositioned guess rather than infer it.', inputSchema: { type: 'object', properties: { tabId: num, x: num, y: num, space: str, annotate: { type: 'boolean' }, marks: { type: 'boolean' } }, required: ['tabId', 'x', 'y'] } },
     { name: 'read_console', description: 'Recent console messages / exceptions captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_network', description: 'Recent network requests (url, method, status) captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
-    { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find), or by {x,y} coords. button:"right"|"middle" for context/aux click; double:true for double-click. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, button: str, double: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'click', description: 'Click an element by "ref" (from read_page/dom_query/find/screenshot marks), or by {x,y}. Returns a RECEIPT naming the element the click actually landed on, and an "intercepted" note when an overlay covered the ref\'s element — so a click that missed says so instead of reporting ok. Coordinates are CSS viewport pixels by default; pass space:"image" for a pixel read off the last screenshot, or space:"page" for document coords. button:"right"|"middle"; double:true. Prefer ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, space: str, button: str, double: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'fill', description: 'Replace an input/textarea value by ref (clears first, fires input+change). Pass value, OR secret:"NAME" to fill a registered secret without stating its literal.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str, secret: str }, required: ['tabId', 'ref'] } },
     { name: 'type_text', description: 'Type text into the currently focused element (focus it first via click). Pass text, OR secret:"NAME" for a registered secret.', inputSchema: { type: 'object', properties: { tabId: num, text: str, secret: str }, required: ['tabId'] } },
     { name: 'press_key', description: 'Press a key/chord on the focused element (Enter, Tab, Escape, Arrow*, Meta+A). A single printable key also types its character.', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
-    { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y}.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num }, required: ['tabId'] } },
-    { name: 'hover', description: 'Move the pointer over an element by ref to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str }, required: ['tabId', 'ref'] } },
+    { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y} (space:"image"|"page" as for click).', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num, space: str }, required: ['tabId'] } },
+    { name: 'hover', description: 'Move the pointer over an element by ref (or {x,y}) to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, space: str }, required: ['tabId'] } },
     { name: 'select_option', description: 'Choose a <select> option by value, by ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
-    { name: 'drag', description: 'Drag from one ref/point to another (sliders, reordering).', inputSchema: { type: 'object', properties: { tabId: num, fromRef: str, toRef: str, fromX: num, fromY: num, toX: num, toY: num }, required: ['tabId'] } },
+    { name: 'drag', description: 'Drag from one ref/point to another (sliders, reordering). space:"image"|"page" applies to both endpoints.', inputSchema: { type: 'object', properties: { tabId: num, fromRef: str, toRef: str, fromX: num, fromY: num, toX: num, toY: num, space: str }, required: ['tabId'] } },
+    { name: 'clipboard_read', description: "Read the browser clipboard as text (e.g. after the page's own 'Copy' button).", inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'clipboard_write', description: 'Put text on the browser clipboard, so the page can paste it.', inputSchema: { type: 'object', properties: { tabId: num, text: str }, required: ['tabId', 'text'] } },
+    { name: 'page_assets', description: "Inventory the files the page actually rendered — images (incl. srcset + CSS backgrounds), video, stylesheets, scripts, loaded fonts — plus inline SVG markup. Load the UI state you care about first; this reports what's currently observable. Don't navigate to asset URLs just to fetch them; use bundle_assets.", inputSchema: { type: 'object', properties: { tabId: num, kinds: { type: 'array', items: str } }, required: ['tabId'] } },
+    { name: 'bundle_assets', description: 'Download assets from the last page_assets inventory to disk and return their local paths, so Claude Code can Read them. Filter by kinds or assetIds.', inputSchema: { type: 'object', properties: { tabId: num, assetIds: { type: 'array', items: str }, kinds: { type: 'array', items: str }, directory: str, limit: num, timeoutMs: num }, required: ['tabId'] } },
+    { name: 'webmcp_tools', description: 'Does this page publish its OWN tools (WebMCP / document.modelContext, plus declarative [toolname] forms)? When a page tool covers what you need, call it with webmcp_call instead of driving the UI — it is the page\'s own semantic API. Worth one check on an unfamiliar app.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'webmcp_call', description: 'Invoke a page-published WebMCP tool by name (from webmcp_tools).', inputSchema: { type: 'object', properties: { tabId: num, name: str, arguments: { type: 'object' } }, required: ['tabId', 'name'] } },
     { name: 'upload_file', description: 'Set files on an <input type=file> by ref (no native picker). Absolute paths.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, paths: { type: 'array', items: str } }, required: ['tabId', 'ref', 'paths'] } },
     { name: 'dialog_handle', description: 'Accept/dismiss an open JS dialog (alert/confirm/prompt). A dialog freezes the page — the action status header shows openDialog when one is up.', inputSchema: { type: 'object', properties: { tabId: num, accept: { type: 'boolean' }, promptText: str }, required: ['tabId'] } },
     { name: 'wait_for', description: 'Block until a condition holds, instead of polling read_page: {state:"load"|"networkidle"} after a nav, or selector / text / textGone / urlIncludes. timeoutMs caps at 25s.', inputSchema: { type: 'object', properties: { tabId: num, state: str, selector: str, text: str, textGone: str, urlIncludes: str, timeoutMs: num }, required: ['tabId'] } },
@@ -190,6 +201,13 @@ function runMcpServer() {
     credential_request: (a) => callHost('requestCredential', a),
     run: async (a) => { const out = await runScript({ callHost, tabId: a.tabId, script: String(a.script || ''), timeoutMs: a.timeoutMs, secrets }); return out.result && out.result.__image ? { __image: out.result.__image, mimeType: out.result.mimeType } : out; },
     cdp: (a) => callHost('executeCdp', { tabId: a.tabId, cdpMethod: a.method, cdpParams: a.params || {} }),
+    probe_point: (a) => callHost('probePoint', a),
+    clipboard_read: (a) => callHost('clipboardRead', a),
+    clipboard_write: (a) => callHost('clipboardWrite', a),
+    page_assets: (a) => callHost('pageAssets', a),
+    bundle_assets: (a) => callHost('bundleAssets', a),
+    webmcp_tools: (a) => callHost('webmcpTools', a),
+    webmcp_call: (a) => callHost('webmcpCall', a),
     secret_set: (a) => { secrets.set(String(a.name), String(a.value ?? '')); return { ok: true, name: a.name }; },
     secret_list: () => ({ names: [...secrets.keys()] }),
     secret_clear: (a) => { if (a && a.name) secrets.delete(String(a.name)); else secrets.clear(); return { ok: true }; },
@@ -231,7 +249,11 @@ function runMcpServer() {
       try {
         const fn = MAP[msg.params.name]; if (!fn) throw new Error('unknown tool: ' + msg.params.name);
         const r = await fn(msg.params.arguments || {});
-        const content = (r && r.__image) ? [{ type: 'image', data: r.__image, mimeType: r.mimeType }]
+        // An image result carries its geometry alongside it (__meta): without the scale and origin
+        // the model cannot map a pixel it reads off the picture back to a clickable coordinate.
+        const content = (r && r.__image)
+          ? [{ type: 'image', data: r.__image, mimeType: r.mimeType },
+             ...(r.__meta ? [{ type: 'text', text: redact(JSON.stringify(r.__meta)) }] : [])]
           : [{ type: 'text', text: redact(typeof r === 'string' ? r : JSON.stringify(r)) }];
         send({ jsonrpc: '2.0', id: msg.id, result: { content } });
       } catch (e) {

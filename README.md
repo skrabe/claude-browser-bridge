@@ -70,7 +70,7 @@ own dir, so all of them are registered automatically.
 
 ## Tools
 
-39 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
+46 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
 are for one-off actions. `cdp` is the escape hatch for anything they don't cover.
 
 | Group | Tools |
@@ -78,11 +78,13 @@ are for one-off actions. `cdp` is the escape hatch for anything they don't cover
 | **Programmable** | `run` *(JS script: Playwright-shaped `page`/locators — getByRole/Text/Label, click/fill/press/check/selectOption/setInputFiles/dragTo, evaluate, waitForURL, domSnapshot, pdf, screenshot; `browser` — openTabs/claimTab/newTab/readUrls/history; auto-waiting, pierces frames + shadow DOM)* |
 | **Tabs** | `tabs_list` · `tab_claim` · `tab_create` *(group by topic)* · `tab_activate` · `tab_release` · `tab_close` |
 | **Navigate** | `navigate` *(waits for load)* · `reload` · `go_back` · `go_forward` · `wait_for` |
-| **Read / observe** | `read_page` *(a11y tree + refs, incl. cross-origin frames)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page)* · `read_console` · `read_network` · `network_body` |
-| **Act** | `click` *(right/double)* · `fill` · `type_text` · `press_key` · `select_option` · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
+| **Read / observe** | `read_page` *(a11y tree + refs, incl. cross-origin frames)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page / `marks:true` set-of-mark badges, always reports its image↔CSS mapping)* · `probe_point` *(what's at {x,y} + a clickable ref; `annotate:true` draws a crosshair)* · `read_console` · `read_network` · `network_body` |
+| **Act** | `click` *(right/double; returns a receipt naming what it hit and flags an intercepting overlay; `space:"image"`/`"page"` coords)* · `fill` · `type_text` · `press_key` · `select_option` · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
 | **Auth & dialogs** | `credential_request` *(secure popup)* · `dialog_handle` |
 | **Secrets** | `secret_set` / `secret_list` / `secret_clear` *(fill by name; the literal is auto-redacted from every tool result so a page echo / network body / console line can't leak it)* |
 | **Downloads** | `download_wait` · `downloads_list` |
+| **Page API & assets** | `webmcp_tools` / `webmcp_call` *(call the page's own published tools instead of driving its UI)* · `page_assets` / `bundle_assets` *(inventory + download what the page rendered)* |
+| **Clipboard** | `clipboard_read` · `clipboard_write` |
 | **Escape hatch** | `cdp` *(any raw CDP command)* |
 
 Ships with the **`browser` skill** — a single self-contained `skill/SKILL.md` that leads with `run`

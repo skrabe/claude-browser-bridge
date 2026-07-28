@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bridge coordinate harness</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif; background: #fbfbfd; color: #1a1a1f; }
+  h2 { margin: 0 0 4px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: #6b6b78; }
+  section { position: relative; padding: 18px 20px 20px; border-bottom: 1px solid #e6e6ec; }
+  .plot { position: relative; height: 260px; margin-top: 10px; background:
+      linear-gradient(#ececf3 1px, transparent 1px) 0 0 / 100% 40px,
+      linear-gradient(90deg, #ececf3 1px, transparent 1px) 0 0 / 40px 100%; }
+  .dot { position: absolute; border-radius: 50%; background: #e11d48; cursor: pointer;
+         transform: translate(-50%, -50%); border: 0; padding: 0; }
+  .dot::after { content: attr(data-tid); position: absolute; left: 50%; top: 100%;
+         transform: translateX(-50%); font-size: 9px; color: #8a8a96; margin-top: 3px; }
+  .dot.tiny { background: #7c3aed; }
+  .dot.hit { background: #059669; box-shadow: 0 0 0 3px rgba(5,150,105,.25); }
+  .veil { position: absolute; inset: 0; background: rgba(37,99,235,.06); }
+  .veil-label { position: absolute; top: 6px; right: 8px; font-size: 10px; color: #2563eb; }
+  #scroller { height: 180px; overflow: auto; border: 1px solid #e6e6ec; background: #fff; }
+  #scroller .inner { height: 900px; position: relative; }
+  iframe { width: 100%; height: 170px; border: 1px solid #e6e6ec; background: #fff; }
+  /* the error overlay sits above everything and never eats clicks */
+  #errors { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+  #summary { padding: 14px 20px; font-variant-numeric: tabular-nums; }
+  #summary b { font-weight: 600; }
+</style>
+</head>
+<body>
+
+<section>
+  <h2>Grid — evenly spaced targets, 18px</h2>
+  <div class="plot" id="grid"><svg id="e-grid" class="err"></svg></div>
+</section>
+
+<section>
+  <h2>Small &amp; crowded — 8px targets 14px apart, where a few pixels of drift changes the answer</h2>
+  <div class="plot" id="crowd" style="height:150px"></div>
+</section>
+
+<section>
+  <h2>Occluded — an invisible overlay covers these; a click must report interception, not success</h2>
+  <div class="plot" id="veiled" style="height:150px">
+    <div class="veil"><span class="veil-label">transparent overlay, z-index 10</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Scrolled — targets below the fold of an inner scroller</h2>
+  <div id="scroller"><div class="inner" id="scrollplot"></div></div>
+</section>
+
+<section>
+  <h2>Nested — same-origin iframe and an open shadow root</h2>
+  <iframe id="frame" srcdoc='
+    <style>body{margin:0;font:12px system-ui;background:#fff}
+      .dot{position:absolute;width:16px;height:16px;border-radius:50%;background:#d97706;transform:translate(-50%,-50%);cursor:pointer}</style>
+    <div class="dot" data-tid="F1" style="left:70px;top:50px"></div>
+    <div class="dot" data-tid="F2" style="left:210px;top:110px"></div>
+    <script>
+      document.addEventListener("click",(e)=>{
+        const d=e.target.closest?.(".dot");
+        parent.postMessage({__harness:1,tid:d?d.dataset.tid:null,x:e.clientX,y:e.clientY},"*");
+      },true);
+    <\/script>'></iframe>
+  <div id="shadowhost" style="position:relative;height:90px;margin-top:10px"></div>
+</section>
+
+<div id="summary">No clicks recorded yet.</div>
+<svg id="errors"></svg>
+
+<script>
+(() => {
+  'use strict';
+  const SVGNS = 'http://www.w3.org/2000/svg';
+
+  // ---- target layout (deterministic, so a run is reproducible) ----
+  function dot(parent, tid, left, top, size, cls) {
+    const d = document.createElement('button');
+    d.className = 'dot' + (cls ? ' ' + cls : '');
+    d.dataset.tid = tid;
+    d.style.left = left + 'px'; d.style.top = top + 'px';
+    d.style.width = size + 'px'; d.style.height = size + 'px';
+    parent.appendChild(d);
+    return d;
+  }
+  let n = 0;
+  const grid = document.getElementById('grid');
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 9; c++) dot(grid, 'G' + (++n), 40 + c * 90, 30 + r * 50, 18);
+  const crowd = document.getElementById('crowd');
+  for (let i = 0; i < 24; i++) dot(crowd, 'C' + (i + 1), 40 + (i % 12) * 14, 40 + Math.floor(i / 12) * 60, 8, 'tiny');
+  const veiled = document.getElementById('veiled');
+  for (let i = 0; i < 6; i++) dot(veiled, 'V' + (i + 1), 60 + i * 110, 70, 18);
+  veiled.querySelector('.veil').style.zIndex = 10;
+  const sp = document.getElementById('scrollplot');
+  for (let i = 0; i < 8; i++) dot(sp, 'S' + (i + 1), 60 + (i % 4) * 130, 120 + i * 95, 16);
+
+  // open shadow root — elementFromPoint must pierce it
+  const host = document.getElementById('shadowhost');
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = '<style>.dot{position:absolute;width:16px;height:16px;border-radius:50%;'
+    + 'background:#0891b2;transform:translate(-50%,-50%);cursor:pointer}'
+    + '.lbl{position:absolute;left:0;top:0;font:10px system-ui;color:#6b6b78}</style>'
+    + '<span class="lbl">shadow root</span>'
+    + '<div class="dot" data-tid="D1" style="left:80px;top:45px"></div>'
+    + '<div class="dot" data-tid="D2" style="left:240px;top:60px"></div>';
+  root.addEventListener('click', (e) => {
+    const d = e.composedPath().find((el) => el.dataset && el.dataset.tid);
+    record(d ? d.dataset.tid : null, e.clientX, e.clientY);
+  }, true);
+
+  // ---- recording ----
+  const log = [];       // { expect, tid, x, y, hit }
+  let expecting = null; // what the runner said it was aiming at
+
+  function record(tid, x, y) {
+    const entry = { expect: expecting, tid, x: Math.round(x), y: Math.round(y), hit: !!tid && tid === expecting };
+    log.push(entry);
+    const el = tid && document.querySelector(`[data-tid="${tid}"]`);
+    if (entry.hit && el) el.classList.add('hit');
+    draw(entry);
+    expecting = null;
+    render();
+  }
+  document.addEventListener('click', (e) => {
+    if (e.target.closest && e.target.closest('#shadowhost')) return; // handled by the shadow listener
+    const d = e.target.closest ? e.target.closest('.dot') : null;
+    record(d ? d.dataset.tid : null, e.clientX, e.clientY);
+  }, true);
+  addEventListener('message', (e) => { // iframe clicks, translated into top-level coords
+    if (!e.data || !e.data.__harness) return;
+    const r = document.getElementById('frame').getBoundingClientRect();
+    record(e.data.tid, e.data.x + r.left, e.data.y + r.top);
+  });
+
+  // ---- error visualisation: where it should have gone vs where it went ----
+  const svg = document.getElementById('errors');
+  function sizeSvg() {
+    svg.setAttribute('width', document.documentElement.scrollWidth);
+    svg.setAttribute('height', document.documentElement.scrollHeight);
+    svg.style.position = 'absolute'; svg.style.left = '0'; svg.style.top = '0';
+  }
+  function mk(tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+  function draw(entry) {
+    sizeSvg();
+    const sx = scrollX, sy = scrollY;
+    const ax = entry.x + sx, ay = entry.y + sy;
+    if (entry.hit) { svg.appendChild(mk('circle', { cx: ax, cy: ay, r: 5, fill: 'none', stroke: '#059669', 'stroke-width': 2 })); return; }
+    // miss: mark where it landed, and where the intended target actually is
+    svg.appendChild(mk('path', { d: `M${ax - 6},${ay - 6}L${ax + 6},${ay + 6}M${ax + 6},${ay - 6}L${ax - 6},${ay + 6}`, stroke: '#e11d48', 'stroke-width': 2.5 }));
+    const want = entry.expect && document.querySelector(`[data-tid="${entry.expect}"]`);
+    if (!want) return;
+    const r = want.getBoundingClientRect();
+    const wx = r.left + r.width / 2 + sx, wy = r.top + r.height / 2 + sy;
+    svg.appendChild(mk('line', { x1: ax, y1: ay, x2: wx, y2: wy, stroke: '#e11d48', 'stroke-width': 1.5, 'stroke-dasharray': '4 3', opacity: .8 }));
+    svg.appendChild(mk('circle', { cx: wx, cy: wy, r: 11, fill: 'none', stroke: '#e11d48', 'stroke-width': 1.5, 'stroke-dasharray': '3 3' }));
+    const d = Math.round(Math.hypot(ax - wx, ay - wy));
+    svg.appendChild(mk('text', { x: (ax + wx) / 2 + 6, y: (ay + wy) / 2 - 4, fill: '#e11d48', 'font-size': 11, 'font-family': 'system-ui' })).textContent = d + 'px off';
+  }
+  function render() {
+    const hits = log.filter((l) => l.hit).length;
+    const offs = log.filter((l) => !l.hit && l.expect).map((l) => {
+      const el = document.querySelector(`[data-tid="${l.expect}"]`); if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return Math.hypot(l.x - (r.left + r.width / 2), l.y - (r.top + r.height / 2));
+    }).filter((v) => v != null);
+    const mean = offs.length ? Math.round(offs.reduce((a, b) => a + b, 0) / offs.length) : 0;
+    document.getElementById('summary').innerHTML =
+      `<b>${hits}/${log.length}</b> clicks landed on their intended target` +
+      (offs.length ? ` &middot; ${offs.length} missed by <b>${mean}px</b> on average (max ${Math.round(Math.max(...offs))}px)` : '');
+  }
+
+  // ---- runner API ----
+  // Every target's live centre in CSS viewport px, so the runner never hardcodes geometry.
+  function collect() {
+    const out = [];
+    const push = (el, frame) => {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return;
+      out.push({ tid: el.dataset.tid, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+                 w: Math.round(r.width), h: Math.round(r.height), frame: frame || null });
+    };
+    document.querySelectorAll('.dot').forEach((el) => push(el));
+    root.querySelectorAll('.dot').forEach((el) => push(el, 'shadow'));
+    try {
+      const f = document.getElementById('frame'), fr = f.getBoundingClientRect();
+      f.contentDocument.querySelectorAll('.dot').forEach((el) => {
+        const r = el.getBoundingClientRect();
+        out.push({ tid: el.dataset.tid, x: Math.round(fr.left + r.left + r.width / 2), y: Math.round(fr.top + r.top + r.height / 2),
+                   w: Math.round(r.width), h: Math.round(r.height), frame: 'iframe' });
+      });
+    } catch {}
+    return out;
+  }
+  window.__harness = {
+    targets: collect,
+    expect: (tid) => { expecting = tid; return true; },
+    log: () => log,
+    reset: () => { log.length = 0; expecting = null; svg.innerHTML = ''; document.querySelectorAll('.hit').forEach((e) => e.classList.remove('hit')); render(); return true; },
+    scrollInner: (top) => { document.getElementById('scroller').scrollTop = top; return document.getElementById('scroller').scrollTop; },
+  };
+  render();
+})();
+</script>
+</body>
+</html>

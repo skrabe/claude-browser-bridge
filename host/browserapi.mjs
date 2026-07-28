@@ -364,7 +364,14 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } throw new Error('expectNavigation: no matching navigation within timeout' + (o.url ? ' (url ' + o.url + ')' : '')); },
     async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000, exclude = (o && o.exclude) || undefined, boxes = !!(o && o.boxes); const main = await evalIn('snapshot', { selector: sel, max, exclude, boxes }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; const framed = await Promise.all(frames.map(async (f) => { try { const s = await evalIn('snapshot', { selector: sel, max: 4000, exclude, boxes }, f.sessionId); return s && !/^\(/.test(s) ? '— frame ' + (f.url || '') + ' —\n' + s : null; } catch { return null; } })); for (const s of framed) if (s) parts.push(s); return parts.join('\n'); },
     async snapshot(o) { return this.domSnapshot(o); },
-    async screenshot(o = {}) { const params = { format: 'png' }; if (o.fullPage) { params.captureBeyondViewport = true; const m = await cdp('Page.getLayoutMetrics').catch(() => ({})); const cs = m.cssContentSize || m.contentSize; if (cs) params.clip = { x: 0, y: 0, width: cs.width, height: cs.height, scale: 1 }; } if (o.clip) params.clip = { ...o.clip, scale: 1 }; const r = await cdp('Page.captureScreenshot', params); return { __image: r.data, mimeType: 'image/png' }; },
+    // Routed through the same capture path as the atomic screenshot tool, so a shot taken inside a
+    // script carries the identical image↔CSS mapping (and can request marks) instead of being a
+    // second, metadata-free implementation that silently disagrees with it.
+    async screenshot(o = {}) {
+      if (abort.aborted) throw new Error('run aborted (timeout)');
+      const r = await callHost('screenshot', { tabId, fullPage: !!o.fullPage, marks: !!o.marks, boxes: !!o.boxes, ...(o.ref != null ? { ref: o.ref } : {}) });
+      return { __image: r.__image, mimeType: r.mimeType || 'image/png', ...(r.__meta || {}) };
+    },
     // Real JS-dialog handling: read the pending alert/confirm/prompt (recorded by the extension on
     // Page.javascriptDialogOpening) and return an object that can accept/dismiss it.
     async getJsDialog() {
