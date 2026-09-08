@@ -831,7 +831,7 @@ const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'select
 // Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
 // once. Saves the dom_query round trip when you already know the selector — and it is strict on
 // purpose: matching several elements is an ambiguous instruction, not a licence to take the first.
-const REF_TOOLS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'hover', 'drag', 'setFiles', 'selectText', 'generateLocator', 'screenshot']);
+const REF_TOOLS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'hover', 'drag', 'setFiles', 'selectText', 'generateLocator', 'screenshot', 'validate']);
 async function resolveSelector(method, p) {
   if (!p || !p.selector || p.ref || !REF_TOOLS.has(method) || p.tabId == null) return p;
   await need(p.tabId);
@@ -1478,6 +1478,52 @@ async function dispatch(method, p) {
       });
       const v = r.result?.value || { count: 0, contexts: [] };
       return { query: q, count: v.count, matches: v.contexts };
+    }
+
+    // "Did it land?" as one cheap, deterministic call. Every check runs and reports its evidence, so
+    // a failed assertion says what the page actually shows rather than just "no". No model is
+    // consulted here on purpose: the outer model reads the evidence, and a nested classifier would
+    // add cost and a second opinion without adding facts.
+    case 'validate': {
+      await need(p.tabId);
+      const checks = [];
+      const t = await chrome.tabs.get(p.tabId);
+      const url = t.url || '';
+      if (p.urlIncludes != null) checks.push({ check: 'urlIncludes', want: p.urlIncludes, ok: url.includes(String(p.urlIncludes)), got: url });
+      if (p.urlMatches != null) { let ok = false; try { ok = new RegExp(String(p.urlMatches)).test(url); } catch { checks.push({ check: 'urlMatches', want: p.urlMatches, ok: false, got: 'invalid regex' }); }
+        if (!checks.some((c) => c.check === 'urlMatches')) checks.push({ check: 'urlMatches', want: p.urlMatches, ok, got: url }); }
+      if (p.titleIncludes != null) checks.push({ check: 'titleIncludes', want: p.titleIncludes, ok: String(t.title || '').includes(String(p.titleIncludes)), got: t.title });
+      const textCount = async (q) => {
+        const r = await cmd(p.tabId, 'Runtime.evaluate', { returnByValue: true, expression: `(()=>{const t=(document.body?document.body.innerText:'').toLowerCase();const n=${JSON.stringify(String(q).toLowerCase())};let i=0,c=0;while((i=t.indexOf(n,i))>=0&&c<1000){c++;i+=n.length;}return c;})()` });
+        return r.result?.value ?? 0;
+      };
+      for (const q of [].concat(p.text ?? [])) { const c = await textCount(q); checks.push({ check: 'text', want: q, ok: c > 0, got: c + ' occurrence(s)' }); }
+      for (const q of [].concat(p.textAbsent ?? [])) { const c = await textCount(q); checks.push({ check: 'textAbsent', want: q, ok: c === 0, got: c + ' occurrence(s)' }); }
+      if (p.ref) {
+        const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+        const dbg = dbgOf(p.tabId, sessionId);
+        const objectId = await objectFor(dbg, backendNodeId);
+        const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: `function(){
+          const el = this.nodeType === 3 ? this.parentElement : this; if (!el) return null;
+          const cs = getComputedStyle(el), b = el.getBoundingClientRect();
+          const visible = cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0 && b.width > 0 && b.height > 0;
+          const checked = typeof el.checked === 'boolean' ? el.checked : el.getAttribute('aria-checked') === 'true';
+          const enabled = !(el.disabled || el.getAttribute('aria-disabled') === 'true');
+          return { visible, checked, enabled, value: 'value' in el ? String(el.value) : null, text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 300), secret: el.type === 'password' };
+        }` });
+        const e = r.result?.value;
+        if (!e) checks.push({ check: 'element', ok: false, got: 'ref no longer resolves to an element' });
+        else {
+          if (p.visible != null) checks.push({ check: 'visible', want: p.visible, ok: e.visible === !!p.visible, got: e.visible });
+          if (p.enabled != null) checks.push({ check: 'enabled', want: p.enabled, ok: e.enabled === !!p.enabled, got: e.enabled });
+          if (p.checked != null) checks.push({ check: 'checked', want: p.checked, ok: e.checked === !!p.checked, got: e.checked });
+          if (p.value != null) checks.push({ check: 'value', want: e.secret ? '(secret)' : p.value, ok: e.value === String(p.value), got: e.secret ? '(secret, length ' + String(e.value ?? '').length + ')' : e.value });
+          if (p.textContains != null) checks.push({ check: 'textContains', want: p.textContains, ok: e.text.toLowerCase().includes(String(p.textContains).toLowerCase()), got: e.text.slice(0, 120) });
+        }
+      }
+      if (!checks.length) throw new Error('validate: nothing to check — pass urlIncludes/urlMatches/titleIncludes/text/textAbsent, or a ref/selector with visible/enabled/checked/value/textContains');
+      const failed = checks.filter((c) => !c.ok);
+      return { ok: failed.length === 0, passed: checks.length - failed.length, ...(failed.length ? { failed } : {}), checks };
     }
 
     case 'hover': {
