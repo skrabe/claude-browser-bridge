@@ -86,7 +86,8 @@ need a manual `sleep` or a pre-check. Explicit waits: `await loc.waitFor({state:
 
 `click(o)` · `dblclick()` · `hover()` · `fill(value)` · `type(value)` · `press('Enter'|'Meta+A')` ·
 `selectOption(v)` · `check()` · `uncheck()` · `setChecked(bool)` · `focus()` ·
-`setInputFiles(paths)` · `dragTo(target)` · `scrollIntoViewIfNeeded()`.
+`setInputFiles(paths)` · `dragTo(target)` · `scrollIntoViewIfNeeded()`. (`pressSequentially(v)` is
+Playwright's current name for `type(v)` — both work, and neither clears the field first.)
 
 - Clicks are **real trusted mouse events** at the element's center (auto-scrolled in first).
   `click({button:'right'})`, `click({modifiers:['Meta']})`, `click({clickCount:2})`.
@@ -119,12 +120,19 @@ Single-value (strict, auto-wait): `textContent()` · `innerText()` · `inputValu
 `getAttribute(name)` · `boundingBox()`. Boolean/plural (no throw): `count()` · `all()` ·
 `allTextContents()` · `isVisible()` · `isEnabled()` · `isChecked()`.
 
-For a whole-page overview prefer **`page.domSnapshot({selector, max, exclude, boxes})`** over the
-atomic `read_page`: a compact list of visible interactables (`[n] role "name" =value`), scopable to
+Locator-scoped JS: **`loc.evaluate((el, arg) => …, arg)`** on the single matched element, and
+**`loc.evaluateAll((el, arg, i) => …, arg)`** across every match in ONE pass. `evaluateAll` is the
+right shape for scraping a list you already have a locator for — `page.getByRole('row')
+.evaluateAll(el => el.innerText)` beats looping `.nth(i)`, which pays a round trip per row.
+
+Inside a script, **`page.domSnapshot({selector, max, exclude, boxes})`** is the whole-page overview:
+a compact list of visible interactables (`[n] role "name" =value`), scopable to
 a container and piercing frames/shadow — **no element cap**, but char-budgeted (default 20k, raise
 via `max`; each cross-origin frame gets 4k). `exclude:['nav','.ads']` prunes chrome/ad noise;
 `boxes:true` appends `[box=x,y,w,h]`; open dialogs/dropdowns are surfaced first so truncation can't
-drop them.
+drop them. That makes it the better instrument for a one-shot survey of a big page — but it always
+returns everything it finds, so in an act-then-look loop outside a script `read_page`'s delta is the
+cheaper one.
 
 Use **`page.evaluate(fn, arg)`** to run JS **in the page** — the function is serialized (`.toString`),
 so it has **no closures** (pass data via the single JSON-serializable `arg`), and runs in the main
@@ -238,6 +246,18 @@ the verification you need.
 - `tabs_list` · `tab_claim` · `tab_create` · `tab_activate` · `tab_release` · `tab_close`.
 - `read_page` — accessibility tree with a stable **ref** per interactable (role + name), including
   cross-origin frames (tagged `frame:true`). Capped ~500 elements; on a huge page narrow first.
+  **Refs survive across reads** for as long as the element lives, so a ref from an earlier read is
+  still good. After the first read of a page it returns only the **delta** — `added` / `changed` /
+  `removed`, with `unchanged` as a count — because in an act-then-look loop nearly everything is
+  unchanged and resending it is the biggest waste of context in a browser session. So call it after
+  every action: it's cheap. `full:true` re-sends the whole tree (use it when you've lost the thread,
+  not routinely); `screenshot:true` returns structure *and* a marked picture of the same state in one
+  call, for when you need to see layout rather than read it. A navigation resets the baseline, so the
+  first read on a new page is automatically full.
+  - **`unchanged:true` is a finding, not a retry cue.** It means your last action changed nothing.
+    Don't fire the same action again and don't fall to coordinates — look for the reason: a modal or
+    cookie banner over the target, a disabled control, a still-loading page (`wait_for`), or the
+    wrong element. Then act on the reason.
 - `read_text` — visible innerText, for reading prose once you're on the right page.
 - `find_text` — does a word/phrase appear **anywhere** (incl. off-screen, not yet scrolled)? Returns
   a count + context snippets. Cheaper than a scroll+read loop. `regex:true` for a pattern.
@@ -252,13 +272,19 @@ the verification you need.
   image↔CSS mapping — see "Working from what you can see".
 - `probe_point` — what element is at `{x,y,space}`? Returns it plus a clickable ref; `annotate:true`
   draws a crosshair on the point so a misplacement is visible.
-- **Lens choice:** `read_page` for structure/refs, `read_text` for prose, `find_text` for "does X
+- **Lens choice:** `read_page` for structure/refs (and the cheap delta after each action), `read_text` for prose, `find_text` for "does X
   appear", `screenshot` for visual layout. Pick the **one** that answers the next question.
 
 **Act** (by ref): `click` (right/middle via `button:`, `double:true`) · `fill` · `type_text` ·
-`press_key` · `select_option` · `scroll` · `hover` · `drag` · `upload_file`. `fill`/`type_text` also
-take `{secret:"NAME"}`. The acting judgment above (exact labels, checkbox `label[for]`, don't-assume-
-navigation) applies here too.
+`press_key` · `select_option` · `scroll` · `hover` · `drag` · `upload_file` · `select_text`.
+`fill`/`type_text` also take `{secret:"NAME"}`. The acting judgment above (exact labels, checkbox
+`label[for]`, don't-assume-navigation) applies here too.
+
+- `select_text` puts the caret or a selection at an **exact spot inside existing text** (input,
+  textarea, or contenteditable): `{ref, text:"Berlin", selectionType:"select"}` then `type_text` to
+  replace just that word, or `selectionType:"before"|"after"` to place the cursor and type around it.
+  This is how you edit part of a value — `fill` would replace the whole thing. When the text repeats,
+  pin the occurrence with `prefix`/`suffix`; an ambiguous match errors rather than guessing.
 
 **Wait & compose**
 - `wait_for` — block until a condition instead of polling `read_page`: `{state:"load"|"networkidle"}`,
@@ -268,6 +294,23 @@ navigation) applies here too.
 - Also: `dialog_handle`, `download_wait` / `downloads_list`, `credential_request`,
   `secret_set` / `secret_list` / `secret_clear`, `read_console` / `read_network` / `network_body`,
   `clipboard_read` / `clipboard_write`, `navigate` / `reload` / `go_back` / `go_forward`, `cdp`.
+
+**Without taking the tab over**
+- `peek_tab` — read a user tab's title, URL and visible text **without claiming it**. No debugger
+  attach, so no "being debugged" banner and nothing taken away from them. This is the right answer to
+  "what does that other tab say" or "check the price in my other tab". Claim only when you need to
+  *act*. It can't read browser-internal pages, and a page still loading may come back thin — claim it
+  if you need certainty.
+
+**Organize the browser itself**
+- `browser_manage` — windows, tab groups, pinning and bookmarks: `namespace` + `method` + `args`
+  mirroring the Chrome extension APIs (`tabs.query({url:'https://docs.*/*'})`,
+  `tabs.update(id,{pinned:true})`, `tabs.group({tabIds})`, `tabGroups.update(id,{title,color})`,
+  `windows.update(id,{focused:true,width,height})`, `bookmarks.search({query})`,
+  `bookmarks.create({title,url,parentId})`). Query first, act on the ids you get back, and keep tabs
+  in their current window unless the user asked to move them. `namespace:"audit"` lists what you
+  changed this session with the state before each change — use it to tell the user what happened or
+  to undo it. Confirm before deleting a bookmark or closing tabs the user owns.
 
 **The page's own API and assets**
 - `webmcp_tools` — does this page publish its own tools (WebMCP `document.modelContext`, plus
@@ -286,7 +329,10 @@ navigation) applies here too.
 
 1. **Orient** — `tabs_list` to see real tabs; `tab_claim` an existing one, or `tab_create`.
 2. **Drive** — write a `run` script for the flow. Let locators auto-wait; `log()` progress, `return`
-   what you need. Drop to atomic tools only for a trivial single action or a quick look.
+   what you need. Drop to atomic tools for a trivial single action or a quick look — and for UI you
+   can't predict, where the honest loop is act → `read_page` (delta) → decide. Rule of thumb: script
+   what you can foresee, step through what you can't. When a `run` script dies mid-flow, don't just
+   re-run a longer one; step the failing part atomically until you can see what the page is doing.
 3. **Verify** — `run` returns your script's value (or `{error, logs}` on failure); atomic actions
    return a status header ({url, title, new console errors/warnings, `openDialog`}). Stop at one
    authoritative signal (URL param, toast, checked state, line item) — don't re-verify a fact you
@@ -298,6 +344,13 @@ navigation) applies here too.
   `read_page` + `screenshot`). On a fresh page, dismiss any blocking modal/cookie banner as part of
   orienting before going for the target. If you're **not getting narrower**, don't scale extraction
   across more elements — change strategy (a different lens, the site's own search, a direct URL).
+- **When you're driving atomically, look after every action** — `read_page` returns a delta, so the
+  cost of checking is roughly the size of what actually changed. The failure mode to avoid is the
+  opposite one: firing three or four actions blind and then trying to reconstruct which of them
+  didn't land.
+- **Acting is not finishing.** A click that returned `ok` is an attempt, not a result. Before you
+  report a task done, the observed state has to *show* it — the row is gone, the toast says saved,
+  the URL carries the id. If you never saw that, say what you did and what you couldn't confirm.
 - **Search-engine fallback is one focused query.** If you drop to a web search from inside a page,
   run one query, open the strongest result — don't loop rewriting the query.
 - **Reuse, don't refetch.** Keep the latest snapshot for building targets; refresh only after a
@@ -371,6 +424,12 @@ await page.getByRole('link', { name: 'Open report' }).click();
 await sleep(400);
 const p2 = await browser.claimTab((await browser.openTabs()).find(t => !before.has(t.id)));
 ```
+
+**Verifying your own local app** (`localhost`, `127.0.0.1`, `::1`, a dev URL): if the framework has
+no hot reload — or it's disabled — the tab is showing the code from *before* your edit. `reload()`
+first, then observe; otherwise you'll verify a stale build and believe a fix worked (or didn't) for
+the wrong reason. With hot reload on, still wait for a content signal rather than assuming the
+re-render already happened.
 
 ## Script doctrine
 
@@ -515,8 +574,13 @@ unusable base64 string), and the `navigate` tool over raw `Page.navigate` (which
 already on the URL, wiping in-progress input). Reach here for: DOM node ops
 (`DOM.getDocument {depth:-1}`, `DOM.querySelector`), chorded mouse gestures / pointer types `click`
 doesn't expose, or a domain not otherwise surfaced. `Page`/`DOM`/`Runtime`/`Accessibility`/`Network`/
-`Log` are pre-enabled on claim; enable any other domain first. The bridge does **not** stream CDP
-events — poll state; console/network are buffered and read via `read_console`/`read_network`.
+`Log` are pre-enabled on claim; enable any other domain first.
+
+Events are buffered, not streamed. `read_console` / `read_network` are the digests for the two you
+usually want; **`cdp_events`** reads the rest of the protocol (lifecycle, CSS, Animation, a domain
+you enabled yourself). To attribute events to an action, read once for the `cursor`, act, then read
+again with `afterSequence:<cursor>` — that returns exactly what your action caused. Filter with
+`methods:[…]`, keep paging while `hasMore`, and treat `truncated:true` as "older events aged out".
 
 ---
 
