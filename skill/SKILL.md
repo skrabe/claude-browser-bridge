@@ -300,6 +300,12 @@ already know it; matching more than one element is an error, not a licence to ta
 `fill`/`type_text` also take `{secret:"NAME"}`. The acting judgment above (exact labels, checkbox
 `label[for]`, don't-assume-navigation) applies here too.
 
+- **`intent`** on any of these is the robust way to target: `{selector:"#save", intent:"save the
+  order"}`. The selector narrows; the intent confirms — if the selector now points at something
+  whose label doesn't agree (a reshuffled id landing on "Delete order") the call is **refused**,
+  and if the selector matches nothing the intent finds the control by label, taken only when one
+  candidate clearly leads (`resolvedBy:"intent"` in the result). `intent` alone works too. An
+  ambiguous intent errors with the candidates rather than guessing.
 - `select_text` puts the caret or a selection at an **exact spot inside existing text** (input,
   textarea, or contenteditable): `{ref, text:"Berlin", selectionType:"select"}` then `type_text` to
   replace just that word, or `selectionType:"before"|"after"` to place the cursor and type around it.
@@ -321,6 +327,16 @@ already know it; matching more than one element is an error, not a licence to ta
   "what does that other tab say" or "check the price in my other tab". Claim only when you need to
   *act*. It can't read browser-internal pages, and a page still loading may come back thin — claim it
   if you need certainty.
+
+**Test under conditions / find out why it's slow**
+- `emulate` — `cpuThrottlingRate:4`, `networkConditions:"Slow 3G"`, `colorScheme:"dark"`,
+  `viewport:"390x844x3,mobile,touch"`, `userAgent`, `geolocation:"lat,lng"`, `extraHttpHeaders`.
+  Each key applies independently; **nothing is undone for you** — `reset:true` when done.
+- `perf_trace {action:"start", reload:true}` (returns after the load settles) … interact if you
+  want INP … `{action:"stop"}` → Core Web Vitals each rated good/needs-improvement/poor, long
+  tasks, render-blocking and slowest resources, and **named insights** (`LCPBreakdown`,
+  `DocumentLatency`, `CLSCulprits`…) saying what to look at, plus the raw trace as a `.json.gz`
+  for DevTools/Perfetto. "On a slow phone" = `emulate` first, then trace.
 
 **Organize the browser itself**
 - `browser_manage` — windows, tab groups, pinning and bookmarks: `namespace` + `method` + `args`
@@ -443,6 +459,13 @@ returns `cacheStatus`:
 **Scope the fingerprint.** Fingerprints hash interactive roles+names, so prose and counters don't
 churn them — but a nav with a live badge will. Set `read_page {ignore:["nav",".ads"]}` once on the
 tab before recording; it sticks, and both the live tree and every fingerprint honour it.
+
+**Or let the user show you once.** `user_record {action:"start"}` watches *their* real clicks,
+typing (coalesced to the final value per field), selects and Enter — across navigations — and
+`stop` returns a ready `run` script plus, with `saveAs`, a flow. Say when you start and stop.
+Password values are never captured; they become `fill({secret:"NAME"})` placeholders you register
+with `secret_set` before replaying. User-recorded steps carry no fingerprints, so replay relies on
+each target resolving uniquely and its intent agreeing — run it once to confirm.
 
 `flows {action:"list"|"show"|"delete"}` manages them. They're plain JSON under
 `~/.claude-browser-bridge/flows` (`CBB_FLOW_DIR` to relocate) — portable, and committable next to a
