@@ -70,16 +70,19 @@ own dir, so all of them are registered automatically.
 
 ## Tools
 
-46 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
-are for one-off actions. `cdp` is the escape hatch for anything they don't cover.
+58 MCP tools. **`run` is the fast path** — script a whole flow in one call; the atomic tools below
+are for one-off actions; **flows** replay a sequence you (or the user) did once, with no model in
+the loop. `cdp` is the escape hatch for anything they don't cover.
 
 | Group | Tools |
 |---|---|
 | **Programmable** | `run` *(JS script: Playwright-shaped `page`/locators — getByRole/Text/Label, click/fill/press/check/selectOption/setInputFiles/dragTo, evaluate, waitForURL, domSnapshot, pdf, screenshot; `browser` — openTabs/claimTab/newTab/readUrls/history; auto-waiting, pierces frames + shadow DOM)* |
 | **Tabs** | `tabs_list` · `tab_claim` · `tab_create` *(group by topic)* · `tab_activate` · `tab_release` · `tab_close` |
 | **Navigate** | `navigate` *(waits for load)* · `reload` · `go_back` · `go_forward` · `wait_for` |
-| **Read / observe** | `read_page` *(a11y tree + refs, incl. cross-origin frames)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page / `marks:true` set-of-mark badges, always reports its image↔CSS mapping)* · `probe_point` *(what's at {x,y} + a clickable ref; `annotate:true` draws a crosshair)* · `read_console` · `read_network` · `network_body` |
-| **Act** | `click` *(right/double; returns a receipt naming what it hit and flags an intercepting overlay; `space:"image"`/`"page"` coords)* · `fill` · `type_text` · `press_key` · `select_option` · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
+| **Read / observe** | `read_page` *(a11y tree + refs that survive across reads; returns only the DELTA after the first read; flags elements buried under an overlay; `mode:"interact"`, sticky `ignore:[css]`, `toFile`)* · `validate` *(prove an action landed: url / text / element visible-checked-value, with evidence)* · `generate_locator` *(ref → durable locator, with match counts)* · `peek_tab` *(read a user tab without claiming it)* · `read_text` · `find_text` · `dom_query` · `find` · `screenshot` *(element / full-page / `marks:true` set-of-mark badges, always reports its image↔CSS mapping)* · `probe_point` *(what's at {x,y} + a clickable ref; `annotate:true` draws a crosshair)* · `read_console` · `read_network` · `network_body` |
+| **Act** | `click` *(by ref, CSS `selector`, or `intent` — selector narrows, intent confirms the label and finds the control again if the selector died; right/double; returns a receipt naming what it hit; `space:"image"`/`"page"` coords)* · `fill` *(reads the value back and reports a mask/maxlength rewrite; rejects a wrongly-formatted date)* · `type_text` · `press_key` · `select_option` · `select_text` *(caret/selection at an exact spot in existing text)* · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
+| **Flows** | `flow_record` *(start/stop: every state-changing call captured with a page fingerprint, refs made durable, `%variables%`)* · `flow_run` *(replay in one call; `HIT` / `HIT-DRIFTED` / `STALE` with the failing step to heal)* · `flows` · `user_record` *(watch the USER do it once → run script + flow; passwords never captured)* |
+| **Browser & perf** | `browser_manage` *(windows, tab groups, pinning, bookmarks + an undo audit trail)* · `emulate` *(CPU/network throttling, dark mode, UA, geolocation, headers, device viewport)* · `perf_trace` *(Core Web Vitals rated + named insights + trace .json.gz)* · `cdp_events` *(cursor-paged CDP event buffer)* |
 | **Auth & dialogs** | `credential_request` *(secure popup)* · `dialog_handle` |
 | **Secrets** | `secret_set` / `secret_list` / `secret_clear` *(fill by name; the literal is auto-redacted from every tool result so a page echo / network body / console line can't leak it)* |
 | **Downloads** | `download_wait` · `downloads_list` |
