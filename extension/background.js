@@ -254,6 +254,91 @@ const PERF_COLLECTOR = `(() => {
   obs('longtask', (e) => { if (P.longTasks.length < 50) P.longTasks.push({ start: Math.round(e.startTime), ms: Math.round(e.duration) }); });
   obs('event', (e) => { if (e.interactionId) { P.interactions++; if (!P.inp || e.duration > P.inp.ms) P.inp = { ms: e.duration, type: e.name, target: e.target ? (e.target.tagName + (e.target.id ? '#' + e.target.id : '')) : null }; } }, { durationThreshold: 16 });
 })();`;
+// Framework click handlers (React onClick, Vue @click) leave no trace in the DOM or the a11y tree;
+// the only way to see them is DevTools' getEventListeners, exposed to CDP through the command-line
+// API. Capped the way Browser Use caps it: skip huge documents outright, stop at 100 hits. Natively
+// interactive elements are excluded here because the tree already has them.
+const LISTENER_HARVEST = `(() => {
+  const all = document.querySelectorAll('*');
+  if (all.length > 10000) return { skipped: 'document has ' + all.length + ' nodes' };
+  const NATIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY','OPTION','LABEL']);
+  const out = [];
+  for (const el of all) {
+    if (NATIVE.has(el.tagName) || el.getAttribute('role')) continue;
+    let l; try { l = getEventListeners(el); } catch { break; }
+    if (l.click || l.mousedown || l.mouseup || l.pointerdown || l.pointerup) { out.push(el); if (out.length >= 100) break; }
+  }
+  return out;
+})()`;
+async function harvestListenerBids(tabId) {
+  const bids = new Set();
+  let r;
+  try { r = await cmd(tabId, 'Runtime.evaluate', { expression: LISTENER_HARVEST, includeCommandLineAPI: true, returnByValue: false }); } catch { return bids; }
+  const obj = r.result;
+  if (!obj || obj.type !== 'object' || obj.subtype !== 'array' || !obj.objectId) return bids;
+  try {
+    const { result: props } = await cmd(tabId, 'Runtime.getProperties', { objectId: obj.objectId, ownProperties: true });
+    const items = props.filter((p) => /^\d+$/.test(p.name) && p.value && p.value.objectId);
+    await Promise.all(items.map(async (p) => {
+      try { const { node } = await cmd(tabId, 'DOM.describeNode', { objectId: p.value.objectId }); if (node?.backendNodeId != null) bids.add(node.backendNodeId); } catch {}
+    }));
+  } catch {}
+  await cmd(tabId, 'Runtime.releaseObject', { objectId: obj.objectId }).catch(() => {});
+  return bids;
+}
+
+// Installed in every document while recording the user. Captures clicks, the final value of each
+// edited field (keystrokes coalesced at change/blur), select changes, Enter, and form submits;
+// computes a durable locator for the target on the spot. Password values are never captured.
+const USER_RECORDER = `(() => {
+  if (window.__cbbUserRecStop) return;
+  const send = (e) => { try { window.__cbbUserEvent(JSON.stringify(e)); } catch {} };
+  const uniq = (sel) => { try { return document.querySelectorAll(sel).length === 1; } catch { return false; } };
+  const esc = (v) => (window.CSS && CSS.escape ? CSS.escape(v) : v);
+  const label = (el) => {
+    const a = el.getAttribute('aria-label'); if (a) return a.trim();
+    if (el.labels && el.labels[0]) return (el.labels[0].textContent || '').trim();
+    const t = (el.innerText || el.textContent || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || '').replace(/\\s+/g, ' ').trim();
+    return t.slice(0, 80);
+  };
+  const roleOf = (el) => el.getAttribute('role') || ({ A: 'link', BUTTON: 'button', SELECT: 'combobox', TEXTAREA: 'textbox', INPUT: ({ checkbox: 'checkbox', radio: 'radio', submit: 'button', button: 'button' })[(el.type || '').toLowerCase()] || 'textbox' })[el.tagName] || null;
+  const locator = (el) => {
+    const tid = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-test');
+    if (tid && uniq('[data-testid="' + tid + '"]')) return { selector: '[data-testid="' + tid + '"]' };
+    if (el.id && !/^[0-9]|:r[0-9a-z]+:|^[0-9a-f]{8,}$/i.test(el.id) && uniq('#' + esc(el.id))) return { selector: '#' + esc(el.id) };
+    const name = el.getAttribute('name'); const tag = el.tagName.toLowerCase();
+    if (name && uniq(tag + '[name="' + name + '"]')) return { selector: tag + '[name="' + name + '"]' };
+    const href = el.getAttribute('href'); if (href && uniq('a[href="' + href + '"]')) return { selector: 'a[href="' + href + '"]' };
+    const r = roleOf(el), l = label(el); if (r && l) return { role: r, name: l };
+    return { fragile: true, hint: tag + ' "' + l + '"' };
+  };
+  const control = (el) => el.closest && (el.closest('button, a, [role=button], [role=link], [role=menuitem], [role=tab], [role=option], input, select, textarea, summary, label, [onclick]') || el);
+  const pending = new Map(); // element -> last value, flushed on change/blur
+  const flush = (el) => { if (!pending.has(el)) return; const v = pending.get(el); pending.delete(el);
+    send({ type: el.type === 'password' ? 'fill-secret' : 'fill', target: locator(el), label: label(el), ...(el.type === 'password' ? { field: el.name || el.id || 'password' } : { value: v }), t: Date.now() }); };
+  const onClick = (ev) => { const el = control(ev.target); if (!el || !el.tagName) return; if (el.tagName === 'INPUT' && /^(text|email|search|tel|url|password|number)$|^$/.test(el.type)) return; // typing follows; the click was just focus
+    for (const k of [...pending.keys()]) flush(k);
+    send({ type: el.tagName === 'SELECT' ? 'noop' : 'click', target: locator(el), label: label(el), role: roleOf(el), t: Date.now() }); };
+  const onInput = (ev) => { const el = ev.target; if (!el || !('value' in el) || el.tagName === 'SELECT') return; if (el.type === 'checkbox' || el.type === 'radio') return; pending.set(el, el.value); };
+  const onChange = (ev) => { const el = ev.target; if (!el) return;
+    if (el.tagName === 'SELECT') { send({ type: 'select', target: locator(el), label: label(el), value: el.value, t: Date.now() }); return; }
+    if (el.type === 'checkbox' || el.type === 'radio') return; // the click already recorded it
+    flush(el); };
+  const onKey = (ev) => { if (ev.key === 'Enter' && ev.target && 'value' in ev.target) { flush(ev.target); send({ type: 'press', key: 'Enter', target: locator(ev.target), label: label(ev.target), t: Date.now() }); } };
+  const onBlur = (ev) => { if (ev.target && pending.has(ev.target)) flush(ev.target); };
+  const onSubmit = (ev) => { for (const k of [...pending.keys()]) flush(k); send({ type: 'submit', t: Date.now() }); };
+  document.addEventListener('click', onClick, true);
+  document.addEventListener('input', onInput, true);
+  document.addEventListener('change', onChange, true);
+  document.addEventListener('keydown', onKey, true);
+  document.addEventListener('blur', onBlur, true);
+  document.addEventListener('submit', onSubmit, true);
+  window.__cbbUserRecStop = () => { for (const k of [...pending.keys()]) flush(k);
+    document.removeEventListener('click', onClick, true); document.removeEventListener('input', onInput, true); document.removeEventListener('change', onChange, true);
+    document.removeEventListener('keydown', onKey, true); document.removeEventListener('blur', onBlur, true); document.removeEventListener('submit', onSubmit, true); delete window.__cbbUserRecStop; };
+  send({ type: 'document', url: location.href, t: Date.now() });
+})();`;
+
 const TRACE_CATEGORIES = ['-*', 'devtools.timeline', 'disabled-by-default-devtools.timeline', 'disabled-by-default-devtools.timeline.frame',
   'toplevel', 'blink.console', 'blink.user_timing', 'latencyInfo', 'disabled-by-default-devtools.timeline.stack', 'disabled-by-default-v8.cpu_profiler',
   'loading', 'v8.execute', 'disabled-by-default-lighthouse'];
@@ -1114,6 +1199,30 @@ async function dispatch(method, p) {
       return { metrics: m, durationMs, trace, traceBytes: bytes, ...(truncated ? { truncated: true } : {}) };
     }
 
+    // Watch the USER drive, and turn it into a script. Events reach the extension through a
+    // Runtime binding, so nothing is lost when the page navigates; the binding is reinstalled on
+    // every new document. The durable locator is computed in the page at event time, because by
+    // the time anyone asks later the element may be gone.
+    case 'userRecordStart': {
+      await need(p.tabId);
+      const s = st(p.tabId);
+      if (s.userRec) throw new Error('already recording the user on this tab');
+      await cmd(p.tabId, 'Runtime.addBinding', { name: '__cbbUserEvent' });
+      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: USER_RECORDER });
+      await cmd(p.tabId, 'Runtime.evaluate', { expression: USER_RECORDER }).catch(() => {});
+      s.userRec = { scriptId: identifier, events: [], startedAt: Date.now(), startUrl: (await chrome.tabs.get(p.tabId)).url };
+      return { ok: true, recording: true, note: 'Recording what the user does in this tab. Stop with user_record {action:"stop"}.' };
+    }
+    case 'userRecordStop': {
+      const s = st(p.tabId);
+      if (!s.userRec) throw new Error('not recording the user on this tab');
+      const rec = s.userRec; s.userRec = null;
+      await cmd(p.tabId, 'Page.removeScriptToEvaluateOnNewDocument', { identifier: rec.scriptId }).catch(() => {});
+      await cmd(p.tabId, 'Runtime.removeBinding', { name: '__cbbUserEvent' }).catch(() => {});
+      await cmd(p.tabId, 'Runtime.evaluate', { expression: 'window.__cbbUserRecStop && window.__cbbUserRecStop()' }).catch(() => {});
+      return { events: rec.events, startUrl: rec.startUrl, durationMs: Date.now() - rec.startedAt, ...(p.cancel ? { cancelled: true } : {}) };
+    }
+
     case 'cdpEvents': {
       await need(p.tabId);
       const s = st(p.tabId);
@@ -1287,6 +1396,10 @@ async function dispatch(method, p) {
         } catch {}
       }
       const interactOnly = p.mode === 'interact';
+      // Listener harvest is the expensive perception step, so it runs on full reads only — the
+      // first read of a page is always full — and is cached until the next navigation.
+      if (!s.ax || p.full || !s.listenerBids) s.listenerBids = await harvestListenerBids(p.tabId);
+      const listenerBids = s.listenerBids || new Set();
       // Identity is the DOM node (backendDOMNodeId within its frame session), not the position in
       // the tree. That is what makes both halves of this work: a ref stays valid for as long as its
       // element lives — so the model can act on an element it saw two reads ago — and "what changed
@@ -1389,7 +1502,7 @@ async function dispatch(method, p) {
         for (const n of generics) {
           if (promoted >= 80) break;
           const g = geo.nodes.get(n.backendDOMNodeId); if (!g) continue;
-          const clickable = g.cursor === 'pointer' || 'onclick' in g.attrs || ('tabindex' in g.attrs && g.attrs.tabindex !== '-1');
+          const clickable = g.cursor === 'pointer' || 'onclick' in g.attrs || ('tabindex' in g.attrs && g.attrs.tabindex !== '-1') || listenerBids.has(n.backendDOMNodeId);
           if (!clickable) continue;
           if (ignoredBids.size) { let a = n, h = 0, hid = false; while (a && h++ < 40) { if (a.backendDOMNodeId != null && ignoredBids.has(a.backendDOMNodeId)) { hid = true; break; } a = mainById.get(a.parentId); } if (hid) continue; }
           let up = mainById.get(n.parentId), hops = 0, inside = false;
@@ -2093,6 +2206,10 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
   if (!s.events) { s.events = []; s.evSeq = 0; }
   s.events.push({ sequence: ++s.evSeq, method: cdpMethod, params: cdpParams, ...(source.sessionId ? { sessionId: source.sessionId } : {}) });
   if (s.events.length > 1000) { s.events.shift(); s.evTruncated = true; }
+  if (cdpMethod === 'Runtime.bindingCalled' && cdpParams.name === '__cbbUserEvent' && s.userRec) {
+    try { const e = JSON.parse(cdpParams.payload); if (e.type !== 'noop' && s.userRec.events.length < 2000) s.userRec.events.push(e); } catch {}
+    return;
+  }
   if (cdpMethod === 'Runtime.consoleAPICalled') {
     s.console.push({ level: cdpParams.type, text: (cdpParams.args || []).map(a => a.value ?? a.description ?? '').join(' '), ts: cdpParams.timestamp });
     if (s.console.length > 500) s.console.shift();
@@ -2116,7 +2233,7 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
   } else if (cdpMethod === 'Page.frameNavigated' && !cdpParams.frame?.parentId) {
     // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
     // it would be pure noise. Drop the baseline and let the next read_page return a full tree.
-    s.ax = null;
+    s.ax = null; s.listenerBids = null;
   } else if (cdpMethod === 'Target.attachedToTarget') {
     // A cross-origin child frame attached. Enable its domains, resolve its owner <iframe> in the
     // parent (needed for coordinate translation), and recurse auto-attach for nested frames.
