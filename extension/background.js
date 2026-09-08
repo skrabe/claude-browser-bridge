@@ -254,36 +254,24 @@ const PERF_COLLECTOR = `(() => {
   obs('longtask', (e) => { if (P.longTasks.length < 50) P.longTasks.push({ start: Math.round(e.startTime), ms: Math.round(e.duration) }); });
   obs('event', (e) => { if (e.interactionId) { P.interactions++; if (!P.inp || e.duration > P.inp.ms) P.inp = { ms: e.duration, type: e.name, target: e.target ? (e.target.tagName + (e.target.id ? '#' + e.target.id : '')) : null }; } }, { durationThreshold: 16 });
 })();`;
-// Framework click handlers (React onClick, Vue @click) leave no trace in the DOM or the a11y tree;
-// the only way to see them is DevTools' getEventListeners, exposed to CDP through the command-line
-// API. Capped the way Browser Use caps it: skip huge documents outright, stop at 100 hits. Natively
-// interactive elements are excluded here because the tree already has them.
-const LISTENER_HARVEST = `(() => {
-  const all = document.querySelectorAll('*');
-  if (all.length > 10000) return { skipped: 'document has ' + all.length + ' nodes' };
-  const NATIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY','OPTION','LABEL']);
-  const out = [];
-  for (const el of all) {
-    if (NATIVE.has(el.tagName) || el.getAttribute('role')) continue;
-    let l; try { l = getEventListeners(el); } catch { break; }
-    if (l.click || l.mousedown || l.mouseup || l.pointerdown || l.pointerup) { out.push(el); if (out.length >= 100) break; }
-  }
-  return out;
-})()`;
-async function harvestListenerBids(tabId) {
+// Framework click handlers (React onClick, Vue @click) leave no trace in the DOM or the a11y tree.
+// DevTools' console helper getEventListeners is not reachable through chrome.debugger — it is a
+// frontend helper, not part of V8's command-line API — so this uses the CDP primitive behind it,
+// DOMDebugger.getEventListeners, one object at a time. Bounded by only asking about the role-less
+// elements read_page already parked as promotion candidates, and capped.
+const CLICKY_EVENTS = new Set(['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup']);
+async function harvestListenerBids(tabId, candidateBids) {
   const bids = new Set();
-  let r;
-  try { r = await cmd(tabId, 'Runtime.evaluate', { expression: LISTENER_HARVEST, includeCommandLineAPI: true, returnByValue: false }); } catch { return bids; }
-  const obj = r.result;
-  if (!obj || obj.type !== 'object' || obj.subtype !== 'array' || !obj.objectId) return bids;
-  try {
-    const { result: props } = await cmd(tabId, 'Runtime.getProperties', { objectId: obj.objectId, ownProperties: true });
-    const items = props.filter((p) => /^\d+$/.test(p.name) && p.value && p.value.objectId);
-    await Promise.all(items.map(async (p) => {
-      try { const { node } = await cmd(tabId, 'DOM.describeNode', { objectId: p.value.objectId }); if (node?.backendNodeId != null) bids.add(node.backendNodeId); } catch {}
-    }));
-  } catch {}
-  await cmd(tabId, 'Runtime.releaseObject', { objectId: obj.objectId }).catch(() => {});
+  const list = [...candidateBids].slice(0, 150);
+  await Promise.all(list.map(async (bid) => {
+    let objectId = null;
+    try {
+      objectId = (await cmd(tabId, 'DOM.resolveNode', { backendNodeId: bid })).object.objectId;
+      const { listeners } = await cmd(tabId, 'DOMDebugger.getEventListeners', { objectId, depth: 0 });
+      if ((listeners || []).some((l) => CLICKY_EVENTS.has(l.type))) bids.add(bid);
+    } catch {}
+    if (objectId) cmd(tabId, 'Runtime.releaseObject', { objectId }).catch(() => {});
+  }));
   return bids;
 }
 
@@ -312,7 +300,11 @@ const USER_RECORDER = `(() => {
     const r = roleOf(el), l = label(el); if (r && l) return { role: r, name: l };
     return { fragile: true, hint: tag + ' "' + l + '"' };
   };
-  const control = (el) => el.closest && (el.closest('button, a, [role=button], [role=link], [role=menuitem], [role=tab], [role=option], input, select, textarea, summary, label, [onclick]') || el);
+  const PROSE = new Set(['P','H1','H2','H3','H4','H5','H6','LI','UL','OL','MAIN','ARTICLE','SECTION','BODY','HTML','TD','TH','BLOCKQUOTE','PRE','CODE','FIGCAPTION','LEGEND','TIME','EM','STRONG','B','I','SMALL']);
+  // A framework-handled <div> shows no sign of being a control, so the fallback keeps it; a click
+  // that lands on prose or a layout container is the user reading, not acting, and is dropped.
+  const control = (el) => { if (!el || !el.closest) return null; const c = el.closest('button, a, [role=button], [role=link], [role=menuitem], [role=tab], [role=option], [role=checkbox], [role=radio], [role=switch], input, select, textarea, summary, label, [onclick], [tabindex]'); if (c) return c;
+    if (PROSE.has(el.tagName)) return null; try { if (getComputedStyle(el).cursor === 'pointer') return el; } catch {} return el.tagName === 'DIV' || el.tagName === 'SPAN' || el.tagName === 'IMG' || el.tagName === 'SVG' ? el : null; };
   const pending = new Map(); // element -> last value, flushed on change/blur
   const flush = (el) => { if (!pending.has(el)) return; const v = pending.get(el); pending.delete(el);
     send({ type: el.type === 'password' ? 'fill-secret' : 'fill', target: locator(el), label: label(el), ...(el.type === 'password' ? { field: el.name || el.id || 'password' } : { value: v }), t: Date.now() }); };
@@ -1396,10 +1388,7 @@ async function dispatch(method, p) {
         } catch {}
       }
       const interactOnly = p.mode === 'interact';
-      // Listener harvest is the expensive perception step, so it runs on full reads only — the
-      // first read of a page is always full — and is cached until the next navigation.
-      if (!s.ax || p.full || !s.listenerBids) s.listenerBids = await harvestListenerBids(p.tabId);
-      const listenerBids = s.listenerBids || new Set();
+
       // Identity is the DOM node (backendDOMNodeId within its frame session), not the position in
       // the tree. That is what makes both halves of this work: a ref stays valid for as long as its
       // element lives — so the model can act on an element it saw two reads ago — and "what changed
@@ -1487,6 +1476,10 @@ async function dispatch(method, p) {
         // walk keeps those out, and an element inside something already promoted is skipped so a
         // clickable card does not bring every child along with it. Capped: on a page where
         // everything is a pointer target this would otherwise undo the pruning win entirely.
+        // Listener harvest is the expensive perception step, so it runs on full reads only — the
+        // first read of a page is always full — and is cached until the next navigation.
+        if (!prev || p.full || !s.listenerBids) s.listenerBids = await harvestListenerBids(p.tabId, generics.map((n) => n.backendDOMNodeId));
+        const listenerBids = s.listenerBids || new Set();
         let promoted = 0;
         const promotedIds = new Set();
         const labelOf = (n) => {
