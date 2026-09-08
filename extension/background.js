@@ -906,7 +906,9 @@ async function resolveSelector(method, p) {
     const cands = await intentCandidates(p.tabId, p.intent);
     const top = cands[0], second = cands[1];
     // Take the intent only when it is unambiguous: a single hit, or a clear leader.
-    if (top && (!second || top.score >= second.score * 2)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
+    // A clear leader: half again the runner-up, or three points clear of it. "save the order"
+    // scores Save 9 to Delete 5 — a clear pick, and a 2x rule would have called that ambiguous.
+    if (top && (!second || top.score >= second.score * 1.5 || top.score - second.score >= 3)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
     const list = cands.slice(0, 5).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
     throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list || 'none'}. Pick one by ref.`);
   };
@@ -940,7 +942,9 @@ async function handle(method, p) {
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
-  const result = await dispatch(method, p);
+  let result = await dispatch(method, p);
+  // Say when the target came from a fallback: the caller asked for a selector and got the intent.
+  if (p && p.resolvedBy && result && typeof result === 'object' && !result.__image) result = { ...result, resolvedBy: p.resolvedBy, ...(p.note ? { note: p.note } : {}) };
   if (track && result && typeof result === 'object' && !result.__image) {
     try {
       const tab = await chrome.tabs.get(tabId);
@@ -1057,8 +1061,17 @@ async function dispatch(method, p) {
       await cmd(p.tabId, 'Runtime.evaluate', { expression: PERF_COLLECTOR }).catch(() => {}); // and for the current document
       await cmd(p.tabId, 'Tracing.start', { categories: TRACE_CATEGORIES.join(','), transferMode: 'ReturnAsStream', options: 'sampling-frequency=10000' });
       s.tracing = { startedAt: Date.now(), scriptId: identifier };
-      if (p.reload) { await cmd(p.tabId, 'Page.reload', { ignoreCache: !!p.ignoreCache }); }
-      return { ok: true, tracing: true, ...(p.reload ? { reloaded: true } : {}), note: 'Interact with the page if you want INP; then perf_trace {action:"stop"}.' };
+      let loaded = null;
+      if (p.reload) {
+        // Measuring a load means waiting for it. Return only once the load event has fired and the
+        // largest paint has had a moment to settle, so a stop immediately afterwards is meaningful.
+        const t0 = Date.now();
+        await cmd(p.tabId, 'Page.reload', { ignoreCache: !!p.ignoreCache });
+        for (let i = 0; i < 300; i++) { if ((s.lastLoadTs || 0) > t0) break; await new Promise((r) => setTimeout(r, 100)); }
+        loaded = (s.lastLoadTs || 0) > t0;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      return { ok: true, tracing: true, ...(p.reload ? { reloaded: true, loaded } : {}), note: (p.reload && !loaded ? 'load event not seen within 30s — metrics may be partial. ' : '') + 'Interact with the page if you want INP; then perf_trace {action:"stop"}.' };
     }
 
     case 'perfStop': {
