@@ -47,6 +47,20 @@ async function sweepOldBundles() {
   } catch { /* nothing to sweep yet */ }
 }
 
+// Heavy results go to disk on request and come back as a path plus a stub. The context window is
+// the wrong place for a 300-element tree the model will glance at once, or a screenshot it wants to
+// keep rather than look at — Read the file when needed, and the transcript carries a line, not a
+// payload. Same scratch root and sweep as bundled assets, so it never accumulates.
+const OFFLOAD_DIR = path.join(BUNDLE_ROOT, 'offload');
+async function offload(kind, data, ext) {
+  await sweepOldBundles();
+  await fsp.mkdir(OFFLOAD_DIR, { recursive: true });
+  const file = path.join(OFFLOAD_DIR, `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`);
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  await fsp.writeFile(file, buf);
+  return { path: file, bytes: buf.length };
+}
+
 const MAX_FRAME = 256 * 1024 * 1024; // sanity cap; a corrupt/misaligned prefix must not stall the leg
 function framer(onMsg) {
   let buf = Buffer.alloc(0);
@@ -212,12 +226,12 @@ function runMcpServer() {
     { name: 'tab_release', description: 'Detach from a tab and hand it back to the user (leaves it open).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'navigate', description: 'Navigate a controlled tab to a URL (skips reload if already there); waits for load by default so the next read is not racing it (waitUntil:"none" to skip).', inputSchema: { type: 'object', properties: { tabId: num, url: str, waitUntil: str }, required: ['tabId', 'url'] } },
     { name: 'reload', description: 'Reload a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
-    { name: 'read_page', description: 'THE way to see a page: accessibility tree of a controlled tab — role + name + a stable "ref" per interactable element. Refs stay valid across reads for as long as the element lives, so a ref you saw earlier still works. After the first read of a page this returns only the DELTA (added/changed/removed); unchanged elements are omitted and keep their refs — call it after every action, it is cheap. full:true forces the whole tree; screenshot:true also returns a picture (marked) for the same state when you need to SEE it, not just read it.', inputSchema: { type: 'object', properties: { tabId: num, full: { type: 'boolean' }, screenshot: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'read_page', description: 'THE way to see a page: accessibility tree of a controlled tab — role + name + a stable "ref" per interactable element. Refs stay valid across reads for as long as the element lives, so a ref you saw earlier still works. After the first read of a page this returns only the DELTA (added/changed/removed); unchanged elements are omitted and keep their refs — call it after every action, it is cheap. full:true forces the whole tree (add toFile:true to write it to disk and get a path + preview instead of the payload); screenshot:true also returns a picture (marked) for the same state when you need to SEE it, not just read it.', inputSchema: { type: 'object', properties: { tabId: num, toFile: { type: 'boolean' }, full: { type: 'boolean' }, screenshot: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_text', description: 'Visible innerText of a controlled tab (for reading prose once on the right page).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'dom_query', description: 'Run a CSS selector in a controlled tab; returns match count and a "ref" + basic attrs per match. Use to check existence/uniqueness or target by selector.', inputSchema: { type: 'object', properties: { tabId: num, selector: str, limit: num }, required: ['tabId', 'selector'] } },
     { name: 'find', description: "Keyword search over visible element roles/names (a11y tree); returns ranked candidate refs. Query with the element's label words, not visual descriptions.", inputSchema: { type: 'object', properties: { tabId: num, query: str }, required: ['tabId', 'query'] } },
     { name: 'find_text', description: 'Does a word/phrase appear ANYWHERE in the page text (incl. off-screen, not yet scrolled)? Returns a count + context snippets. Cheap — beats a scroll+read_text loop. Set regex:true for a regex query.', inputSchema: { type: 'object', properties: { tabId: num, query: str, regex: { type: 'boolean' }, limit: num }, required: ['tabId', 'query'] } },
-    { name: 'screenshot', description: 'PNG screenshot of a controlled tab. marks:true labels every interactable element with the SAME ref click{ref} takes (add boxes:true for per-mark geometry) — USE THIS whenever you want to act on what you can see, then click the badge you see rather than guessing a pixel. ref: just that element; fullPage:true: the whole scrollable page. The image is downscaled to vision limits, so the accompanying JSON reports the exact {scale, origin, space, imageSize, viewport, scroll} mapping: a pixel you read off the image is NOT a CSS pixel — pass it back as {x,y,space:"image"} and the bridge converts it.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, fullPage: { type: 'boolean' }, marks: { type: 'boolean' }, boxes: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'screenshot', description: 'PNG screenshot of a controlled tab. toFile:true writes the PNG to scratch disk and returns its path instead of the image (for keeping, not looking). marks:true labels every interactable element with the SAME ref click{ref} takes (add boxes:true for per-mark geometry) — USE THIS whenever you want to act on what you can see, then click the badge you see rather than guessing a pixel. ref: just that element; fullPage:true: the whole scrollable page. The image is downscaled to vision limits, so the accompanying JSON reports the exact {scale, origin, space, imageSize, viewport, scroll} mapping: a pixel you read off the image is NOT a CSS pixel — pass it back as {x,y,space:"image"} and the bridge converts it.', inputSchema: { type: 'object', properties: { tabId: num, toFile: { type: 'boolean' }, ref: str, fullPage: { type: 'boolean' }, marks: { type: 'boolean' }, boxes: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'probe_point', description: 'What is ACTUALLY at a coordinate? Returns the element there (tag, role, label, selector, box) plus a "ref" you can click — so a coordinate you guessed off a screenshot converts into a reliable semantic target instead of a blind retry. Pass space:"image" for a pixel read off the last screenshot. annotate:true also returns a picture with a crosshair on the probed point, which is how you SEE a mispositioned guess rather than infer it.', inputSchema: { type: 'object', properties: { tabId: num, x: num, y: num, space: str, annotate: { type: 'boolean' }, marks: { type: 'boolean' } }, required: ['tabId', 'x', 'y'] } },
     { name: 'read_console', description: 'Recent console messages / exceptions captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_network', description: 'Recent network requests (url, method, status) captured on a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
@@ -242,7 +256,7 @@ function runMcpServer() {
     { name: 'go_back', description: 'Navigate back in the tab history.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'go_forward', description: 'Navigate forward in the tab history.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'tab_close', description: 'Close a tab the AGENT opened (refuses tabs the agent did not open — use tab_release for the user’s own). Cleans up after multi-tab work.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
-    { name: 'network_body', description: 'Fetch a captured response body by requestId (from read_network). For reading API/JSON responses the page fetched.', inputSchema: { type: 'object', properties: { tabId: num, requestId: str, limit: num }, required: ['tabId', 'requestId'] } },
+    { name: 'network_body', description: 'Fetch a captured response body by requestId (from read_network). toFile:true writes it to disk and returns path + preview — use for anything big. For reading API/JSON responses the page fetched.', inputSchema: { type: 'object', properties: { tabId: num, toFile: { type: 'boolean' }, requestId: str, limit: num }, required: ['tabId', 'requestId'] } },
     { name: 'download_wait', description: 'After triggering a download, wait for it to finish and get its absolute path to Read in Claude Code. timeoutMs caps at 120s.', inputSchema: { type: 'object', properties: { timeoutMs: num }, required: [] } },
     { name: 'downloads_list', description: 'Recent downloads (id, url, filename, state) this session.', inputSchema: { type: 'object', properties: { limit: num } } },
     { name: 'act_batch', description: 'Run several actions in one round trip: actions=[{tool, args}] (fill/click/type_text/press_key/select_option/scroll/hover). Stops if a step navigates unexpectedly. Cuts round trips on multi-field forms.', inputSchema: { type: 'object', properties: { tabId: num, actions: { type: 'array', items: { type: 'object' } }, stopOnError: { type: 'boolean' } }, required: ['tabId', 'actions'] } },
@@ -271,6 +285,11 @@ function runMcpServer() {
     // trip. Two separate calls can straddle a page change and quietly disagree with each other.
     read_page: async (a) => {
       const ax = await callHost('readPage', a);
+      if (a.toFile && ax && ax.elements) {
+        const f = await offload('page', JSON.stringify(ax, null, 1), 'json');
+        const { elements, ...rest } = ax;
+        return { ...rest, ...f, offloaded: true, preview: elements.slice(0, 12), note: `${elements.length} elements written to ${f.path} — Read it for the full tree; refs in it are live.` };
+      }
       if (!a.screenshot) return ax;
       const shot = await callHost('screenshot', { tabId: a.tabId, marks: true });
       return { __image: shot.__image, mimeType: shot.mimeType, __meta: { page: ax, ...(shot.__meta || {}) } };
@@ -279,7 +298,12 @@ function runMcpServer() {
     dom_query: (a) => callHost('domQuery', a),
     find: (a) => callHost('find', a),
     find_text: (a) => callHost('findText', a),
-    screenshot: (a) => callHost('screenshot', a),
+    screenshot: async (a) => {
+      const r = await callHost('screenshot', a);
+      if (!a.toFile || !r || !r.__image) return r;
+      const f = await offload('shot', Buffer.from(r.__image, 'base64'), 'png');
+      return { ...f, offloaded: true, ...(r.__meta || {}), note: 'PNG written to disk, not returned inline — Read the path to view it.' };
+    },
     read_console: (a) => callHost('readConsole', a),
     read_network: (a) => callHost('readNetwork', a),
     click: (a) => callHost('click', a),
@@ -297,7 +321,17 @@ function runMcpServer() {
     go_back: (a) => callHost('goBack', a),
     go_forward: (a) => callHost('goForward', a),
     tab_close: (a) => callHost('closeAgentTab', a),
-    network_body: (a) => callHost('getNetworkBody', a),
+    network_body: async (a) => {
+      // On disk there is no reason to truncate — the whole point is to keep the payload out of
+      // context, not to lose it.
+      const r = await callHost('getNetworkBody', a.toFile ? { ...a, limit: 64 * 1024 * 1024 } : a);
+      if (!a.toFile || !r || r.body == null) return r;
+      const raw = r.base64Encoded ? Buffer.from(String(r.body), 'base64') : Buffer.from(String(r.body));
+      const ext = /json/i.test(r.contentType || '') ? 'json' : r.base64Encoded ? 'bin' : 'txt';
+      const f = await offload('body', raw, ext);
+      const { body, ...rest } = r;
+      return { ...rest, ...f, offloaded: true, preview: r.base64Encoded ? '(binary)' : String(r.body).slice(0, 300) };
+    },
     download_wait: (a) => callHost('waitDownload', a),
     downloads_list: (a) => callHost('listDownloads', a),
     credential_request: (a) => callHost('requestCredential', a),
