@@ -1068,6 +1068,26 @@ async function dispatch(method, p) {
     case 'readPage': {
       await need(p.tabId);
       const s = st(p.tabId);
+      if (p.mode === 'text') { const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.body?.innerText ?? ""', returnByValue: true }); return { url: (await chrome.tabs.get(p.tabId)).url, mode: 'text', text: r.result?.value ?? '' }; }
+      // `ignore` is remembered per tab and applied BEFORE the delta baseline. If it only filtered the
+      // output, the ignored region would still churn the baseline and everything in it would come
+      // back as "added" on the next read — the opposite of the point. Pass ignore:[] to clear.
+      if (Array.isArray(p.ignore)) s.axIgnore = p.ignore.map(String).filter(Boolean);
+      const ignoreSel = s.axIgnore || [];
+      const ignoredBids = new Set();
+      if (ignoreSel.length) {
+        try {
+          const { root } = await cmd(p.tabId, 'DOM.getDocument', { depth: 0 });
+          for (const sel of ignoreSel) {
+            const { nodeIds } = await cmd(p.tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: sel }).catch(() => ({ nodeIds: [] }));
+            for (const nodeId of nodeIds.slice(0, 50)) {
+              const d = await cmd(p.tabId, 'DOM.describeNode', { nodeId }).catch(() => null);
+              if (d?.node?.backendNodeId != null) ignoredBids.add(d.node.backendNodeId);
+            }
+          }
+        } catch {}
+      }
+      const interactOnly = p.mode === 'interact';
       // Identity is the DOM node (backendDOMNodeId within its frame session), not the position in
       // the tree. That is what makes both halves of this work: a ref stays valid for as long as its
       // element lives — so the model can act on an element it saw two reads ago — and "what changed
@@ -1098,6 +1118,13 @@ async function dispatch(method, p) {
           const name = (n.name?.value || '').trim();
           const interactive = INTERACTIVE.has(role);
           if (!interactive && !name) continue;
+          // interact mode: controls plus headings for orientation; prose and landmarks are noise here.
+          if (interactOnly && !interactive && role !== 'heading') continue;
+          if (ignoredBids.size) {
+            let up = n, hops = 0, hidden = false;
+            while (up && hops++ < 40) { if (up.backendDOMNodeId != null && ignoredBids.has(up.backendDOMNodeId)) { hidden = true; break; } up = byId.get(up.parentId); }
+            if (hidden) continue;
+          }
           // A control's label is also published as a StaticText child, so a button arrives as two
           // entries that mean the same thing — and the model has to pick, with only one of them
           // clickable. Keep the control.
@@ -1165,6 +1192,7 @@ async function dispatch(method, p) {
           const g = geo.nodes.get(n.backendDOMNodeId); if (!g) continue;
           const clickable = g.cursor === 'pointer' || 'onclick' in g.attrs || ('tabindex' in g.attrs && g.attrs.tabindex !== '-1');
           if (!clickable) continue;
+          if (ignoredBids.size) { let a = n, h = 0, hid = false; while (a && h++ < 40) { if (a.backendDOMNodeId != null && ignoredBids.has(a.backendDOMNodeId)) { hid = true; break; } a = mainById.get(a.parentId); } if (hid) continue; }
           let up = mainById.get(n.parentId), hops = 0, inside = false;
           while (up && hops++ < 8) {
             if (INTERACTIVE.has(up.role?.value) || promotedIds.has(up.nodeId)) { inside = true; break; }
@@ -1210,7 +1238,7 @@ async function dispatch(method, p) {
       s.ax = next;
 
       const url = (await chrome.tabs.get(p.tabId)).url;
-      const frames = s.frames.size ? { frames: s.frames.size } : {};
+      const frames = { ...(s.frames.size ? { frames: s.frames.size } : {}), ...(ignoreSel.length ? { ignoring: ignoreSel } : {}), ...(interactOnly ? { mode: 'interact' } : {}) };
       // An overlay is the single most common reason a click does nothing, and the a11y tree gives no
       // hint of it. Say it once, as a count, rather than flipping a flag on every buried element.
       const overlay = coveredCount ? { covered: coveredCount, hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {};
