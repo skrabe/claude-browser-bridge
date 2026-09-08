@@ -884,15 +884,12 @@ async function findCandidates(tabId, query) {
   return scored;
 }
 
-// Does an element's accessible label plausibly mean what the caller intended? Loose on purpose —
-// "Save" should satisfy "save the order" — but "Delete" must not satisfy "Save". Empty label: no
-// opinion.
-function labelAgrees(label, intent) {
-  const l = String(label || '').toLowerCase().trim(); if (!l) return true;
-  const i = String(intent || '').toLowerCase();
-  if (i.includes(l) || l.includes(i)) return true;
-  const words = i.split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
-  return words.some((w) => l.includes(w));
+// Rank the interactive elements an intent could mean. Controls first: a button's label is also
+// published as a StaticText, and letting the twin compete makes every intent look ambiguous.
+async function intentCandidates(tabId, intent) {
+  const all = await findCandidates(tabId, intent);
+  const controls = all.filter((c) => INTERACTIVE.has(c.role));
+  return controls.length ? controls : all;
 }
 
 // Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
@@ -906,7 +903,7 @@ async function resolveSelector(method, p) {
   await need(p.tabId);
   const s = st(p.tabId);
   const byIntent = async (why) => {
-    const cands = await findCandidates(p.tabId, p.intent);
+    const cands = await intentCandidates(p.tabId, p.intent);
     const top = cands[0], second = cands[1];
     // Take the intent only when it is unambiguous: a single hit, or a clear leader.
     if (top && (!second || top.score >= second.score * 2)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
@@ -923,11 +920,15 @@ async function resolveSelector(method, p) {
   if (nodeIds.length > 1) throw new Error(`selector ${JSON.stringify(p.selector)} matched ${nodeIds.length} elements — narrow it, or pick one with dom_query and act by ref`);
   const { node } = await cmd(p.tabId, 'DOM.describeNode', { nodeId: nodeIds[0] });
   if (p.intent) {
-    // The selector narrows; the intent confirms. A stale id that now points at a different control
-    // is exactly the case where acting anyway does damage.
-    let label = '';
-    try { const objectId = await objectFor(p.tabId, node.backendNodeId); const r = await cmd(p.tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: DESCRIBE_FN, returnByValue: true }); label = r.result?.value?.label || ''; } catch {}
-    if (!labelAgrees(label, p.intent)) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${label}", which does not look like ${JSON.stringify(p.intent)} — refusing. Re-target by ref from a fresh read_page.`);
+    // The selector narrows; the intent confirms. Confirmation means: among everything on the page
+    // the intent could mean, the selector's element ranks first. A shared word is not agreement —
+    // "save the order" overlaps "Delete order" on "order", and that is exactly the click that does
+    // damage when a stale id now points at the wrong control.
+    const cands = await intentCandidates(p.tabId, p.intent);
+    const mine = cands.find((c) => s.refs.get(c.ref)?.backendNodeId === node.backendNodeId);
+    const best = cands[0];
+    if (!mine) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to an element that does not match ${JSON.stringify(p.intent)} at all${best ? ` — the intent points at ${best.ref} ${best.role} "${best.name}"` : ''}. Refusing; re-target by ref from a fresh read_page.`);
+    if (best && best.score > mine.score) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${mine.name}", but ${JSON.stringify(p.intent)} points more strongly at ${best.ref} ${best.role} "${best.name}". Refusing; re-target by ref.`);
   }
   const ref = 's' + (++s.seq);
   s.refs.set(ref, { backendNodeId: node.backendNodeId, sessionId: undefined });
