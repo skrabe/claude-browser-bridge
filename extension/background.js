@@ -229,7 +229,7 @@ async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId
 // so on its own it will happily offer you a button that a cookie modal is covering. DOMSnapshot
 // answers all of that at once — bounds, paint order, attributes and the styles we need to tell a
 // real occluder from a transparent one — for the price of a single round trip.
-const OCCLUSION_STYLES = ['background-color', 'opacity'];
+const OCCLUSION_STYLES = ['background-color', 'opacity', 'cursor'];
 async function domSnapshotIndex(tabId, sessionId) {
   let snap;
   try {
@@ -259,6 +259,7 @@ async function domSnapshotIndex(tabId, sessionId) {
       const st = (layout.styles || [])[i] || [];
       const bg = str(st[0]) ?? '', op = str(st[1]) ?? '1';
       const opaque = !/^rgba\(.*,\s*0\)$/.test(bg) && bg !== 'transparent' && bg !== '' && parseFloat(op || '1') >= 0.8;
+      byNodeIndex.get(ni).cursor = str(st[2]);
       painted.push({ rect, paint, opaque });
     }
     for (let ni = 0; ni < bids.length; ni++) {
@@ -270,7 +271,7 @@ async function domSnapshotIndex(tabId, sessionId) {
         const name = str(a[k]); if (name) attrs[name] = str(a[k + 1]) ?? '';
       }
       const geo = byNodeIndex.get(ni);
-      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint });
+      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint, cursor: geo?.cursor });
     }
   }
   return { nodes: out, painted };
@@ -568,7 +569,8 @@ const KEYS = {
 
 const INTERACTIVE = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox',
   'radio', 'switch', 'slider', 'spinbutton', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
-  'tab', 'option', 'listbox', 'textarea', 'colorwell', 'date', 'datetime']);
+  'tab', 'option', 'listbox', 'textarea', 'colorwell', 'date', 'datetime',
+  'clickable']); // our own role for a role-less element that the page makes clickable (see readPage)
 
 // Icon-font glyphs surface as Private-Use-Area codepoints — meaningless to the model. Collapse to [icon].
 function cleanName(s) {
@@ -1072,13 +1074,23 @@ async function dispatch(method, p) {
       // since the last read" becomes a set operation instead of a guess.
       const cur = new Map();
       let anon = 0;
+      const generics = [];   // role-less main-frame nodes with a DOM node, to be promoted by geometry
+      let mainById = null;   // AX nodes of the main frame by id, for ancestor walks
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
         let nodes;
         try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
         const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+        if (!sessionId) mainById = byId;
         for (const n of nodes) {
           if (n.ignored) continue;
-          const role = n.role?.value; if (!role || role === 'none' || role === 'generic') continue;
+          const role = n.role?.value; if (!role) continue;
+          // A <div onclick> has the AX role "generic" and no accessible name, so the tree alone
+          // would drop it and the element could never be targeted. Park it; the geometry pass
+          // decides whether the page actually treats it as clickable.
+          if (role === 'none' || role === 'generic') {
+            if (n.backendDOMNodeId != null && !sessionId) generics.push(n);
+            continue;
+          }
           // Chrome's per-line layout boxes. They have no DOM node, so they can never be targeted,
           // and they restate the StaticText directly above them — on a text-heavy page that is a
           // third of the tree spent saying everything twice.
@@ -1130,6 +1142,44 @@ async function dispatch(method, p) {
           // Only worth saying about something you would actually try to click. A landmark or a
           // container being overlapped is normal page layout, not a problem to report.
           if (INTERACTIVE.has(e.role) && buried.has(e.__bid)) { e.covered = true; coveredCount++; }
+        }
+        // Promote role-less elements the page makes clickable: cursor:pointer, or an onclick /
+        // tabindex attribute. cursor inherits, so a span inside a link qualifies too — the ancestor
+        // walk keeps those out, and an element inside something already promoted is skipped so a
+        // clickable card does not bring every child along with it. Capped: on a page where
+        // everything is a pointer target this would otherwise undo the pruning win entirely.
+        let promoted = 0;
+        const promotedIds = new Set();
+        const labelOf = (n) => {
+          const out = []; const q = [...(n.childIds || [])]; let seen = 0;
+          while (q.length && seen++ < 16 && out.join(' ').length < 80) {
+            const c = mainById.get(q.shift()); if (!c) continue;
+            const r = c.role?.value;
+            if (r === 'StaticText') { const t = (c.name?.value || '').trim(); if (t) out.push(t); }
+            else if (r !== 'InlineTextBox') q.push(...(c.childIds || []));
+          }
+          return cleanName(out.join(' ')).slice(0, 80);
+        };
+        for (const n of generics) {
+          if (promoted >= 80) break;
+          const g = geo.nodes.get(n.backendDOMNodeId); if (!g) continue;
+          const clickable = g.cursor === 'pointer' || 'onclick' in g.attrs || ('tabindex' in g.attrs && g.attrs.tabindex !== '-1');
+          if (!clickable) continue;
+          let up = mainById.get(n.parentId), hops = 0, inside = false;
+          while (up && hops++ < 8) {
+            if (INTERACTIVE.has(up.role?.value) || promotedIds.has(up.nodeId)) { inside = true; break; }
+            up = mainById.get(up.parentId);
+          }
+          if (inside) continue;
+          const label = (g.attrs['aria-label'] || g.attrs.title || '').trim() || labelOf(n);
+          if (!label) continue; // nothing to name it by, and a nameless target is not usable
+          const key = '-:' + n.backendDOMNodeId;
+          if (cur.has(key)) continue;
+          promotedIds.add(n.nodeId);
+          promoted++;
+          const e = { role: 'clickable', name: label, __bid: n.backendDOMNodeId, __sid: undefined };
+          if (buried.has(e.__bid)) { e.covered = true; coveredCount++; }
+          cur.set(key, e);
         }
       }
 
