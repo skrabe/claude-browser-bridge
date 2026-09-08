@@ -230,6 +230,33 @@ async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId
 // answers all of that at once — bounds, paint order, attributes and the styles we need to tell a
 // real occluder from a transparent one — for the price of a single round trip.
 const OCCLUSION_STYLES = ['background-color', 'opacity', 'cursor'];
+
+// ---- emulation + performance ----
+// Network presets are Puppeteer's PredefinedNetworkConditions, which are what DevTools' throttling
+// menu uses: bytes/second and milliseconds.
+const NETWORK_PRESETS = {
+  'offline': { offline: true, downloadThroughput: 0, uploadThroughput: 0, latency: 0 },
+  'slow 3g': { offline: false, downloadThroughput: 50000, uploadThroughput: 50000, latency: 2000 },
+  'fast 3g': { offline: false, downloadThroughput: 180000, uploadThroughput: 84375, latency: 562.5 },
+  'slow 4g': { offline: false, downloadThroughput: 180000, uploadThroughput: 84375, latency: 562.5 },
+  'fast 4g': { offline: false, downloadThroughput: 450000, uploadThroughput: 337500, latency: 75 },
+  'none': { offline: false, downloadThroughput: -1, uploadThroughput: -1, latency: 0 },
+};
+// Installed before the document loads (Page.addScriptToEvaluateOnNewDocument), so a reload during
+// a trace still captures the metrics of that load. Buffered observers give the entries that fired
+// before the observer existed. INP is the worst interaction latency seen, which is the definition.
+const PERF_COLLECTOR = `(() => {
+  const P = window.__cbbPerf = { lcp: null, cls: 0, inp: null, fcp: null, longTasks: [], interactions: 0 };
+  const obs = (type, fn, extra) => { try { new PerformanceObserver((l) => l.getEntries().forEach(fn)).observe({ type, buffered: true, ...(extra || {}) }); } catch {} };
+  obs('largest-contentful-paint', (e) => { P.lcp = { ms: e.startTime, size: e.size, url: e.url || null, element: e.element ? (e.element.tagName + (e.element.id ? '#' + e.element.id : '')) : null }; });
+  obs('layout-shift', (e) => { if (!e.hadRecentInput) P.cls += e.value; });
+  obs('paint', (e) => { if (e.name === 'first-contentful-paint') P.fcp = e.startTime; });
+  obs('longtask', (e) => { if (P.longTasks.length < 50) P.longTasks.push({ start: Math.round(e.startTime), ms: Math.round(e.duration) }); });
+  obs('event', (e) => { if (e.interactionId) { P.interactions++; if (!P.inp || e.duration > P.inp.ms) P.inp = { ms: e.duration, type: e.name, target: e.target ? (e.target.tagName + (e.target.id ? '#' + e.target.id : '')) : null }; } }, { durationThreshold: 16 });
+})();`;
+const TRACE_CATEGORIES = ['-*', 'devtools.timeline', 'disabled-by-default-devtools.timeline', 'disabled-by-default-devtools.timeline.frame',
+  'toplevel', 'blink.console', 'blink.user_timing', 'latencyInfo', 'disabled-by-default-devtools.timeline.stack', 'disabled-by-default-v8.cpu_profiler',
+  'loading', 'v8.execute', 'disabled-by-default-lighthouse'];
 async function domSnapshotIndex(tabId, sessionId) {
   let snap;
   try {
@@ -974,6 +1001,105 @@ async function dispatch(method, p) {
     // say" — claiming a tab to read one number is disproportionate and visible to the user.
     // Cursor-paged so an observe-act-observe loop reads exactly the events its action caused:
     // read once to learn the cursor, act, then read from that cursor.
+    // Emulation is a set of independent overrides; each key given is applied, `reset:true` clears
+    // them all. Unlike screenshots, nothing here is undone for you at the end of a task.
+    case 'emulate': {
+      await need(p.tabId);
+      const applied = {};
+      if (p.reset) {
+        await cmd(p.tabId, 'Emulation.setCPUThrottlingRate', { rate: 1 }).catch(() => {});
+        await cmd(p.tabId, 'Network.emulateNetworkConditions', NETWORK_PRESETS.none).catch(() => {});
+        await cmd(p.tabId, 'Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: '' }] }).catch(() => {});
+        await cmd(p.tabId, 'Emulation.setUserAgentOverride', { userAgent: '' }).catch(() => {});
+        await cmd(p.tabId, 'Emulation.clearGeolocationOverride').catch(() => {});
+        await cmd(p.tabId, 'Network.setExtraHTTPHeaders', { headers: {} }).catch(() => {});
+        await cmd(p.tabId, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
+        await cmd(p.tabId, 'Emulation.setTouchEmulationEnabled', { enabled: false }).catch(() => {});
+        applied.reset = true;
+      }
+      if (p.cpuThrottlingRate != null) { await cmd(p.tabId, 'Emulation.setCPUThrottlingRate', { rate: Math.max(1, Number(p.cpuThrottlingRate)) }); applied.cpuThrottlingRate = Number(p.cpuThrottlingRate); }
+      if (p.networkConditions != null) {
+        const key = String(p.networkConditions).toLowerCase();
+        const preset = NETWORK_PRESETS[key]; if (!preset) throw new Error(`networkConditions must be one of: ${Object.keys(NETWORK_PRESETS).join(', ')}`);
+        await cmd(p.tabId, 'Network.emulateNetworkConditions', preset); applied.networkConditions = key;
+      }
+      if (p.colorScheme != null) { const v = String(p.colorScheme); await cmd(p.tabId, 'Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: v === 'auto' ? '' : v }] }); applied.colorScheme = v; }
+      if (p.userAgent != null) { await cmd(p.tabId, 'Emulation.setUserAgentOverride', { userAgent: String(p.userAgent) }); applied.userAgent = String(p.userAgent) || '(cleared)'; }
+      if (p.geolocation != null) {
+        if (p.geolocation === '' || p.geolocation === null) { await cmd(p.tabId, 'Emulation.clearGeolocationOverride'); applied.geolocation = '(cleared)'; }
+        else { const [lat, lng] = String(p.geolocation).split(',').map(Number); if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw new Error('geolocation must be "lat,lng"'); await cmd(p.tabId, 'Emulation.setGeolocationOverride', { latitude: lat, longitude: lng, accuracy: 10 }); applied.geolocation = { lat, lng }; }
+      }
+      if (p.extraHttpHeaders != null) { await cmd(p.tabId, 'Network.setExtraHTTPHeaders', { headers: p.extraHttpHeaders || {} }); applied.extraHttpHeaders = Object.keys(p.extraHttpHeaders || {}); }
+      if (p.viewport != null) {
+        if (!p.viewport) { await cmd(p.tabId, 'Emulation.clearDeviceMetricsOverride'); applied.viewport = '(cleared)'; }
+        else {
+          // "WxHxDPR[,mobile][,touch][,landscape]" — the same shorthand Chrome DevTools MCP takes.
+          const [dims, ...flags] = String(p.viewport).split(',').map((x) => x.trim().toLowerCase());
+          const [w, h, dpr] = dims.split('x').map(Number);
+          if (!(w > 0 && h > 0)) throw new Error('viewport must be "WIDTHxHEIGHT[xDPR][,mobile][,touch][,landscape]"');
+          const mobile = flags.includes('mobile'), landscape = flags.includes('landscape');
+          await cmd(p.tabId, 'Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: dpr > 0 ? dpr : 1, mobile, screenOrientation: landscape ? { type: 'landscapePrimary', angle: 90 } : { type: 'portraitPrimary', angle: 0 } });
+          if (flags.includes('touch') || mobile) await cmd(p.tabId, 'Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+          applied.viewport = { width: w, height: h, dpr: dpr > 0 ? dpr : 1, mobile, touch: flags.includes('touch') || mobile, landscape };
+        }
+      }
+      if (!Object.keys(applied).length) throw new Error('emulate: nothing to apply — pass cpuThrottlingRate / networkConditions / colorScheme / userAgent / geolocation / extraHttpHeaders / viewport, or reset:true');
+      return { ok: true, applied };
+    }
+
+    case 'perfStart': {
+      await need(p.tabId);
+      const s = st(p.tabId);
+      if (s.tracing) throw new Error('a trace is already running on this tab — stop it first');
+      // The collector must exist before the page we measure loads, or LCP/FCP of a reload are gone.
+      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: PERF_COLLECTOR });
+      await cmd(p.tabId, 'Runtime.evaluate', { expression: PERF_COLLECTOR }).catch(() => {}); // and for the current document
+      await cmd(p.tabId, 'Tracing.start', { categories: TRACE_CATEGORIES.join(','), transferMode: 'ReturnAsStream', options: 'sampling-frequency=10000' });
+      s.tracing = { startedAt: Date.now(), scriptId: identifier };
+      if (p.reload) { await cmd(p.tabId, 'Page.reload', { ignoreCache: !!p.ignoreCache }); }
+      return { ok: true, tracing: true, ...(p.reload ? { reloaded: true } : {}), note: 'Interact with the page if you want INP; then perf_trace {action:"stop"}.' };
+    }
+
+    case 'perfStop': {
+      await need(p.tabId);
+      const s = st(p.tabId);
+      if (!s.tracing) throw new Error('no trace is running on this tab');
+      // Collect the observer metrics first, while the document is still the one that was traced.
+      const m = await cmd(p.tabId, 'Runtime.evaluate', { returnByValue: true, expression: `(() => {
+        const P = window.__cbbPerf || {};
+        const nav = performance.getEntriesByType('navigation')[0];
+        const res = performance.getEntriesByType('resource').map((r) => ({ url: r.name, ms: Math.round(r.duration), bytes: r.transferSize || 0, type: r.initiatorType, renderBlocking: r.renderBlockingStatus === 'blocking' }))
+          .sort((a, b) => b.ms - a.ms);
+        return { ...P, url: location.href, navigation: nav ? { ttfb: Math.round(nav.responseStart), domContentLoaded: Math.round(nav.domContentLoadedEventEnd), load: Math.round(nav.loadEventEnd), transferBytes: nav.transferSize || 0, protocol: nav.nextHopProtocol } : null,
+          resources: { count: res.length, totalBytes: res.reduce((a, r) => a + r.bytes, 0), renderBlocking: res.filter((r) => r.renderBlocking).slice(0, 10), slowest: res.slice(0, 10) } };
+      })()` }).then((r) => r.result?.value || {}).catch(() => ({}));
+      await cmd(p.tabId, 'Tracing.end');
+      // Tracing.end is asynchronous; the data arrives as a Tracing.tracingComplete event carrying an
+      // IO stream handle. Wait for it via the event ring, then drain the stream.
+      let done = null;
+      for (let i = 0; i < 300 && !done; i++) {
+        done = (s.events || []).find((e) => e.method === 'Tracing.tracingComplete');
+        if (!done) await new Promise((r) => setTimeout(r, 100));
+      }
+      let trace = '', bytes = 0, truncated = false;
+      if (done && done.params && done.params.stream) {
+        const handle = done.params.stream;
+        for (;;) {
+          const chunk = await cmd(p.tabId, 'IO.read', { handle, size: 4 * 1024 * 1024 });
+          const part = chunk.base64Encoded ? atob(chunk.data) : chunk.data;
+          bytes += part.length;
+          if (bytes <= 96 * 1024 * 1024) trace += part; else truncated = true;
+          if (chunk.eof) break;
+        }
+        await cmd(p.tabId, 'IO.close', { handle }).catch(() => {});
+      }
+      if (s.tracing.scriptId) await cmd(p.tabId, 'Page.removeScriptToEvaluateOnNewDocument', { identifier: s.tracing.scriptId }).catch(() => {});
+      const durationMs = Date.now() - s.tracing.startedAt;
+      s.tracing = null;
+      s.events = (s.events || []).filter((e) => e.method !== 'Tracing.tracingComplete');
+      return { metrics: m, durationMs, trace, traceBytes: bytes, ...(truncated ? { truncated: true } : {}) };
+    }
+
     case 'cdpEvents': {
       await need(p.tabId);
       const s = st(p.tabId);

@@ -12,6 +12,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { runScript } from './browserapi.mjs';
 import { makeRecorder, runFlow, listFlows, loadFlow, deleteFlow, FLOW_DIR } from './flows.mjs';
+import zlib from 'node:zlib';
 
 const VERSION = '0.12.0';
 // Overridable so tests can run against their own socket instead of borrowing (and breaking) the
@@ -60,6 +61,27 @@ async function offload(kind, data, ext) {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   await fsp.writeFile(file, buf);
   return { path: file, bytes: buf.length };
+}
+
+// Turn raw metrics into the sentences a performance engineer would say first. Thresholds are the
+// Core Web Vitals "good" / "poor" boundaries; the rest are the usual first suspects.
+function perfInsights(m) {
+  const out = [];
+  const rate = (v, good, poor) => (v == null ? null : v <= good ? 'good' : v <= poor ? 'needs-improvement' : 'poor');
+  if (m.lcp) out.push({ name: 'LCPBreakdown', metric: 'LCP', value: Math.round(m.lcp.ms) + 'ms', rating: rate(m.lcp.ms, 2500, 4000), detail: `Largest contentful paint was ${m.lcp.element || 'an element'}${m.lcp.url ? ' (' + m.lcp.url.split('/').pop().slice(0, 60) + ')' : ''}.` + (m.lcp.ms > 2500 ? ' Over 2.5s: check whether the LCP resource is discoverable early (preload), render-blocking work before it, and server TTFB.' : '') });
+  if (m.cls != null) out.push({ name: 'CLSCulprits', metric: 'CLS', value: m.cls.toFixed(3), rating: rate(m.cls, 0.1, 0.25), detail: m.cls > 0.1 ? 'Layout is shifting after first paint — images/embeds without dimensions, late-injected banners, or web fonts swapping are the usual causes.' : 'Layout is stable.' });
+  if (m.inp) out.push({ name: 'INPBreakdown', metric: 'INP', value: Math.round(m.inp.ms) + 'ms', rating: rate(m.inp.ms, 200, 500), detail: `Slowest interaction: ${m.inp.type} on ${m.inp.target || 'an element'}${m.inp.ms > 200 ? ' — main thread was busy; look at long tasks around that moment.' : '.'}` });
+  else out.push({ name: 'INPBreakdown', metric: 'INP', value: null, detail: 'No interactions recorded during the trace — interact with the page while tracing to measure INP.' });
+  if (m.fcp != null) out.push({ name: 'FCP', metric: 'FCP', value: Math.round(m.fcp) + 'ms', rating: rate(m.fcp, 1800, 3000) });
+  if (m.navigation) {
+    out.push({ name: 'DocumentLatency', metric: 'TTFB', value: m.navigation.ttfb + 'ms', rating: rate(m.navigation.ttfb, 800, 1800), detail: `TTFB ${m.navigation.ttfb}ms over ${m.navigation.protocol || '?'}; DOMContentLoaded ${m.navigation.domContentLoaded}ms; load ${m.navigation.load}ms.` + (m.navigation.ttfb > 800 ? ' Slow server response — caching, CDN, or backend work before first byte.' : '') });
+  }
+  const lt = m.longTasks || [];
+  if (lt.length) { const total = lt.reduce((a, t) => a + t.ms, 0); out.push({ name: 'LongTasks', metric: 'long tasks', value: `${lt.length} tasks, ${total}ms total`, rating: total > 500 ? 'poor' : total > 200 ? 'needs-improvement' : 'good', detail: `Longest ${Math.max(...lt.map((t) => t.ms))}ms at ${lt.slice().sort((a, b) => b.ms - a.ms)[0].start}ms. Main-thread work over 50ms blocks input; split it or move it off the main thread.` }); }
+  const rb = m.resources?.renderBlocking || [];
+  if (rb.length) out.push({ name: 'RenderBlocking', metric: 'render-blocking resources', value: String(rb.length), rating: rb.length > 2 ? 'needs-improvement' : 'good', detail: rb.slice(0, 5).map((r) => `${r.url.split('/').pop().slice(0, 50)} (${r.ms}ms)`).join(', ') });
+  if (m.resources?.slowest?.length) out.push({ name: 'SlowestResources', metric: 'resources', value: `${m.resources.count} requests, ${Math.round((m.resources.totalBytes || 0) / 1024)}KB`, detail: m.resources.slowest.slice(0, 5).map((r) => `${r.url.split('/').pop().slice(0, 50) || r.url.slice(0, 50)} ${r.ms}ms ${Math.round(r.bytes / 1024)}KB`).join('; ') });
+  return out;
 }
 
 const MAX_FRAME = 256 * 1024 * 1024; // sanity cap; a corrupt/misaligned prefix must not stall the leg
@@ -145,7 +167,7 @@ function runMcpServer() {
   const SLOW = {
     getUserTabs: 10000, listDownloads: 10000, activateTab: 10000, release: 10000,
     navigate: 180000, reload: 180000, executeCdp: 120000, waitFor: 35000,
-    waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000,
+    waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000, perfStop: 120000, perfStart: 60000,
   };
   const DEFAULT_BUDGET = 60000;
 
@@ -219,6 +241,8 @@ function runMcpServer() {
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
     { name: 'browser_manage', description: "Organize the browser itself (not page content): windows, tab groups, pinning, and bookmarks. namespace + method + args mirror the Chrome extension APIs — tabs.query({url}) / tabs.update(id,{pinned}) / tabs.group({tabIds}) / tabGroups.update(id,{title,color}) / windows.update(id,{focused,width,height}) / bookmarks.search({query}) / bookmarks.create({title,url,parentId}) / bookmarks.move(id,{parentId}). Use namespace:'audit' to list the changes made this session with the state before each one, which is how you tell the user what changed or put it back. Search/query first and act on the ids you get; confirm before deleting a bookmark or closing the user's tabs.", inputSchema: { type: 'object', properties: { namespace: str, method: str, args: { type: 'array' } }, required: ['namespace'] } },
     { name: 'validate', description: "Prove an action landed, in ONE cheap call, before you report it done. Every check runs and returns its evidence, so a failure tells you what the page actually shows. Page-level: urlIncludes / urlMatches(regex) / titleIncludes / text (present, string or array) / textAbsent. Element-level (by ref or a unique CSS selector): visible / enabled / checked / value / textContains. All given checks must pass for ok:true. Deterministic — no model call — so it is the right thing to run after every submit instead of a second read_page.", inputSchema: { type: 'object', properties: { tabId: num, intent: str, ref: str, selector: str, urlIncludes: str, urlMatches: str, titleIncludes: str, text: {}, textAbsent: {}, visible: { type: 'boolean' }, enabled: { type: 'boolean' }, checked: { type: 'boolean' }, value: str, textContains: str }, required: ['tabId'] } },
+    { name: 'emulate', description: "Emulate conditions on a controlled tab — for testing, not for normal browsing. cpuThrottlingRate (4 = 4x slower) · networkConditions ('Offline'|'Slow 3G'|'Fast 3G'|'Slow 4G'|'Fast 4G'|'none') · colorScheme ('dark'|'light'|'auto') · userAgent (string; '' clears) · geolocation ('lat,lng'; '' clears) · extraHttpHeaders ({}) · viewport ('390x844x3,mobile,touch' or '' to clear). Each given key is applied; reset:true clears everything. Nothing is undone for you — reset when done.", inputSchema: { type: 'object', properties: { tabId: num, cpuThrottlingRate: num, networkConditions: str, colorScheme: str, userAgent: str, geolocation: str, extraHttpHeaders: { type: 'object' }, viewport: str, reset: { type: 'boolean' } }, required: ['tabId'] } },
+    { name: 'perf_trace', description: "Why is this page slow? action:'start' {reload:true} begins a trace and reloads so the load is measured (interact with the page afterwards if you want INP); action:'stop' returns Core Web Vitals (LCP, CLS, INP, FCP, TTFB) each rated good/needs-improvement/poor, long tasks, render-blocking and slowest resources, and NAMED insights with what to do about each — plus the raw trace written to a .json.gz you can open in DevTools or Perfetto. Combine with emulate for 'on a slow phone'.", inputSchema: { type: 'object', properties: { tabId: num, action: str, reload: { type: 'boolean' }, ignoreCache: { type: 'boolean' } }, required: ['tabId', 'action'] } },
     { name: 'flow_record', description: "Compile what you are about to do into a REPLAYABLE flow, so next time it runs without you. action:'start' {name} — then work normally with the atomic tools (click/fill/press_key/navigate/wait_for/validate…); every state-changing call is captured with a fingerprint of the page it acted on, refs are converted to durable locators, and reads are NOT recorded (on replay they vanish — that is the point). action:'stop' {variables:{email:'ada@x.com'}} replaces those literal values with %email% so one flow serves every value; action:'cancel' discards. Use secret:'NAME' for passwords while recording — the name is stored, never the value. act_batch is not recorded; use atomic tools while recording.", inputSchema: { type: 'object', properties: { action: str, name: str, description: str, tabId: num, variables: { type: 'object' } }, required: ['action'] } },
     { name: 'flow_run', description: "Replay a recorded flow in one call — no model turns per step. variables:{} fills the %placeholders%. Each step first compares the page against the fingerprint it was recorded on; a changed page with a still-unique target proceeds and is reported as drift (cacheStatus HIT-DRIFTED), a target that no longer resolves stops the flow with the failing step index and what the page shows, so you heal that ONE step by hand and re-record. cacheStatus: HIT | HIT-DRIFTED | STALE | FAILED. stopOnDrift:true to refuse any drift.", inputSchema: { type: 'object', properties: { name: str, tabId: num, variables: { type: 'object' }, stopOnDrift: { type: 'boolean' } }, required: ['name', 'tabId'] } },
     { name: 'flows', description: "Saved flows on disk. action:'list' (name, origin, steps, variables, runs, last status) · 'show' {name} (the full step list, for editing) · 'delete' {name}. Flow files are plain JSON — portable, and can be committed alongside a project.", inputSchema: { type: 'object', properties: { action: str, name: str }, required: ['action'] } },
@@ -277,6 +301,19 @@ function runMcpServer() {
     tabs_list: (a) => callHost('getUserTabs', {}),
     browser_manage: (a) => callHost('manage', a),
     validate: (a) => callHost('validate', a),
+    emulate: (a) => callHost('emulate', a),
+    perf_trace: async (a) => {
+      const act = String(a.action || '');
+      if (act === 'start') return callHost('perfStart', a);
+      if (act !== 'stop') throw new Error('perf_trace action must be start or stop');
+      const r = await callHost('perfStop', a);
+      let file = null;
+      if (r.trace) {
+        try { file = await offload('trace', zlib.gzipSync(Buffer.from(r.trace, 'latin1')), 'json.gz'); } catch (e) { file = { error: 'could not write trace: ' + e.message }; }
+      }
+      const { trace, ...rest } = r;
+      return { ...rest, insights: perfInsights(r.metrics || {}), trace: file, ...(r.truncated ? { note: 'trace exceeded 96MB and was truncated on disk; metrics are unaffected' } : {}) };
+    },
     flow_record: async (a) => {
       const act = String(a.action || '');
       if (act === 'start') return recorder.start(a);
