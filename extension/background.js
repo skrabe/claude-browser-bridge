@@ -33,29 +33,71 @@ function st(tabId) {
   if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set(), frames: new Map(), ax: null }; state.set(tabId, s); }
   return s;
 }
-// Which tabs the agent opened, persisted in session storage.
+// Which tabs the agent opened.
 //
-// This cannot live only in `state`: an MV3 service worker is evicted or reloaded routinely, and when
-// it comes back that map is empty — so tab_close would refuse to close a tab the agent itself had
-// opened, orphaning it in the user's window with no way to clean up. storage.session survives worker
-// restarts and is cleared when the browser closes, which is exactly the right lifetime.
+// This cannot live only in `state`: an MV3 service worker is evicted routinely, and when it comes
+// back that map is empty — so tab_close would refuse to close a tab the agent itself had opened,
+// orphaning it in the user's window with no way to clean up.
+//
+// storage.session was the obvious home, but it is also cleared by an extension *reload*, which
+// orphans every agent tab open at that moment. storage.local survives a reload — the catch being
+// that Chrome reuses tab ids across browser restarts, so a stale record could name one of the
+// user's tabs. Two independent fences make that safe, and a stale id would have to beat both:
+//
+//   1. A watermark that only a browser start moves. onStartup fires on browser start but NOT on an
+//      extension reload, which is exactly the distinction we need; records older than it are ignored
+//      (and pruned outright).
+//   2. A TTL, so even if onStartup never fires on some build, a record cannot stay dangerous
+//      indefinitely. Expiry only ever makes tab_close refuse — it fails in the safe direction.
 const AGENT_TABS_KEY = 'cbb.agentTabs';
+const RUN_MARK_KEY = 'cbb.browserRunStartedAt';
+const AGENT_TAB_TTL_MS = 24 * 60 * 60 * 1000;
+
+let runMark = null;
+async function browserRunMark() {
+  if (runMark != null) return runMark;
+  try {
+    const v = (await chrome.storage.local.get(RUN_MARK_KEY))[RUN_MARK_KEY];
+    if (typeof v === 'number') return (runMark = v);
+    runMark = Date.now(); // first run ever — start the fence here
+    await chrome.storage.local.set({ [RUN_MARK_KEY]: runMark });
+    return runMark;
+  } catch { return (runMark = Date.now()); }
+}
+// A new browser run: every id from the previous one is now meaningless and possibly reassigned.
+async function startBrowserRun() {
+  runMark = Date.now();
+  try { await chrome.storage.local.set({ [RUN_MARK_KEY]: runMark, [AGENT_TABS_KEY]: [] }); } catch {}
+}
+async function readAgentTabs() {
+  try {
+    const mark = await browserRunMark();
+    const floor = Math.max(mark, Date.now() - AGENT_TAB_TTL_MS);
+    const cur = (await chrome.storage.local.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || [];
+    return cur.filter((r) => r && typeof r.id === 'number' && (r.at || 0) >= floor);
+  } catch { return []; }
+}
 async function markAgentTab(tabId) {
   st(tabId).createdByAgent = true;
   try {
-    const cur = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || [];
-    if (!cur.includes(tabId)) await chrome.storage.session.set({ [AGENT_TABS_KEY]: [...cur, tabId] });
+    const cur = await readAgentTabs();
+    if (!cur.some((r) => r.id === tabId)) {
+      await chrome.storage.local.set({ [AGENT_TABS_KEY]: [...cur, { id: tabId, at: Date.now() }] });
+    }
   } catch {}
 }
 async function isAgentTab(tabId) {
   if (state.get(tabId)?.createdByAgent) return true;
-  try { return ((await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || []).includes(tabId); }
-  catch { return false; }
+  return (await readAgentTabs()).some((r) => r.id === tabId);
 }
 async function forgetAgentTab(tabId) {
+  // Both halves, or "forgetting" a tab leaves the in-memory flag asserting ownership that storage
+  // no longer backs. Today every caller also drops the tab's state, which hides that; a future one
+  // might not.
+  const s = state.get(tabId); if (s) s.createdByAgent = false;
   try {
-    const cur = (await chrome.storage.session.get(AGENT_TABS_KEY))[AGENT_TABS_KEY] || [];
-    if (cur.includes(tabId)) await chrome.storage.session.set({ [AGENT_TABS_KEY]: cur.filter((t) => t !== tabId) });
+    const cur = await readAgentTabs();
+    if (cur.some((r) => r.id === tabId)) await chrome.storage.local.set({ [AGENT_TABS_KEY]: cur.filter((r) => r.id !== tabId) });
   } catch {}
 }
 // Don't let the set grow stale as the user closes tabs themselves.
@@ -110,7 +152,10 @@ connect();
 
 // Self-heal: MV3 service workers go dormant, so a failed/dropped native-messaging port can get
 // stuck. Reconnect on startup/install and via a periodic alarm that wakes the worker.
-try { chrome.runtime.onStartup.addListener(() => connect()); } catch {}
+// onStartup means a new browser run, so it also retires the previous run's agent-tab records —
+// their ids may already have been handed to tabs the user opened. An extension reload deliberately
+// does NOT come through here, which is what lets those records survive one.
+try { chrome.runtime.onStartup.addListener(() => { startBrowserRun(); connect(); }); } catch {}
 try { chrome.runtime.onInstalled.addListener(() => connect()); } catch {}
 try {
   chrome.alarms.create('cbb-reconnect', { periodInMinutes: 0.5 });
