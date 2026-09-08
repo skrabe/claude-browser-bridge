@@ -1012,12 +1012,28 @@ async function dispatch(method, p) {
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
         let nodes;
         try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+        const byId = new Map(nodes.map((n) => [n.nodeId, n]));
         for (const n of nodes) {
           if (n.ignored) continue;
           const role = n.role?.value; if (!role || role === 'none' || role === 'generic') continue;
+          // Chrome's per-line layout boxes. They have no DOM node, so they can never be targeted,
+          // and they restate the StaticText directly above them — on a text-heavy page that is a
+          // third of the tree spent saying everything twice.
+          if (role === 'InlineTextBox') continue;
           const name = (n.name?.value || '').trim();
           const interactive = INTERACTIVE.has(role);
           if (!interactive && !name) continue;
+          // A control's label is also published as a StaticText child, so a button arrives as two
+          // entries that mean the same thing — and the model has to pick, with only one of them
+          // clickable. Keep the control.
+          if (role === 'StaticText' && name) {
+            let up = byId.get(n.parentId), hops = 0, dup = false;
+            while (up && hops++ < 4) {
+              if (INTERACTIVE.has(up.role?.value) && (up.name?.value || '').trim() === name) { dup = true; break; }
+              up = byId.get(up.parentId);
+            }
+            if (dup) continue;
+          }
           const bid = n.backendDOMNodeId;
           // A node with no DOM backing can never be targeted, so it gets no ref and an identity that
           // is only good for this read — it shows up as page structure, never as a click target.
