@@ -12,7 +12,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { runScript } from './browserapi.mjs';
 
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 // Overridable so tests can run against their own socket instead of borrowing (and breaking) the
 // live one — a unix socket is bound to its path, so moving the real one aside is not reversible.
 const SOCK = process.env.CBB_SOCK || `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
@@ -202,13 +202,15 @@ function runMcpServer() {
 
   const TOOLS = [
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
+    { name: 'browser_manage', description: "Organize the browser itself (not page content): windows, tab groups, pinning, and bookmarks. namespace + method + args mirror the Chrome extension APIs — tabs.query({url}) / tabs.update(id,{pinned}) / tabs.group({tabIds}) / tabGroups.update(id,{title,color}) / windows.update(id,{focused,width,height}) / bookmarks.search({query}) / bookmarks.create({title,url,parentId}) / bookmarks.move(id,{parentId}). Use namespace:'audit' to list the changes made this session with the state before each one, which is how you tell the user what changed or put it back. Search/query first and act on the ids you get; confirm before deleting a bookmark or closing the user's tabs.", inputSchema: { type: 'object', properties: { namespace: str, method: str, args: { type: 'array' } }, required: ['namespace'] } },
+    { name: 'peek_tab', description: "Read one of the user's open tabs WITHOUT taking it over: returns title, url and visible text. No debugger attach, no 'being debugged' banner, nothing taken from the user — so this is the right way to answer 'what does that other tab say'. Claim the tab only when you need to ACT on it.", inputSchema: { type: 'object', properties: { tabId: num, limit: num }, required: ['tabId'] } },
     { name: 'tab_claim', description: 'Take control of an EXISTING tab in place by id (from tabs_list). Attaches the debugger; does not open a new tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'tab_create', description: 'Open a new tab and take control of it. Pass group:"<topic>" to place it in a topic tab group — reuses an existing group of that name, else starts one. Group the tabs you open by topic.', inputSchema: { type: 'object', properties: { url: str, active: { type: 'boolean' }, group: str } } },
     { name: 'tab_activate', description: 'Bring a controlled tab to the front (only when the user should watch).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'tab_release', description: 'Detach from a tab and hand it back to the user (leaves it open).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'navigate', description: 'Navigate a controlled tab to a URL (skips reload if already there); waits for load by default so the next read is not racing it (waitUntil:"none" to skip).', inputSchema: { type: 'object', properties: { tabId: num, url: str, waitUntil: str }, required: ['tabId', 'url'] } },
     { name: 'reload', description: 'Reload a controlled tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
-    { name: 'read_page', description: 'Accessibility tree of a controlled tab: role + name + a stable "ref" per interactable element. Primary way to see structure and target elements.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
+    { name: 'read_page', description: 'THE way to see a page: accessibility tree of a controlled tab — role + name + a stable "ref" per interactable element. Refs stay valid across reads for as long as the element lives, so a ref you saw earlier still works. After the first read of a page this returns only the DELTA (added/changed/removed); unchanged elements are omitted and keep their refs — call it after every action, it is cheap. full:true forces the whole tree; screenshot:true also returns a picture (marked) for the same state when you need to SEE it, not just read it.', inputSchema: { type: 'object', properties: { tabId: num, full: { type: 'boolean' }, screenshot: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'read_text', description: 'Visible innerText of a controlled tab (for reading prose once on the right page).', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
     { name: 'dom_query', description: 'Run a CSS selector in a controlled tab; returns match count and a "ref" + basic attrs per match. Use to check existence/uniqueness or target by selector.', inputSchema: { type: 'object', properties: { tabId: num, selector: str, limit: num }, required: ['tabId', 'selector'] } },
     { name: 'find', description: "Keyword search over visible element roles/names (a11y tree); returns ranked candidate refs. Query with the element's label words, not visual descriptions.", inputSchema: { type: 'object', properties: { tabId: num, query: str }, required: ['tabId', 'query'] } },
@@ -223,6 +225,7 @@ function runMcpServer() {
     { name: 'press_key', description: 'Press a key/chord on the focused element (Enter, Tab, Escape, Arrow*, Meta+A). A single printable key also types its character.', inputSchema: { type: 'object', properties: { tabId: num, key: str }, required: ['tabId', 'key'] } },
     { name: 'scroll', description: 'Scroll a ref into view, or scroll by {dx,dy} at {x,y} (space:"image"|"page" as for click).', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, dx: num, dy: num, space: str }, required: ['tabId'] } },
     { name: 'hover', description: 'Move the pointer over an element by ref (or {x,y}) to reveal hover-only controls (card CTA, hover menu), then act on what appears.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, x: num, y: num, space: str }, required: ['tabId'] } },
+    { name: 'select_text', description: 'Put the caret or a selection at an exact spot inside existing text (input, textarea, or contenteditable) by ref — for editing part of a value instead of clearing it. text is the substring; prefix/suffix pin which occurrence when it repeats; selectionType "select" (default) selects it, "before"/"after" just place the caret there. Then type_text/press_key act at that point.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, text: str, prefix: str, suffix: str, selectionType: str }, required: ['tabId', 'ref', 'text'] } },
     { name: 'select_option', description: 'Choose a <select> option by value, by ref.', inputSchema: { type: 'object', properties: { tabId: num, ref: str, value: str }, required: ['tabId', 'ref', 'value'] } },
     { name: 'drag', description: 'Drag from one ref/point to another (sliders, reordering). space:"image"|"page" applies to both endpoints.', inputSchema: { type: 'object', properties: { tabId: num, fromRef: str, toRef: str, fromX: num, fromY: num, toX: num, toY: num, space: str }, required: ['tabId'] } },
     { name: 'clipboard_read', description: "Read the browser clipboard as text (e.g. after the page's own 'Copy' button).", inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
@@ -244,6 +247,7 @@ function runMcpServer() {
     { name: 'credential_request', description: 'Sign in without seeing the secret: the USER types credentials into a secure popup Claude never sees; the bridge fills them into the page by selector and returns only a status (submitted/declined/origin_changed/locator_invalid/expired/submission_failed). Pass field SELECTORS + metadata, NEVER values. Use this instead of ever asking for a password/OTP in chat. fields:[{id,label,type,selector}]; optional submit:{selector,action:"click"|"enter"}.', inputSchema: { type: 'object', properties: { tabId: num, reason: str, fields: { type: 'array', items: { type: 'object' } }, submit: { type: 'object' }, timeoutMs: num }, required: ['tabId', 'fields'] } },
     { name: 'run', description: 'THE fast path — run a JS automation script in ONE call and compose many steps with real control flow (loops, conditionals), instead of many atomic tool calls. Injected: `page` (Playwright-shaped, auto-waiting: page.getByRole/getByText/getByLabel/getByPlaceholder/getByTestId(id)/locator(css); on a locator .click()/.dblclick()/.fill(v) (or .fill({secret:"NAME"}) for a registered secret)/.type(v)/.press("Enter")/.check()/.uncheck()/.selectOption(v)/.hover()/.focus(), and .count()/.first()/.nth(i)/.filter({hasText})/.waitFor({state})/.textContent()/.innerText()/.getAttribute(n)/.inputValue()/.isVisible()/.isChecked()/.boundingBox(); plus locator .setInputFiles(paths) (upload) and .dragTo(target); plus page.evaluate(fn,arg), page.goto(url)/url()/title()/reload()/goBack()/waitForLoadState({state})/waitForURL(p)/expectNavigation(fn,{url})/domSnapshot({selector,exclude,boxes})/screenshot({fullPage})/pdf({path})/export({format})/setViewport({width,height})/resetViewport()/getJsDialog()/consoleLogs()/waitForDownload()/elementFromPoint({x,y})/drag(from,to)/mouse.click(x,y)/mouse.wheel(x,y,dx,dy), and page.dom_cua.get_visible_dom()/click({node_id})/type({text})/scroll({x,y})); `browser` (openTabs()/claimTab(t)/newTab(url)/readUrls([urls])/history({query})); plus `log(...)` and `sleep(ms)`. Semantic locators pierce same-origin iframes + shadow DOM and reach cross-origin frames; clicks are real trusted mouse events. BULK READS: never loop nth(i)+innerText/getAttribute to scrape a list — do it in ONE page.evaluate that projects the whole array (per-element reads each cross the browser boundary). `return` any value to get it back. Use this for multi-step flows (forms, navigation, extraction); reach for atomic tools only for one-off actions.', inputSchema: { type: 'object', properties: { tabId: num, script: str, timeoutMs: num }, required: ['tabId', 'script'] } },
     { name: 'cdp', description: 'Escape hatch: raw Chrome DevTools Protocol command on a controlled tab. method e.g. "Runtime.evaluate", params per CDP.', inputSchema: { type: 'object', properties: { tabId: num, method: str, params: { type: 'object' } }, required: ['tabId', 'method'] } },
+    { name: 'cdp_events', description: "Read CDP events the tab has emitted, for the protocol surface read_console/read_network don't cover (lifecycle, CSS, Animation, a domain you enabled yourself via `cdp`). To attribute events to an action: call once to get `cursor`, do the action, then call again with afterSequence:<cursor>. Filter with methods:[...]; keep paging while hasMore is true. truncated:true means older events aged out of the buffer.", inputSchema: { type: 'object', properties: { tabId: num, afterSequence: num, methods: { type: 'array', items: str }, limit: num, clear: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'secret_set', description: 'Register a named secret (e.g. a password/OTP the user gave you) so you can fill it by NAME without re-stating the literal. Once set, its value is (a) fillable in run via `.fill({secret:"NAME"})` or in atomic fill via {secret:"NAME"}, and (b) auto-REDACTED from every tool result — so a page echo, network body, or console line can never leak it back. The value is not returned. Prefer this over pasting a secret into script text.', inputSchema: { type: 'object', properties: { name: str, value: str }, required: ['name', 'value'] } },
     { name: 'secret_list', description: 'List the NAMES of registered secrets (never values).', inputSchema: { type: 'object', properties: {} } },
     { name: 'secret_clear', description: 'Forget a registered secret by name, or all of them if no name is given.', inputSchema: { type: 'object', properties: { name: str } } },
@@ -251,13 +255,22 @@ function runMcpServer() {
 
   const MAP = {
     tabs_list: (a) => callHost('getUserTabs', {}),
+    browser_manage: (a) => callHost('manage', a),
+    peek_tab: (a) => callHost('peekTab', a),
     tab_claim: (a) => callHost('claimTab', a),
     tab_create: (a) => callHost('createTab', a),
     tab_activate: (a) => callHost('activateTab', a),
     tab_release: (a) => callHost('release', a),
     navigate: (a) => callHost('navigate', a),
     reload: (a) => callHost('reload', a),
-    read_page: (a) => callHost('readPage', a),
+    // screenshot:true is the "both" mode — structure and picture for the SAME state in one round
+    // trip. Two separate calls can straddle a page change and quietly disagree with each other.
+    read_page: async (a) => {
+      const ax = await callHost('readPage', a);
+      if (!a.screenshot) return ax;
+      const shot = await callHost('screenshot', { tabId: a.tabId, marks: true });
+      return { __image: shot.__image, mimeType: shot.mimeType, __meta: { page: ax, ...(shot.__meta || {}) } };
+    },
     read_text: (a) => callHost('readText', a),
     dom_query: (a) => callHost('domQuery', a),
     find: (a) => callHost('find', a),
@@ -271,6 +284,7 @@ function runMcpServer() {
     press_key: (a) => callHost('pressKey', a),
     scroll: (a) => callHost('scroll', a),
     hover: (a) => callHost('hover', a),
+    select_text: (a) => callHost('selectText', a),
     select_option: (a) => callHost('selectOption', a),
     drag: (a) => callHost('drag', a),
     upload_file: (a) => callHost('setFiles', a),
@@ -317,6 +331,7 @@ function runMcpServer() {
     },
     webmcp_tools: (a) => callHost('webmcpTools', a),
     webmcp_call: (a) => callHost('webmcpCall', a),
+    cdp_events: (a) => callHost('cdpEvents', a),
     secret_set: (a) => { secrets.set(String(a.name), String(a.value ?? '')); return { ok: true, name: a.name }; },
     secret_list: () => ({ names: [...secrets.keys()] }),
     secret_clear: (a) => { if (a && a.name) secrets.delete(String(a.name)); else secrets.clear(); return { ok: true }; },

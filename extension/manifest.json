@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Better Claude in Chrome",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Let Claude Code drive your real, logged-in browser tabs over the Chrome DevTools Protocol \u2014 a fuller, owned take on Claude in Chrome.",
   "background": {
     "service_worker": "background.js"
@@ -15,7 +15,8 @@
     "storage",
     "alarms",
     "downloads",
-    "history"
+    "history",
+    "bookmarks"
   ],
   "host_permissions": [
     "<all_urls>"
