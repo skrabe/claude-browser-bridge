@@ -262,6 +262,16 @@ the verification you need.
     banner) and cannot be clicked until it is dismissed — the result also carries a count. This is
     the most common reason a click silently does nothing, so deal with the overlay first rather than
     retrying the buried control.
+  - Role **`clickable`** is our own: a role-less element (`<div onclick>`, a card with
+    `cursor:pointer`) the page makes clickable. It has a ref and clicks like anything else; it's
+    named from its `aria-label`/`title`/text.
+  - **Scope big app shells:** `ignore:["nav","[role=banner]",".ads"]` drops those subtrees from
+    the tree *and* the delta baseline, so a live badge in the nav stops churning every read. It
+    sticks per tab until `ignore:[]`. `mode:"interact"` = controls + headings only; `mode:"text"`
+    = prose.
+  - **`full:true` + `toFile:true`** writes the tree to disk and returns a path + 12-element preview
+    — for the rare time you need the whole thing on a huge page, without paying for it in context.
+    `screenshot` and `network_body` take `toFile` too (keep a PNG; pull a 2MB JSON body).
   - **`unchanged:true` is a finding, not a retry cue.** It means your last action changed nothing.
     Don't fire the same action again and don't fall to coordinates — look for the reason: a modal or
     cookie banner over the target, a disabled control, a still-loading page (`wait_for`), or the
@@ -360,7 +370,10 @@ already know it; matching more than one element is an error, not a licence to ta
   didn't land.
 - **Acting is not finishing.** A click that returned `ok` is an attempt, not a result. Before you
   report a task done, the observed state has to *show* it — the row is gone, the toast says saved,
-  the URL carries the id. If you never saw that, say what you did and what you couldn't confirm.
+  the URL carries the id. **`validate` is the instrument**: one deterministic call that checks
+  `urlIncludes` / `text` / `textAbsent` / an element's `visible` / `checked` / `value` and returns
+  evidence for each — after every submit, run `validate`, not a second `read_page`. If a check
+  fails it tells you what the page actually shows, which is usually the next step.
 - **Search-engine fallback is one focused query.** If you drop to a web search from inside a page,
   run one query, open the strongest result — don't loop rewriting the query.
 - **Reuse, don't refetch.** Keep the latest snapshot for building targets; refresh only after a
@@ -396,6 +409,44 @@ already know it; matching more than one element is an error, not a licence to ta
   fresh snapshot, or to `screenshot({marks:true})` and click the badge on the thing you can see. A
   single opaque `canvas` where you expect many rows means the content is painted, not in the DOM →
   go visual, and use `probe_point` to name what's under a point before acting on it.
+
+---
+
+# Flows — do it once, replay it forever
+
+A flow is a sequence of your own successful actions, compiled so it replays **without you in the
+loop**. Stagehand's numbers for the same idea: ~2× faster, ~30% cheaper on repeat work.
+
+**Record, don't write.** `flow_record {action:"start", name}` → then just do the task with the atomic
+tools → `flow_record {action:"stop", variables:{email:"ada@x.com"}}`. While recording:
+- every state-changing call (`click`/`fill`/`select_option`/`press_key`/`navigate`/`wait_for`/
+  `validate`…) is captured with a fingerprint of the page it acted on;
+- **reads are not recorded** — on replay the observe steps vanish, which is the whole point;
+- a ref you used is converted to a durable locator on the spot (via `generate_locator`); an element
+  with no unique locator is recorded as fragile and you're told which step;
+- a failed action, or a red `validate`, is not recorded;
+- `variables` turns those literal values into `%email%` — the key is the variable *name*, so one flow
+  serves every value. Use `secret:"NAME"` for passwords: the name is stored, never the value.
+- `act_batch` is not recorded (its inner calls bypass the recorder) — use atomic tools while recording.
+- End the recording with a `validate` so the flow proves its own outcome on every replay.
+
+**Replay:** `flow_run {name, tabId, variables:{email:"bo@y.org"}}` runs every step in one call and
+returns `cacheStatus`:
+- `HIT` — page matched the recording, all steps ran.
+- `HIT-DRIFTED` — the page's controls changed since recording but every target still resolved
+  uniquely, so it proceeded. Fine; consider re-recording when convenient.
+- `STALE` / `FAILED` — a step's target no longer resolves (or a `validate` went red). You get the
+  failing step index, what the page shows, and the flow file path. **Heal that one step** — take a
+  `read_page`, do the step by hand, re-record from there — don't start the task over.
+- `stopOnDrift:true` refuses any drift, for flows where a changed page means "stop and look".
+
+**Scope the fingerprint.** Fingerprints hash interactive roles+names, so prose and counters don't
+churn them — but a nav with a live badge will. Set `read_page {ignore:["nav",".ads"]}` once on the
+tab before recording; it sticks, and both the live tree and every fingerprint honour it.
+
+`flows {action:"list"|"show"|"delete"}` manages them. They're plain JSON under
+`~/.claude-browser-bridge/flows` (`CBB_FLOW_DIR` to relocate) — portable, and committable next to a
+project so CI can replay a login or a fixture setup.
 
 ---
 
