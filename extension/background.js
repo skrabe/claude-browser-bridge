@@ -830,19 +830,78 @@ async function tabUrl(tabId, tab) {
 // console error/warning counts) so the model can often skip a follow-up read_page. Best-effort:
 // a failure here never affects the action's own result.
 const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'drag', 'navigate', 'reload', 'hover', 'goBack', 'goForward', 'setFiles', 'handleDialog']);
+// Heuristic over the a11y tree (main + cross-origin frames): rank interactive nodes by fuzzy match
+// against the words of a query. Refs minted here use an 'f' prefix with the same monotonic seq, so
+// they never clobber read_page's.
+async function findCandidates(tabId, query) {
+  const s = st(tabId);
+  const q = String(query || '').toLowerCase();
+  const terms = q.split(/\s+/).filter(Boolean);
+  const scored = [];
+  for (const sessionId of [undefined, ...s.frames.keys()]) {
+    let nodes;
+    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    for (const n of nodes) {
+      if (n.ignored || n.backendDOMNodeId == null) continue;
+      const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
+      if (!INTERACTIVE.has(role) && !name) continue;
+      const hay = (role + ' ' + name).toLowerCase();
+      let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
+      if (name && q.includes(name.toLowerCase())) score += 5;
+      if (score <= 0) continue;
+      const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
+      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, ...(sessionId ? { frame: true } : {}) });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+// Does an element's accessible label plausibly mean what the caller intended? Loose on purpose —
+// "Save" should satisfy "save the order" — but "Delete" must not satisfy "Save". Empty label: no
+// opinion.
+function labelAgrees(label, intent) {
+  const l = String(label || '').toLowerCase().trim(); if (!l) return true;
+  const i = String(intent || '').toLowerCase();
+  if (i.includes(l) || l.includes(i)) return true;
+  const words = i.split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
+  return words.some((w) => l.includes(w));
+}
+
 // Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
-// once. Saves the dom_query round trip when you already know the selector — and it is strict on
+// once. With an `intent` as well, the selector is checked against what it hit and, if it hits
+// nothing, the intent is searched for — so a step written yesterday survives a renamed id today. Saves the dom_query round trip when you already know the selector — and it is strict on
 // purpose: matching several elements is an ambiguous instruction, not a licence to take the first.
 const REF_TOOLS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'hover', 'drag', 'setFiles', 'selectText', 'generateLocator', 'screenshot', 'validate']);
 async function resolveSelector(method, p) {
-  if (!p || !p.selector || p.ref || !REF_TOOLS.has(method) || p.tabId == null) return p;
+  if (!p || !REF_TOOLS.has(method) || p.tabId == null || p.ref) return p;
+  if (!p.selector && !p.intent) return p;
   await need(p.tabId);
   const s = st(p.tabId);
+  const byIntent = async (why) => {
+    const cands = await findCandidates(p.tabId, p.intent);
+    const top = cands[0], second = cands[1];
+    // Take the intent only when it is unambiguous: a single hit, or a clear leader.
+    if (top && (!second || top.score >= second.score * 2)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
+    const list = cands.slice(0, 5).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
+    throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list || 'none'}. Pick one by ref.`);
+  };
+  if (!p.selector) return byIntent('');
   const { root } = await cmd(p.tabId, 'DOM.getDocument', { depth: 0 });
   const { nodeIds } = await cmd(p.tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: p.selector });
-  if (!nodeIds.length) throw new Error(`selector ${JSON.stringify(p.selector)} matched no element — check it with dom_query, or target by ref from read_page (a selector cannot cross into a cross-origin frame)`);
+  if (!nodeIds.length) {
+    if (p.intent) return byIntent(`selector ${JSON.stringify(p.selector)} matched nothing`);
+    throw new Error(`selector ${JSON.stringify(p.selector)} matched no element — check it with dom_query, or target by ref from read_page (a selector cannot cross into a cross-origin frame)`);
+  }
   if (nodeIds.length > 1) throw new Error(`selector ${JSON.stringify(p.selector)} matched ${nodeIds.length} elements — narrow it, or pick one with dom_query and act by ref`);
   const { node } = await cmd(p.tabId, 'DOM.describeNode', { nodeId: nodeIds[0] });
+  if (p.intent) {
+    // The selector narrows; the intent confirms. A stale id that now points at a different control
+    // is exactly the case where acting anyway does damage.
+    let label = '';
+    try { const objectId = await objectFor(p.tabId, node.backendNodeId); const r = await cmd(p.tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: DESCRIBE_FN, returnByValue: true }); label = r.result?.value?.label || ''; } catch {}
+    if (!labelAgrees(label, p.intent)) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${label}", which does not look like ${JSON.stringify(p.intent)} — refusing. Re-target by ref from a fresh read_page.`);
+  }
   const ref = 's' + (++s.seq);
   s.refs.set(ref, { backendNodeId: node.backendNodeId, sessionId: undefined });
   return { ...p, ref };
@@ -1287,28 +1346,8 @@ async function dispatch(method, p) {
     }
 
     case 'find': {
-      // heuristic over the a11y tree (main + cross-origin frames): rank interactive nodes by fuzzy match
       await need(p.tabId);
-      const s = st(p.tabId); // append 'f' refs with a monotonic seq — never clobber read_page's 'e' refs
-      const q = String(p.query || '').toLowerCase();
-      const terms = q.split(/\s+/).filter(Boolean);
-      const scored = [];
-      for (const sessionId of [undefined, ...s.frames.keys()]) {
-        let nodes;
-        try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
-        for (const n of nodes) {
-          if (n.ignored || n.backendDOMNodeId == null) continue;
-          const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
-          if (!INTERACTIVE.has(role) && !name) continue;
-          const hay = (role + ' ' + name).toLowerCase();
-          let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
-          if (name && q.includes(name.toLowerCase())) score += 5;
-          if (score <= 0) continue;
-          const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
-          scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, ...(sessionId ? { frame: true } : {}) });
-        }
-      }
-      scored.sort((a, b) => b.score - a.score);
+      const scored = await findCandidates(p.tabId, p.query);
       return { candidates: scored.slice(0, 10).map(({ score, ...c }) => c) };
     }
 
