@@ -93,7 +93,6 @@ the loop. `cdp` is the escape hatch for anything they don't cover.
 Ships with the **`browser` skill** — a single self-contained `skill/SKILL.md` that leads with `run`
 (the scripting playbook: page/locator API + patterns) and covers targeting, the interaction loop,
 navigation/tabs, safety, troubleshooting, and the CDP escape hatch. Invoke it as `/browser`.
-(`skill/reference/*.md` + `SKILL.split.md` are a dormant fallback of the earlier split version.)
 
 ---
 
