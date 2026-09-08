@@ -223,6 +223,73 @@ function detach(tabId) {
 }
 async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId); }
 
+// ---- page geometry + attributes, in one CDP call ----
+//
+// The accessibility tree knows what an element IS but not where it sits or what is painted over it,
+// so on its own it will happily offer you a button that a cookie modal is covering. DOMSnapshot
+// answers all of that at once — bounds, paint order and attributes for every node — for the price
+// of a single round trip, which is why it is worth doing here rather than per element.
+async function pageGeometry(tabId, sessionId) {
+  let snap;
+  try {
+    snap = await cmd(dbgOf(tabId, sessionId), 'DOMSnapshot.captureSnapshot', {
+      computedStyles: [], includePaintOrder: true, includeDOMRects: false,
+    });
+  } catch { return null; }
+  const S = snap.strings || [];
+  const str = (i) => (i == null || i < 0 ? undefined : S[i]);
+  const out = new Map(); // backendNodeId -> { tag, attrs, rect, paint }
+  const painted = [];    // { rect, paint } for every laid-out node, for the occlusion pass
+  for (const doc of snap.documents || []) {
+    const nodes = doc.nodes || {}, layout = doc.layout || {};
+    const bids = nodes.backendNodeId || [];
+    const byNodeIndex = new Map();
+    for (let i = 0; i < (layout.nodeIndex || []).length; i++) {
+      const ni = layout.nodeIndex[i];
+      const b = (layout.bounds || [])[i];
+      const paint = (layout.paintOrders || [])[i];
+      if (!b) continue;
+      const rect = { x: b[0], y: b[1], w: b[2], h: b[3] };
+      byNodeIndex.set(ni, { rect, paint });
+      if (rect.w > 0 && rect.h > 0 && paint != null) painted.push({ rect, paint });
+    }
+    for (let ni = 0; ni < bids.length; ni++) {
+      const bid = bids[ni];
+      if (bid == null) continue;
+      const attrs = {};
+      const a = (nodes.attributes || [])[ni] || [];
+      for (let k = 0; k + 1 < a.length; k += 2) {
+        const name = str(a[k]); if (name) attrs[name] = str(a[k + 1]) ?? '';
+      }
+      const geo = byNodeIndex.get(ni);
+      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint });
+    }
+  }
+  painted.sort((a, b) => b.paint - a.paint); // topmost first
+  return { nodes: out, painted };
+}
+
+// Is this rect fully hidden behind things painted above it? Walks only the nodes painted higher and
+// tests whether any single one covers it. A union would also catch a rect quilted over by several
+// separate elements, but the case that actually matters — a modal, dropdown or cookie banner laid
+// over the page — is one big covering rect, and a single-cover test cannot produce a false positive.
+function occludedBy(rect, painted, paint) {
+  if (!rect || rect.w <= 0 || rect.h <= 0 || paint == null) return null;
+  for (const p of painted) {
+    if (p.paint <= paint) break; // sorted desc: nothing left is above us
+    if (p.rect.w * p.rect.h < rect.w * rect.h) continue; // too small to cover it
+    if (p.rect.x <= rect.x && p.rect.y <= rect.y &&
+        p.rect.x + p.rect.w >= rect.x + rect.w &&
+        p.rect.y + p.rect.h >= rect.y + rect.h) return p;
+  }
+  return null;
+}
+
+// Chrome renders a date/time input by locale but only accepts a value in one wire format, so a model
+// typing "03/15/2026" into a date field it can see as "MM/DD/YYYY" silently sets nothing. Naming the
+// format it must actually type is the whole fix.
+const DATE_FORMATS = { date: 'YYYY-MM-DD', month: 'YYYY-MM', week: 'YYYY-Www', time: 'HH:MM', 'datetime-local': 'YYYY-MM-DDTHH:MM' };
+
 // ---- ref resolution ----
 function refNode(tabId, ref) {
   const n = st(tabId).refs.get(ref);
@@ -884,6 +951,24 @@ async function dispatch(method, p) {
         }
       }
 
+      // Enrich the main frame with geometry + attributes. Best-effort: if the snapshot fails we
+      // still return a perfectly usable tree, just without the covered/format annotations.
+      const geo = await pageGeometry(p.tabId);
+      let coveredCount = 0;
+      if (geo) {
+        for (const e of cur.values()) {
+          if (e.__bid == null) continue;
+          const g = geo.nodes.get(e.__bid);
+          if (!g) continue;
+          const type = (g.attrs.type || '').toLowerCase();
+          // A password's value must never reach the transcript, whatever the AX tree offers.
+          if (type === 'password') delete e.value;
+          if (DATE_FORMATS[type] && !e.value) e.format = DATE_FORMATS[type];
+          const hit = occludedBy(g.rect, geo.painted, g.paint);
+          if (hit) { e.covered = true; coveredCount++; }
+        }
+      }
+
       const prev = s.ax; // Map(key -> {ref, role, name, value, frame}) from the previous read
       // Retire refs whose element is gone, so a stale ref errors instead of silently re-aliasing
       // onto whatever node inherited its id.
@@ -899,7 +984,7 @@ async function dispatch(method, p) {
           if (!ref) ref = 'e' + (++s.seq);
           s.refs.set(ref, { backendNodeId: e.__bid, sessionId: e.__sid });
         } else ref = null;
-        const shown = { ref, role: e.role, name: e.name, ...(e.value != null ? { value: e.value } : {}), ...(e.frame ? { frame: true } : {}) };
+        const shown = { ref, role: e.role, name: e.name, ...(e.value != null ? { value: e.value } : {}), ...(e.format ? { format: e.format } : {}), ...(e.covered ? { covered: true } : {}), ...(e.frame ? { frame: true } : {}) };
         next.set(k, shown);
         if (!was) added.push(shown);
         else if (was.name !== e.name || was.value !== e.value || was.role !== e.role) {
@@ -912,17 +997,23 @@ async function dispatch(method, p) {
 
       const url = (await chrome.tabs.get(p.tabId)).url;
       const frames = s.frames.size ? { frames: s.frames.size } : {};
+      // An overlay is the single most common reason a click does nothing, and the a11y tree gives no
+      // hint of it. Say it once, as a count, rather than flipping a flag on every buried element.
+      const overlay = coveredCount ? { covered: coveredCount, hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {};
+      // A page with almost nothing on it is usually mid-load, not genuinely empty — worth saying,
+      // because the alternative is the model concluding the content does not exist.
+      const thin = next.size < 10 ? { note2: 'Very few elements — the page is probably still loading or rendering. wait_for a known element before concluding anything is missing.' } : {};
       // Full tree on the first read of a tab, or on demand. Otherwise only the delta — in an
       // act-then-look loop almost every element is unchanged, and re-sending the whole tree each
       // time is the single biggest source of wasted tokens in a browser session.
       if (!prev || p.full) {
-        return { url, count: next.size, elements: [...next.values()], ...frames };
+        return { url, count: next.size, elements: [...next.values()], ...overlay, ...thin, ...frames };
       }
       if (!added.length && !changed.length && !removed.length) {
-        return { url, diff: true, unchanged: true, total: next.size, note: 'No accessibility change since the last read_page. Refs from the previous read are still valid. Do not repeat this call without acting first — if you expected a change, the action did not land: look for an overlay/disabled control (screenshot:true), or the page may still be loading (wait_for).', ...frames };
+        return { url, diff: true, unchanged: true, total: next.size, ...overlay, ...thin, note: 'No accessibility change since the last read_page. Refs from the previous read are still valid. Do not repeat this call without acting first — if you expected a change, the action did not land: look for an overlay/disabled control (screenshot:true), or the page may still be loading (wait_for).', ...frames };
       }
       return {
-        url, diff: true, total: next.size, unchanged,
+        url, diff: true, total: next.size, unchanged, ...overlay, ...thin,
         ...(added.length ? { added } : {}), ...(changed.length ? { changed } : {}), ...(removed.length ? { removed } : {}),
         note: 'Delta since the last read_page; unchanged elements are omitted and their refs remain valid. Pass full:true for the whole tree.',
         ...frames,
@@ -1057,12 +1148,28 @@ async function dispatch(method, p) {
       const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
       const objectId = await objectFor(dbg, backendNodeId);
-      await cmd(dbg, 'Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: 'function(v){this.focus&&this.focus();const p=Object.getOwnPropertyDescriptor(this.__proto__,"value");if(p&&p.set)p.set.call(this,v);else this.value=v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));}',
+      // Read the value back in the same call. A phone/date/currency/card field with an input mask
+      // silently rewrites what you set, and a maxlength quietly truncates it — so "fill succeeded"
+      // is not the same as "the field holds what you asked for". Reporting the difference here is
+      // what turns a wrong value discovered three steps later into one you see immediately.
+      const r = await cmd(dbg, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true,
+        functionDeclaration: `function(v){
+          this.focus && this.focus();
+          const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
+          if (d && d.set) d.set.call(this, v); else this.value = v;
+          this.dispatchEvent(new Event("input", { bubbles: true }));
+          this.dispatchEvent(new Event("change", { bubbles: true }));
+          return { got: this.value, secret: this.type === "password" };
+        }`,
         arguments: [{ value: String(p.value ?? '') }],
       });
-      return { ok: true };
+      const want = String(p.value ?? '');
+      const { got, secret } = r.result?.value || {};
+      if (got === want || got === undefined) return { ok: true };
+      // Never echo a password back, even to report a mismatch.
+      if (secret) return { ok: true, mismatch: 'the field did not keep the value exactly (length ' + String(got).length + ' vs ' + want.length + ')' };
+      return { ok: true, mismatch: 'the field now holds ' + JSON.stringify(String(got).slice(0, 120)) + ', not what you set — an input mask or maxlength rewrote it. Reconcile before continuing.', value: got };
     }
     // Put the caret somewhere specific inside existing text, instead of the only two positions a
     // click gives you (wherever you happened to hit) or fill gives you (everything replaced).
