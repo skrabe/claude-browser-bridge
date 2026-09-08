@@ -1464,8 +1464,9 @@ async function dispatch(method, p) {
 
       // Enrich the main frame with geometry + attributes. Best-effort: if the snapshot fails we
       // still return a perfectly usable tree, just without the covered/format annotations.
+      const prev = s.ax; // Map(key -> {ref, role, name, value, frame}) from the previous read
       const geo = await domSnapshotIndex(p.tabId);
-      let coveredCount = 0;
+      let coveredCount = 0, listenerHits = 0;
       if (geo) {
         const buried = occludedNodes(geo);
         for (const e of cur.values()) {
@@ -1489,6 +1490,7 @@ async function dispatch(method, p) {
         // first read of a page is always full — and is cached until the next navigation.
         if (!prev || p.full || !s.listenerBids) s.listenerBids = await harvestListenerBids(p.tabId, generics.map((n) => n.backendDOMNodeId));
         const listenerBids = s.listenerBids || new Set();
+        listenerHits = listenerBids.size;
         let promoted = 0;
         const promotedIds = new Set();
         const labelOf = (n) => {
@@ -1525,7 +1527,6 @@ async function dispatch(method, p) {
         }
       }
 
-      const prev = s.ax; // Map(key -> {ref, role, name, value, frame}) from the previous read
       // Retire refs whose element is gone, so a stale ref errors instead of silently re-aliasing
       // onto whatever node inherited its id.
       if (prev) for (const [k, e] of prev) if (!cur.has(k) && e.ref) s.refs.delete(e.ref);
@@ -1563,7 +1564,7 @@ async function dispatch(method, p) {
       // act-then-look loop almost every element is unchanged, and re-sending the whole tree each
       // time is the single biggest source of wasted tokens in a browser session.
       if (!prev || p.full) {
-        return { url, count: next.size, elements: [...next.values()], ...overlay, ...thin, ...frames };
+        return { url, count: next.size, elements: [...next.values()], ...(listenerHits ? { listenerHits } : {}), ...overlay, ...thin, ...frames };
       }
       if (!added.length && !changed.length && !removed.length) {
         return { url, diff: true, unchanged: true, total: next.size, ...overlay, ...thin, note: 'No accessibility change since the last read_page. Refs from the previous read are still valid. Do not repeat this call without acting first — if you expected a change, the action did not land: look for an overlay/disabled control (screenshot:true), or the page may still be loading (wait_for).', ...frames };
