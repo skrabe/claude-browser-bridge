@@ -67,5 +67,14 @@ const vd=cbb('vdom',{});
 eq('vdom returns interactables (>=6)', vd.length>=6, true);
 eq('vdom entries have node_id+role+box', !!(vd[0].node_id && vd[0].role && vd[0].box), true);
 
+eq('evaluate runs the fn against the matched element',
+  cbb('evalfn',{steps:[{by:'css',selector:'#email'}],i:0,fn:'(el)=>el.getAttribute("name")'}), 'email');
+eq('evaluate receives the caller arg',
+  cbb('evalfn',{steps:[{by:'role',role:'heading'}],i:0,fn:'(el,arg)=>el.textContent+arg',arg:'!'}), 'Welcome back!');
+eq('evaluateAll projects every match in one pass',
+  cbb('evalfn',{steps:[{by:'css',selector:'li'}],all:true,fn:'(el)=>el.textContent'}), ['alpha','beta','gamma']);
+eq('evaluateAll passes the index',
+  cbb('evalfn',{steps:[{by:'css',selector:'li'}],all:true,fn:'(el,arg,i)=>i'}), [0,1,2]);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

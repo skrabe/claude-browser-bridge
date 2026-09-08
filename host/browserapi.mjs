@@ -137,6 +137,14 @@ if (!window.__cbb) {
     if (op === 'focus') { if (!el) return { ok: false }; el.focus && el.focus(); return { ok: true }; }
     if (op === 'scroll') { if (!el) return { ok: false }; if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'center' }); return { ok: true, box: topBox(el) }; }
     if (op === 'checkstate') { if (!el) return null; return { box: topBox(el), checked: isChecked(el), vis: isVisible(el), en: isEnabled(el) }; }
+    // Run the caller's function against the matched element(s) IN the page. The point is bulk reads:
+    // projecting a whole list in one pass, instead of a per-element round trip for every field.
+    if (op === 'evalfn') {
+      const fn = (0, eval)('(' + a.fn + ')');
+      if (a.all) { const all = a.steps ? resolve(a.steps) : []; return all.map((e, i) => fn(e, a.arg, i)); }
+      if (!el) return null;
+      return fn(el, a.arg, a.i || 0);
+    }
     if (op === 'snapshot') {
       const root = a.selector ? document.querySelector(a.selector) : document; if (!root) return '(selector matched nothing)';
       const INT = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton', 'menuitem', 'tab', 'option', 'listbox', 'heading']);
@@ -274,6 +282,10 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async inputValue(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'value' }, t.sessionId); }
     async getAttribute(name, o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'attr', name }, t.sessionId); }
     async allTextContents() { const g = await resolveGlobal(this.steps); const q = this._q; return Promise.all(g.map((t) => evalIn('text', { steps: q, i: t.i, kind: 'text' }, t.sessionId))); }
+    // (el, arg) => value, run in the page. evaluateAll gets the whole matched array in ONE pass —
+    // the difference between one round trip and one per row when scraping a list.
+    async evaluate(fn, arg, o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('evalfn', { steps: this._q, i: t.i, fn: String(fn), arg }, t.sessionId); }
+    async evaluateAll(fn, arg) { const g = await resolveGlobal(this.steps); const sid = g.length ? g[0].sessionId : undefined; return evalIn('evalfn', { steps: this._q, all: true, fn: String(fn), arg }, sid); }
     async isVisible() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].vis); }
     async isEnabled() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].en); }
     async isChecked() { const g = await resolveGlobal(this.steps); return !!(g[0] && g[0].checked); }
@@ -287,6 +299,9 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
     // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
     async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await typeChars(cdp, secretVal(value)); }
+    // Playwright renamed .type() to .pressSequentially(); accept both so a script written against
+    // either generation of the API works here. Both append — neither clears first.
+    async pressSequentially(value, o = {}) { return this.type(value, o); }
     async press(keyChord, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await pressChord(cdp, keyChord); }
     async selectOption(values, o = {}) { const t = await this._one(true, o.timeoutMs); const arr = Array.isArray(values) ? values : [values]; const r = await evalIn('select', { steps: this._q, i: t.i, values: arr }, t.sessionId); if (!r || !r.ok) throw new Error('selectOption failed: ' + (r && r.err)); return r.selected; }
     async check(o = {}) { const t = await this._one(true, o.timeoutMs); const s = await evalIn('checkstate', { steps: this._q, i: t.i }, t.sessionId); if (s && s.checked) return; await this.click(o); }
