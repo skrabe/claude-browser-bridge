@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -751,6 +751,13 @@ async function dispatch(method, p) {
           },
         });
       } catch (e) {
+        // Chrome reports an injection into a discarded (auto-slept) tab as a *permission* error,
+        // which sends you hunting through the manifest for a problem that isn't there. The tab
+        // simply has no live document until something wakes it.
+        const fresh = await chrome.tabs.get(p.tabId).catch(() => null);
+        if (fresh?.discarded || fresh?.status === 'unloaded') {
+          throw new Error('that tab is discarded (Chrome unloaded it to save memory), so it has no page to read yet — reload it first, or tab_claim it');
+        }
         throw new Error('could not read that tab without claiming it (' + e.message + ') — the page may still be loading, or be a restricted origin; tab_claim gives full access');
       }
       return { peek: true, ...(res?.result || {}), tabGroup: t.groupId != null && t.groupId !== -1 ? (await chrome.tabGroups.get(t.groupId).catch(() => null))?.title || null : null };
@@ -1023,9 +1030,13 @@ async function dispatch(method, p) {
       const r = await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId, returnByValue: true,
         functionDeclaration: `function(text, prefix, suffix, how){
-          this.focus && this.focus();
-          const editable = this.value !== undefined && (this.tagName === 'INPUT' || this.tagName === 'TEXTAREA');
-          const hay = editable ? String(this.value) : (this.innerText || this.textContent || '');
+          // A StaticText ref from read_page resolves to a TEXT NODE, not an element. A TreeWalker
+          // rooted at a text node yields nothing, so climb to the containing element first.
+          const host = this.nodeType === 3 ? this.parentElement : this;
+          if (!host) return { ok: false, reason: 'this ref no longer has a containing element' };
+          host.focus && host.focus();
+          const editable = host.value !== undefined && (host.tagName === 'INPUT' || host.tagName === 'TEXTAREA');
+          const hay = editable ? String(host.value) : (host.innerText || host.textContent || '');
           // prefix/suffix disambiguate which occurrence is meant when the text repeats.
           const needle = (prefix || '') + text + (suffix || '');
           const at = hay.indexOf(needle);
@@ -1034,9 +1045,9 @@ async function dispatch(method, p) {
           const s = at + (prefix || '').length, e = s + text.length;
           const from = how === 'after' ? e : s;
           const to = how === 'before' ? s : how === 'after' ? e : e;
-          if (editable) { this.setSelectionRange(from, to); return { ok: true, start: from, end: to }; }
+          if (editable) { host.setSelectionRange(from, to); return { ok: true, start: from, end: to }; }
           // contenteditable / static text: walk text nodes to convert the string offset into a Range.
-          const walker = document.createTreeWalker(this, NodeFilter.SHOW_TEXT);
+          const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
           let seen = 0, a = null, b = null, n;
           while ((n = walker.nextNode())) {
             const len = n.nodeValue.length;
