@@ -30,7 +30,7 @@ const pendingCredentials = new Map(); // token -> { spec, tabId, origin, fields,
 const state = new Map();
 function st(tabId) {
   let s = state.get(tabId);
-  if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set(), frames: new Map() }; state.set(tabId, s); }
+  if (!s) { s = { refs: new Map(), seq: 0, console: [], network: new Map(), domains: new Set(), frames: new Map(), ax: null }; state.set(tabId, s); }
   return s;
 }
 // Which tabs the agent opened, persisted in session storage.
@@ -66,6 +66,34 @@ try { chrome.tabs.onRemoved.addListener((tabId) => { forgetAgentTab(tabId); stat
 const dbgOf = (tabId, sessionId) => (sessionId ? { tabId, sessionId } : tabId);
 // Pages the agent must never drive/see — browser UI and extension pages (incl. our credential popup).
 const PRIVILEGED_URL = /^(chrome|chrome-extension|devtools|edge|brave|about|view-source):/i;
+
+// ---- browser organization (browser_manage) ----
+// A named allowlist rather than an open passthrough, so a typo'd method name fails with the list of
+// real ones instead of an opaque "not a function" from deep inside the extension API.
+const MANAGE_ALLOWED = {
+  tabs: new Set(['query', 'get', 'update', 'move', 'group', 'ungroup', 'remove', 'discard', 'reload']),
+  windows: new Set(['get', 'getAll', 'getCurrent', 'getLastFocused', 'create', 'update', 'remove']),
+  tabGroups: new Set(['query', 'get', 'update', 'move']),
+  bookmarks: new Set(['search', 'get', 'getTree', 'getSubTree', 'getChildren', 'getRecent', 'create', 'move', 'update', 'remove', 'removeTree']),
+};
+const MANAGE_MUTATING = new Set([
+  'tabs.update', 'tabs.move', 'tabs.group', 'tabs.ungroup', 'tabs.remove', 'tabs.discard',
+  'windows.create', 'windows.update', 'windows.remove',
+  'tabGroups.update', 'tabGroups.move',
+  'bookmarks.create', 'bookmarks.move', 'bookmarks.update', 'bookmarks.remove', 'bookmarks.removeTree',
+]);
+const auditTrail = [];
+// What the browser looked like immediately before a mutation — enough to describe the change in
+// words and to reverse it, without dragging the whole bookmark tree into memory every time.
+async function layoutSnapshot(ns) {
+  try {
+    if (ns === 'bookmarks') return { bookmarks: await chrome.bookmarks.getRecent(25).catch(() => []) };
+    const tabs = (await chrome.tabs.query({})).map((t) => ({ id: t.id, index: t.index, windowId: t.windowId, groupId: t.groupId, pinned: t.pinned, url: t.url }));
+    const groups = await chrome.tabGroups.query({}).catch(() => []);
+    const windows = (await chrome.windows.getAll({})).map((w) => ({ id: w.id, focused: w.focused, state: w.state, left: w.left, top: w.top, width: w.width, height: w.height }));
+    return { tabs, groups, windows };
+  } catch { return null; }
+}
 
 function connect() {
   if (port) return; // one native-messaging connection only — never spawn a second host
@@ -664,6 +692,70 @@ async function dispatch(method, p) {
       return { tabs: out };
     }
 
+    // Browser organization (windows, groups, bookmarks) — the "tidy my tabs" surface, which is
+    // separate from driving a page and needs no debugger at all.
+    case 'manage': {
+      const ns = String(p.namespace || ''), method = String(p.method || '');
+      const api = { tabs: chrome.tabs, windows: chrome.windows, tabGroups: chrome.tabGroups, bookmarks: chrome.bookmarks }[ns];
+      if (ns === 'audit') return { changes: auditTrail.slice().reverse() };
+      if (!api) throw new Error(`unknown namespace "${ns}" — use tabs, windows, tabGroups, bookmarks, or audit`);
+      if (!MANAGE_ALLOWED[ns].has(method)) throw new Error(`"${ns}.${method}" is not available — allowed: ${[...MANAGE_ALLOWED[ns]].join(', ')}`);
+      if (typeof api[method] !== 'function') throw new Error(`this browser does not implement ${ns}.${method}`);
+      const args = Array.isArray(p.args) ? p.args : [];
+      // Snapshot before a mutation so the model can tell the user what changed and put it back.
+      // Reads are the common case and must stay cheap, so only mutations pay for this.
+      const mutating = MANAGE_MUTATING.has(ns + '.' + method);
+      const before = mutating ? await layoutSnapshot(ns) : null;
+      const result = await api[method](...args);
+      if (mutating) {
+        auditTrail.push({ at: new Date().toISOString(), namespace: ns, method, args, before });
+        if (auditTrail.length > 100) auditTrail.shift();
+      }
+      return { ok: true, result: result === undefined ? null : result };
+    }
+
+    // Read one of the user's tabs WITHOUT claiming it: no debugger attach, so no "being debugged"
+    // banner and nothing taken away from them. This is the right tool for "what does that other tab
+    // say" — claiming a tab to read one number is disproportionate and visible to the user.
+    // Cursor-paged so an observe-act-observe loop reads exactly the events its action caused:
+    // read once to learn the cursor, act, then read from that cursor.
+    case 'cdpEvents': {
+      await need(p.tabId);
+      const s = st(p.tabId);
+      const all = s.events || [];
+      const after = p.afterSequence != null ? Number(p.afterSequence) : null;
+      const methods = Array.isArray(p.methods) && p.methods.length ? new Set(p.methods) : null;
+      const limit = Math.min(Math.max(Number(p.limit) || 100, 1), 1000);
+      let hits = all.filter((e) => (after == null || e.sequence > after) && (!methods || methods.has(e.method)));
+      const hasMore = hits.length > limit;
+      hits = hits.slice(0, limit);
+      return {
+        cursor: all.length ? all[all.length - 1].sequence : (s.evSeq || 0),
+        events: hits, hasMore, truncated: !!s.evTruncated,
+        ...(p.clear ? (s.events = [], s.evTruncated = false, { cleared: true }) : {}),
+      };
+    }
+
+    case 'peekTab': {
+      const t = await chrome.tabs.get(p.tabId);
+      if (t.url && PRIVILEGED_URL.test(t.url)) throw new Error('cannot read a browser-internal page (' + t.url + ')');
+      const limit = Math.min(Math.max(Number(p.limit) || 20000, 500), 200000);
+      let res;
+      try {
+        [res] = await chrome.scripting.executeScript({
+          target: { tabId: p.tabId },
+          args: [limit],
+          func: (max) => {
+            const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+            return { title: document.title, url: location.href, text: text.slice(0, max), truncated: text.length > max, length: text.length };
+          },
+        });
+      } catch (e) {
+        throw new Error('could not read that tab without claiming it (' + e.message + ') — the page may still be loading, or be a restricted origin; tab_claim gives full access');
+      }
+      return { peek: true, ...(res?.result || {}), tabGroup: t.groupId != null && t.groupId !== -1 ? (await chrome.tabGroups.get(t.groupId).catch(() => null))?.title || null : null };
+    }
+
     case 'claimTab': {
       const tab = await chrome.tabs.get(p.tabId);
       // Refuse privileged/extension pages — notably our own credential popup, so the secret the user
@@ -708,8 +800,13 @@ async function dispatch(method, p) {
 
     case 'readPage': {
       await need(p.tabId);
-      const s = st(p.tabId); s.refs.clear(); // fresh snapshot; seq stays monotonic so stale ids error, never re-alias
-      const lines = [];
+      const s = st(p.tabId);
+      // Identity is the DOM node (backendDOMNodeId within its frame session), not the position in
+      // the tree. That is what makes both halves of this work: a ref stays valid for as long as its
+      // element lives — so the model can act on an element it saw two reads ago — and "what changed
+      // since the last read" becomes a set operation instead of a guess.
+      const cur = new Map();
+      let anon = 0;
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
         let nodes;
         try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
@@ -719,16 +816,65 @@ async function dispatch(method, p) {
           const name = (n.name?.value || '').trim();
           const interactive = INTERACTIVE.has(role);
           if (!interactive && !name) continue;
-          let ref = null;
-          if (n.backendDOMNodeId != null && (interactive || name)) {
-            ref = 'e' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
-          }
+          const bid = n.backendDOMNodeId;
+          // A node with no DOM backing can never be targeted, so it gets no ref and an identity that
+          // is only good for this read — it shows up as page structure, never as a click target.
+          const key = bid != null ? (sessionId || '-') + ':' + bid : 'anon:' + (++anon);
+          if (cur.has(key)) continue;
           const val = n.value?.value;
-          lines.push({ ref, role, name: cleanName(name).slice(0, 160), ...(val != null ? { value: String(val).slice(0, 80) } : {}), ...(sessionId ? { frame: true } : {}) });
-          if (lines.length >= 500) break outer;
+          cur.set(key, {
+            role, name: cleanName(name).slice(0, 160),
+            ...(val != null ? { value: String(val).slice(0, 80) } : {}),
+            ...(sessionId ? { frame: true } : {}),
+            __bid: bid, __sid: sessionId,
+          });
+          if (cur.size >= 500) break outer;
         }
       }
-      return { url: (await chrome.tabs.get(p.tabId)).url, count: lines.length, elements: lines, ...(s.frames.size ? { frames: s.frames.size } : {}) };
+
+      const prev = s.ax; // Map(key -> {ref, role, name, value, frame}) from the previous read
+      // Retire refs whose element is gone, so a stale ref errors instead of silently re-aliasing
+      // onto whatever node inherited its id.
+      if (prev) for (const [k, e] of prev) if (!cur.has(k) && e.ref) s.refs.delete(e.ref);
+
+      const next = new Map();
+      const added = [], changed = [];
+      let unchanged = 0;
+      for (const [k, e] of cur) {
+        const was = prev && prev.get(k);
+        let ref = was && was.ref;
+        if (e.__bid != null) {
+          if (!ref) ref = 'e' + (++s.seq);
+          s.refs.set(ref, { backendNodeId: e.__bid, sessionId: e.__sid });
+        } else ref = null;
+        const shown = { ref, role: e.role, name: e.name, ...(e.value != null ? { value: e.value } : {}), ...(e.frame ? { frame: true } : {}) };
+        next.set(k, shown);
+        if (!was) added.push(shown);
+        else if (was.name !== e.name || was.value !== e.value || was.role !== e.role) {
+          changed.push({ ...shown, was: { ...(was.name !== e.name ? { name: was.name } : {}), ...(was.value !== e.value ? { value: was.value } : {}), ...(was.role !== e.role ? { role: was.role } : {}) } });
+        } else unchanged++;
+      }
+      const removed = [];
+      if (prev) for (const [k, e] of prev) if (!cur.has(k)) removed.push({ role: e.role, name: e.name });
+      s.ax = next;
+
+      const url = (await chrome.tabs.get(p.tabId)).url;
+      const frames = s.frames.size ? { frames: s.frames.size } : {};
+      // Full tree on the first read of a tab, or on demand. Otherwise only the delta — in an
+      // act-then-look loop almost every element is unchanged, and re-sending the whole tree each
+      // time is the single biggest source of wasted tokens in a browser session.
+      if (!prev || p.full) {
+        return { url, count: next.size, elements: [...next.values()], ...frames };
+      }
+      if (!added.length && !changed.length && !removed.length) {
+        return { url, diff: true, unchanged: true, total: next.size, note: 'No accessibility change since the last read_page. Refs from the previous read are still valid. Do not repeat this call without acting first — if you expected a change, the action did not land: look for an overlay/disabled control (screenshot:true), or the page may still be loading (wait_for).', ...frames };
+      }
+      return {
+        url, diff: true, total: next.size, unchanged,
+        ...(added.length ? { added } : {}), ...(changed.length ? { changed } : {}), ...(removed.length ? { removed } : {}),
+        note: 'Delta since the last read_page; unchanged elements are omitted and their refs remain valid. Pass full:true for the whole tree.',
+        ...frames,
+      };
     }
 
     case 'readText': {
@@ -865,6 +1011,50 @@ async function dispatch(method, p) {
         arguments: [{ value: String(p.value ?? '') }],
       });
       return { ok: true };
+    }
+    // Put the caret somewhere specific inside existing text, instead of the only two positions a
+    // click gives you (wherever you happened to hit) or fill gives you (everything replaced).
+    // This is what makes "change just this word" a single action rather than clear-and-retype.
+    case 'selectText': {
+      await need(p.tabId);
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const dbg = dbgOf(p.tabId, sessionId);
+      const objectId = await objectFor(dbg, backendNodeId);
+      const r = await cmd(dbg, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true,
+        functionDeclaration: `function(text, prefix, suffix, how){
+          this.focus && this.focus();
+          const editable = this.value !== undefined && (this.tagName === 'INPUT' || this.tagName === 'TEXTAREA');
+          const hay = editable ? String(this.value) : (this.innerText || this.textContent || '');
+          // prefix/suffix disambiguate which occurrence is meant when the text repeats.
+          const needle = (prefix || '') + text + (suffix || '');
+          const at = hay.indexOf(needle);
+          if (at < 0) return { ok: false, reason: 'text not found in this element', length: hay.length, sample: hay.slice(0, 200) };
+          if (hay.indexOf(needle, at + 1) >= 0) return { ok: false, reason: 'ambiguous — that text appears more than once; add prefix/suffix to pin the occurrence' };
+          const s = at + (prefix || '').length, e = s + text.length;
+          const from = how === 'after' ? e : s;
+          const to = how === 'before' ? s : how === 'after' ? e : e;
+          if (editable) { this.setSelectionRange(from, to); return { ok: true, start: from, end: to }; }
+          // contenteditable / static text: walk text nodes to convert the string offset into a Range.
+          const walker = document.createTreeWalker(this, NodeFilter.SHOW_TEXT);
+          let seen = 0, a = null, b = null, n;
+          while ((n = walker.nextNode())) {
+            const len = n.nodeValue.length;
+            if (!a && seen + len >= from) a = [n, from - seen];
+            if (!b && seen + len >= to) { b = [n, to - seen]; break; }
+            seen += len;
+          }
+          if (!a || !b) return { ok: false, reason: 'could not map the offset onto the rendered text nodes' };
+          const range = document.createRange();
+          range.setStart(a[0], a[1]); range.setEnd(b[0], b[1]);
+          const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+          return { ok: true, start: from, end: to };
+        }`,
+        arguments: [{ value: String(p.text ?? '') }, { value: String(p.prefix ?? '') }, { value: String(p.suffix ?? '') }, { value: String(p.selectionType || 'select') }],
+      });
+      const out = r.result?.value || {};
+      if (!out.ok) throw new Error('select_text: ' + (out.reason || 'failed') + (out.sample ? ' — element text starts: ' + JSON.stringify(out.sample) : ''));
+      return out;
     }
     case 'typeText': { // real per-char keystrokes (keyDown+keyUp) so search-as-you-type / key-filtered / per-key OTP widgets fire
       await need(p.tabId);
@@ -1261,6 +1451,12 @@ async function dispatch(method, p) {
 chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
   const tabId = source.tabId; if (tabId == null) return;
   const s = state.get(tabId); if (!s) return;
+  // Generic event ring, on top of the console/network digests below. read_console and read_network
+  // cover the usual questions; this is for the rest of the protocol — a lifecycle event, a CSS or
+  // Animation domain you enabled yourself via `cdp` — which otherwise fires and is gone.
+  if (!s.events) { s.events = []; s.evSeq = 0; }
+  s.events.push({ sequence: ++s.evSeq, method: cdpMethod, params: cdpParams, ...(source.sessionId ? { sessionId: source.sessionId } : {}) });
+  if (s.events.length > 1000) { s.events.shift(); s.evTruncated = true; }
   if (cdpMethod === 'Runtime.consoleAPICalled') {
     s.console.push({ level: cdpParams.type, text: (cdpParams.args || []).map(a => a.value ?? a.description ?? '').join(' '), ts: cdpParams.timestamp });
     if (s.console.length > 500) s.console.shift();
@@ -1281,6 +1477,10 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     s.dialog = null;
   } else if (cdpMethod === 'Page.loadEventFired') {
     s.lastLoadTs = Date.now();
+  } else if (cdpMethod === 'Page.frameNavigated' && !cdpParams.frame?.parentId) {
+    // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
+    // it would be pure noise. Drop the baseline and let the next read_page return a full tree.
+    s.ax = null;
   } else if (cdpMethod === 'Target.attachedToTarget') {
     // A cross-origin child frame attached. Enable its domains, resolve its owner <iframe> in the
     // parent (needed for coordinate translation), and recurse auto-attach for nested frames.
