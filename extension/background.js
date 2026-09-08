@@ -1243,12 +1243,18 @@ async function dispatch(method, p) {
           if (d && d.set) d.set.call(this, v); else this.value = v;
           this.dispatchEvent(new Event("input", { bubbles: true }));
           this.dispatchEvent(new Event("change", { bubbles: true }));
-          return { got: this.value, secret: this.type === "password" };
+          return { got: this.value, secret: this.type === "password", type: (this.type || "").toLowerCase() };
         }`,
         arguments: [{ value: String(p.value ?? '') }],
       });
       const want = String(p.value ?? '');
-      const { got, secret } = r.result?.value || {};
+      const { got, secret, type } = r.result?.value || {};
+      // A date/time input silently rejects anything not in its wire format, leaving the field empty
+      // while the page still displays a locale mask like mm/dd/yyyy. Without this the model sets a
+      // perfectly reasonable-looking value, sees no error, and moves on with an empty field.
+      if (DATE_FORMATS[type] && got === '' && want !== '') {
+        throw new Error(`this is an <input type="${type}"> — it only accepts ${DATE_FORMATS[type]}, and rejected ${JSON.stringify(want)}, leaving the field empty. The mm/dd/yyyy you see is just how Chrome displays it. Re-fill using ${DATE_FORMATS[type]}.`);
+      }
       if (got === want || got === undefined) return { ok: true };
       // Never echo a password back, even to report a mismatch.
       if (secret) return { ok: true, mismatch: 'the field did not keep the value exactly (length ' + String(got).length + ' vs ' + want.length + ')' };
