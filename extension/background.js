@@ -227,19 +227,20 @@ async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId
 //
 // The accessibility tree knows what an element IS but not where it sits or what is painted over it,
 // so on its own it will happily offer you a button that a cookie modal is covering. DOMSnapshot
-// answers all of that at once — bounds, paint order and attributes for every node — for the price
-// of a single round trip, which is why it is worth doing here rather than per element.
+// answers all of that at once — bounds, paint order, attributes and the styles we need to tell a
+// real occluder from a transparent one — for the price of a single round trip.
+const OCCLUSION_STYLES = ['background-color', 'opacity'];
 async function domSnapshotIndex(tabId, sessionId) {
   let snap;
   try {
     snap = await cmd(dbgOf(tabId, sessionId), 'DOMSnapshot.captureSnapshot', {
-      computedStyles: [], includePaintOrder: true, includeDOMRects: false,
+      computedStyles: OCCLUSION_STYLES, includePaintOrder: true, includeDOMRects: false,
     });
   } catch { return null; }
   const S = snap.strings || [];
   const str = (i) => (i == null || i < 0 ? undefined : S[i]);
-  const out = new Map(); // backendNodeId -> { tag, attrs, rect, paint }
-  const painted = [];    // { rect, paint } for every laid-out node, for the occlusion pass
+  const out = new Map();  // backendNodeId -> { tag, attrs, rect, paint }
+  const painted = [];     // { rect, paint, opaque } for the occlusion pass
   for (const doc of snap.documents || []) {
     const nodes = doc.nodes || {}, layout = doc.layout || {};
     const bids = nodes.backendNodeId || [];
@@ -248,10 +249,17 @@ async function domSnapshotIndex(tabId, sessionId) {
       const ni = layout.nodeIndex[i];
       const b = (layout.bounds || [])[i];
       const paint = (layout.paintOrders || [])[i];
-      if (!b) continue;
-      const rect = { x: b[0], y: b[1], w: b[2], h: b[3] };
+      if (!b || paint == null) continue;
+      const rect = { x1: b[0], y1: b[1], x2: b[0] + b[2], y2: b[1] + b[3] };
       byNodeIndex.set(ni, { rect, paint });
-      if (rect.w > 0 && rect.h > 0 && paint != null) painted.push({ rect, paint });
+      if (b[2] <= 0 || b[3] <= 0) continue;
+      // Only something you cannot see through actually hides what is behind it. A transparent
+      // layout wrapper spanning the page is the common case, and treating it as an occluder marks
+      // the whole page unclickable — which is exactly the false positive this guards against.
+      const st = (layout.styles || [])[i] || [];
+      const bg = str(st[0]) ?? '', op = str(st[1]) ?? '1';
+      const opaque = !/^rgba\(.*,\s*0\)$/.test(bg) && bg !== 'transparent' && bg !== '' && parseFloat(op || '1') >= 0.8;
+      painted.push({ rect, paint, opaque });
     }
     for (let ni = 0; ni < bids.length; ni++) {
       const bid = bids[ni];
@@ -265,24 +273,79 @@ async function domSnapshotIndex(tabId, sessionId) {
       out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint });
     }
   }
-  painted.sort((a, b) => b.paint - a.paint); // topmost first
   return { nodes: out, painted };
 }
 
-// Is this rect fully hidden behind things painted above it? Walks only the nodes painted higher and
-// tests whether any single one covers it. A union would also catch a rect quilted over by several
-// separate elements, but the case that actually matters — a modal, dropdown or cookie banner laid
-// over the page — is one big covering rect, and a single-cover test cannot produce a false positive.
-function occludedBy(rect, painted, paint) {
-  if (!rect || rect.w <= 0 || rect.h <= 0 || paint == null) return null;
-  for (const p of painted) {
-    if (p.paint <= paint) break; // sorted desc: nothing left is above us
-    if (p.rect.w * p.rect.h < rect.w * rect.h) continue; // too small to cover it
-    if (p.rect.x <= rect.x && p.rect.y <= rect.y &&
-        p.rect.x + p.rect.w >= rect.x + rect.w &&
-        p.rect.y + p.rect.h >= rect.y + rect.h) return p;
+// A disjoint union of rectangles, so an element buried under SEVERAL stacked panels is caught, not
+// just one covering it outright. Capped, because each insert can fragment existing rects into four
+// and a page of translucent layers would otherwise grow this without bound; past the cap it simply
+// reports nothing as covered, which errs toward silence rather than a wrong warning.
+const MAX_UNION_RECTS = 5000;
+const rIntersects = (a, b) => !(a.x2 <= b.x1 || b.x2 <= a.x1 || a.y2 <= b.y1 || b.y2 <= a.y1);
+const rContains = (a, b) => a.x1 <= b.x1 && a.y1 <= b.y1 && a.x2 >= b.x2 && a.y2 >= b.y2;
+// a minus b, as up to four rectangles.
+function rSplit(a, b) {
+  const parts = [];
+  if (a.y1 < b.y1) parts.push({ x1: a.x1, y1: a.y1, x2: a.x2, y2: b.y1 });
+  if (b.y2 < a.y2) parts.push({ x1: a.x1, y1: b.y2, x2: a.x2, y2: a.y2 });
+  const lo = Math.max(a.y1, b.y1), hi = Math.min(a.y2, b.y2);
+  if (a.x1 < b.x1) parts.push({ x1: a.x1, y1: lo, x2: b.x1, y2: hi });
+  if (b.x2 < a.x2) parts.push({ x1: b.x2, y1: lo, x2: a.x2, y2: hi });
+  return parts;
+}
+class RectUnion {
+  constructor() { this.rects = []; }
+  covers(r) {
+    if (!this.rects.length) return false;
+    let stack = [r];
+    for (const s of this.rects) {
+      const next = [];
+      for (const piece of stack) {
+        if (rContains(s, piece)) continue;
+        if (rIntersects(piece, s)) next.push(...rSplit(piece, s));
+        else next.push(piece);
+      }
+      if (!next.length) return true; // every part of r was eaten
+      stack = next;
+    }
+    return false;
   }
-  return null;
+  add(r) {
+    if (this.rects.length >= MAX_UNION_RECTS || this.covers(r)) return;
+    let pending = [r];
+    for (const s of this.rects) {
+      const next = [];
+      for (const piece of pending) {
+        if (rIntersects(piece, s)) next.push(...rSplit(piece, s));
+        else next.push(piece);
+      }
+      pending = next;
+      if (!pending.length) return;
+    }
+    this.rects.push(...pending);
+  }
+}
+
+// Which nodes are buried? Walk paint order from the top down: everything at one level is tested
+// against what is already above it before any of that level is added, so siblings never occlude
+// each other.
+function occludedNodes(geo) {
+  const covered = new Set();
+  if (!geo) return covered;
+  const levels = new Map();
+  for (const p of geo.painted) {
+    if (!levels.has(p.paint)) levels.set(p.paint, []);
+    levels.get(p.paint).push(p);
+  }
+  const union = new RectUnion();
+  const byBid = new Map();
+  for (const [bid, g] of geo.nodes) if (g.rect && g.paint != null) byBid.set(bid, g);
+  for (const paint of [...levels.keys()].sort((a, b) => b - a)) {
+    const group = levels.get(paint);
+    for (const [bid, g] of byBid) if (g.paint === paint && union.covers(g.rect)) covered.add(bid);
+    for (const p of group) if (p.opaque) union.add(p.rect);
+  }
+  return covered;
 }
 
 // Chrome renders a date/time input by locale but only accepts a value in one wire format, so a model
@@ -1055,6 +1118,7 @@ async function dispatch(method, p) {
       const geo = await domSnapshotIndex(p.tabId);
       let coveredCount = 0;
       if (geo) {
+        const buried = occludedNodes(geo);
         for (const e of cur.values()) {
           if (e.__bid == null) continue;
           const g = geo.nodes.get(e.__bid);
@@ -1063,8 +1127,9 @@ async function dispatch(method, p) {
           // A password's value must never reach the transcript, whatever the AX tree offers.
           if (type === 'password') delete e.value;
           if (DATE_FORMATS[type] && !e.value) e.format = DATE_FORMATS[type];
-          const hit = occludedBy(g.rect, geo.painted, g.paint);
-          if (hit) { e.covered = true; coveredCount++; }
+          // Only worth saying about something you would actually try to click. A landmark or a
+          // container being overlapped is normal page layout, not a problem to report.
+          if (INTERACTIVE.has(e.role) && buried.has(e.__bid)) { e.covered = true; coveredCount++; }
         }
       }
 
