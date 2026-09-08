@@ -161,6 +161,9 @@ export function makeRecorder({ MAP }) {
     },
     after(tool, args, pre, result) {
       if (!rec || !pre) return;
+      // validate does not throw on a failed assertion — it reports it. Recording that would replay
+      // a check that is known to fail, so a red validate is dropped just like a thrown action.
+      if (tool === 'validate' && result && result.ok === false) return;
       const { tabId, target, fp } = pre;
       const { ref, selector, ...rest } = args; // the session ref is replaced by the durable target
       rec.steps.push({ tool, args: { ...rest, tabId: undefined }, ...(target ? { target } : {}), before: fp, ...(result && result.status && result.status.url ? { afterUrl: normalizeUrl(result.status.url) } : {}) });
