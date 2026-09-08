@@ -114,17 +114,23 @@ export function makeRecorder({ MAP }) {
 
   // Turn a ref the model used into something that survives the session.
   const durableTarget = async (tabId, args) => {
-    if (args.selector && !args.ref) return { selector: args.selector };
-    if (!args.ref) return null;
+    // The intent, when given, travels with the target: on replay it both confirms the selector
+    // still points at the right control and finds the control again if the selector has died.
+    const intent = args.intent ? { intent: String(args.intent) } : {};
+    if (args.selector && !args.ref) return { selector: args.selector, ...intent };
+    if (!args.ref) return args.intent ? { ...intent } : null;
     try {
       const g = await MAP.generate_locator({ tabId, ref: args.ref });
-      if (g.best && /^page\.locator\(/.test(g.best)) return { selector: JSON.parse(g.best.slice('page.locator('.length, -1)) };
+      const el = g.element || {};
+      // Without an explicit intent, the element's own label serves as one — it is what a human
+      // would say they clicked, and it is exactly the check that catches a reshuffled id.
+      const inferred = args.intent ? intent : (el.ariaLabel || el.text) ? { intent: String(el.ariaLabel || el.text).slice(0, 80) } : {};
+      if (g.best && /^page\.locator\(/.test(g.best)) return { selector: JSON.parse(g.best.slice('page.locator('.length, -1)), ...inferred };
       if (g.semantic && g.semantic.count === 1) {
         const m = g.semantic.locator.match(/getByRole\("([^"]+)", \{ name: (".*") \}\)/);
-        if (m) return { role: m[1], name: JSON.parse(m[2]) };
+        if (m) return { role: m[1], name: JSON.parse(m[2]), ...inferred };
       }
-      const el = g.element || {};
-      return { fragile: true, hint: `${el.tag || 'element'} "${(el.text || el.ariaLabel || '').slice(0, 60)}"`, ...(g.semantic ? { role: g.semantic.locator.match(/getByRole\("([^"]+)"/)?.[1], name: g.semantic.locator.match(/name: (".*") \}/)?.[1] && JSON.parse(g.semantic.locator.match(/name: (".*") \}/)[1]) } : {}) };
+      return { fragile: true, ...inferred, hint: `${el.tag || 'element'} "${(el.text || el.ariaLabel || '').slice(0, 60)}"`, ...(g.semantic ? { role: g.semantic.locator.match(/getByRole\("([^"]+)"/)?.[1], name: g.semantic.locator.match(/name: (".*") \}/)?.[1] && JSON.parse(g.semantic.locator.match(/name: (".*") \}/)[1]) } : {}) };
     } catch { return { fragile: true }; }
   };
 
@@ -184,13 +190,15 @@ export async function runFlow({ MAP, name, tabId, variables, stopOnDrift }) {
 
   const resolveTarget = async (target) => {
     if (!target) return {};
-    if (target.selector) return { selector: target.selector };
+    if (target.selector) return { selector: target.selector, ...(target.intent ? { intent: target.intent } : {}) };
     if (target.role && target.name) {
       const page = await MAP.read_page({ tabId, full: true, mode: 'interact' });
       const hits = (page.elements || []).filter((e) => String(e.role).toLowerCase() === String(target.role).toLowerCase() && e.name === target.name);
       if (hits.length === 1) return { ref: hits[0].ref };
+      if (target.intent) return { intent: target.intent };
       throw new Error(`target ${target.role} "${target.name}" matched ${hits.length} elements`);
     }
+    if (target.intent) return { intent: target.intent };
     throw new Error('step has no usable target' + (target.hint ? ` (recorded as ${target.hint})` : ''));
   };
 
