@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { runScript } from './browserapi.mjs';
-import { makeRecorder, runFlow, listFlows, loadFlow, deleteFlow, FLOW_DIR } from './flows.mjs';
+import { makeRecorder, runFlow, listFlows, loadFlow, deleteFlow, FLOW_DIR, compileUserRecording, saveFlow, templatize } from './flows.mjs';
 import zlib from 'node:zlib';
 
 const VERSION = '0.12.0';
@@ -167,7 +167,7 @@ function runMcpServer() {
   const SLOW = {
     getUserTabs: 10000, listDownloads: 10000, activateTab: 10000, release: 10000,
     navigate: 180000, reload: 180000, executeCdp: 120000, waitFor: 35000,
-    waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000, perfStop: 120000, perfStart: 60000,
+    waitDownload: 130000, fetchAssets: 190000, requestCredential: 310000, perfStop: 120000, perfStart: 60000, userRecordStart: 20000, userRecordStop: 20000,
   };
   const DEFAULT_BUDGET = 60000;
 
@@ -243,6 +243,7 @@ function runMcpServer() {
     { name: 'validate', description: "Prove an action landed, in ONE cheap call, before you report it done. Every check runs and returns its evidence, so a failure tells you what the page actually shows. Page-level: urlIncludes / urlMatches(regex) / titleIncludes / text (present, string or array) / textAbsent. Element-level (by ref or a unique CSS selector): visible / enabled / checked / value / textContains. All given checks must pass for ok:true. Deterministic — no model call — so it is the right thing to run after every submit instead of a second read_page.", inputSchema: { type: 'object', properties: { tabId: num, intent: str, ref: str, selector: str, urlIncludes: str, urlMatches: str, titleIncludes: str, text: {}, textAbsent: {}, visible: { type: 'boolean' }, enabled: { type: 'boolean' }, checked: { type: 'boolean' }, value: str, textContains: str }, required: ['tabId'] } },
     { name: 'emulate', description: "Emulate conditions on a controlled tab — for testing, not for normal browsing. cpuThrottlingRate (4 = 4x slower) · networkConditions ('Offline'|'Slow 3G'|'Fast 3G'|'Slow 4G'|'Fast 4G'|'none') · colorScheme ('dark'|'light'|'auto') · userAgent (string; '' clears) · geolocation ('lat,lng'; '' clears) · extraHttpHeaders ({}) · viewport ('390x844x3,mobile,touch' or '' to clear). Each given key is applied; reset:true clears everything. Nothing is undone for you — reset when done.", inputSchema: { type: 'object', properties: { tabId: num, cpuThrottlingRate: num, networkConditions: str, colorScheme: str, userAgent: str, geolocation: str, extraHttpHeaders: { type: 'object' }, viewport: str, reset: { type: 'boolean' } }, required: ['tabId'] } },
     { name: 'perf_trace', description: "Why is this page slow? action:'start' {reload:true} begins a trace and reloads so the load is measured (interact with the page afterwards if you want INP); action:'stop' returns Core Web Vitals (LCP, CLS, INP, FCP, TTFB) each rated good/needs-improvement/poor, long tasks, render-blocking and slowest resources, and NAMED insights with what to do about each — plus the raw trace written to a .json.gz you can open in DevTools or Perfetto. Combine with emulate for 'on a slow phone'.", inputSchema: { type: 'object', properties: { tabId: num, action: str, reload: { type: 'boolean' }, ignoreCache: { type: 'boolean' } }, required: ['tabId', 'action'] } },
+    { name: 'user_record', description: "Let the USER show you once. action:'start' watches their real clicks, typing (coalesced into the final value per field), selects and Enter in a controlled tab — across navigations — computing a durable locator for each target at the moment it happens. action:'stop' returns a ready-to-run `run` script AND, with saveAs:'name', a saved flow you can flow_run later (variables:{email:'…'} turns those literal values into %email%). Password values are never captured: they become fill({secret:NAME}) placeholders. Tell the user when you start and when you stop.", inputSchema: { type: 'object', properties: { tabId: num, action: str, saveAs: str, description: str, variables: { type: 'object' } }, required: ['tabId', 'action'] } },
     { name: 'flow_record', description: "Compile what you are about to do into a REPLAYABLE flow, so next time it runs without you. action:'start' {name} — then work normally with the atomic tools (click/fill/press_key/navigate/wait_for/validate…); every state-changing call is captured with a fingerprint of the page it acted on, refs are converted to durable locators, and reads are NOT recorded (on replay they vanish — that is the point). action:'stop' {variables:{email:'ada@x.com'}} replaces those literal values with %email% so one flow serves every value; action:'cancel' discards. Use secret:'NAME' for passwords while recording — the name is stored, never the value. act_batch is not recorded; use atomic tools while recording.", inputSchema: { type: 'object', properties: { action: str, name: str, description: str, tabId: num, variables: { type: 'object' } }, required: ['action'] } },
     { name: 'flow_run', description: "Replay a recorded flow in one call — no model turns per step. variables:{} fills the %placeholders%. Each step first compares the page against the fingerprint it was recorded on; a changed page with a still-unique target proceeds and is reported as drift (cacheStatus HIT-DRIFTED), a target that no longer resolves stops the flow with the failing step index and what the page shows, so you heal that ONE step by hand and re-record. cacheStatus: HIT | HIT-DRIFTED | STALE | FAILED. stopOnDrift:true to refuse any drift.", inputSchema: { type: 'object', properties: { name: str, tabId: num, variables: { type: 'object' }, stopOnDrift: { type: 'boolean' } }, required: ['name', 'tabId'] } },
     { name: 'flows', description: "Saved flows on disk. action:'list' (name, origin, steps, variables, runs, last status) · 'show' {name} (the full step list, for editing) · 'delete' {name}. Flow files are plain JSON — portable, and can be committed alongside a project.", inputSchema: { type: 'object', properties: { action: str, name: str }, required: ['action'] } },
@@ -313,6 +314,22 @@ function runMcpServer() {
       }
       const { trace, ...rest } = r;
       return { ...rest, insights: perfInsights(r.metrics || {}), trace: file, ...(r.truncated ? { note: 'trace exceeded 96MB and was truncated on disk; metrics are unaffected' } : {}) };
+    },
+    user_record: async (a) => {
+      const act = String(a.action || '');
+      if (act === 'start') return callHost('userRecordStart', a);
+      if (act === 'cancel') { await callHost('userRecordStop', { ...a, cancel: true }); return { cancelled: true }; }
+      if (act !== 'stop') throw new Error('user_record action must be start, stop, or cancel');
+      const r = await callHost('userRecordStop', a);
+      const c = compileUserRecording(r);
+      let flow = null;
+      if (a.saveAs) {
+        const steps = c.steps.map((st) => ({ ...st, args: templatize(st.args, a.variables) }));
+        const origin = (() => { try { return new URL(r.startUrl).origin; } catch { return null; } })();
+        const f = { name: String(a.saveAs), description: a.description || 'recorded from the user', origin, variables: Object.keys(a.variables || {}), steps, recordedAt: new Date().toISOString(), runs: 0, recordedFrom: 'user' };
+        flow = { saved: f.name, file: await saveFlow(f), steps: steps.length, note: 'Recorded from the user, so steps carry no page fingerprints — replay relies on each target resolving uniquely (and its intent agreeing). Run it once with flow_run to confirm.' };
+      }
+      return { events: (r.events || []).length, durationMs: r.durationMs, script: c.script, ...(c.secrets.length ? { secrets: c.secrets, note: 'register these with secret_set before running: ' + c.secrets.join(', ') } : {}), ...(c.fragile.length ? { fragileSteps: c.fragile } : {}), ...(flow ? { flow } : {}) };
     },
     flow_record: async (a) => {
       const act = String(a.action || '');

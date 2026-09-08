@@ -244,3 +244,43 @@ export async function runFlow({ MAP, name, tabId, variables, stopOnDrift }) {
   await saveFlow(flow).catch(() => {});
   return report;
 }
+
+// ---------------------------------------------------------------------------------------------
+// User recording → script + flow. Events come from the in-page recorder (see USER_RECORDER in the
+// extension): document / click / fill / fill-secret / select / press / submit, each with a durable
+// locator computed at event time.
+const locCode = (t) => {
+  if (!t) return 'page.locator("?")';
+  if (t.selector) return `page.locator(${JSON.stringify(t.selector)})`;
+  if (t.role && t.name) return `page.getByRole(${JSON.stringify(t.role)}, { name: ${JSON.stringify(t.name)} })`;
+  return `page.getByText(${JSON.stringify((t.hint || '').replace(/^\w+ "|"$/g, ''))}) /* FRAGILE: no unique locator was available */`;
+};
+const stepTarget = (t) => (t && (t.selector ? { selector: t.selector } : t.role && t.name ? { role: t.role, name: t.name } : { fragile: true, hint: t.hint }));
+
+export function compileUserRecording({ events, startUrl }) {
+  const lines = [], steps = [], secrets = new Set(), fragile = [];
+  let first = true, sawAction = false;
+  for (const e of events || []) {
+    const t = e.target;
+    const intent = e.label ? { intent: String(e.label).slice(0, 80) } : {};
+    if (t && t.fragile) fragile.push(steps.length);
+    switch (e.type) {
+      case 'document':
+        if (first) { lines.push(`await page.goto(${JSON.stringify(e.url)});`); steps.push({ tool: 'navigate', args: { url: e.url } }); first = false; }
+        else if (sawAction) { lines.push(`await page.waitForLoadState(); // navigated to ${e.url}`); steps.push({ tool: 'wait_for', args: { state: 'load' } }); }
+        break;
+      case 'click': sawAction = true; lines.push(`await ${locCode(t)}.click();${e.label ? ' // ' + e.label : ''}`); steps.push({ tool: 'click', args: {}, target: { ...stepTarget(t), ...intent } }); break;
+      case 'fill': sawAction = true; lines.push(`await ${locCode(t)}.fill(${JSON.stringify(e.value ?? '')});`); steps.push({ tool: 'fill', args: { value: e.value ?? '' }, target: { ...stepTarget(t), ...intent } }); break;
+      case 'fill-secret': { sawAction = true; const name = String(e.field || 'password').replace(/[^\w-]+/g, '_'); secrets.add(name);
+        lines.push(`await ${locCode(t)}.fill({ secret: ${JSON.stringify(name)} }); // value never recorded — secret_set ${JSON.stringify(name)} first`);
+        steps.push({ tool: 'fill', args: { secret: name }, target: { ...stepTarget(t), ...intent } }); break; }
+      case 'select': sawAction = true; lines.push(`await ${locCode(t)}.selectOption(${JSON.stringify(e.value)});`); steps.push({ tool: 'select_option', args: { value: e.value }, target: { ...stepTarget(t), ...intent } }); break;
+      case 'press': sawAction = true; lines.push(`await ${locCode(t)}.press(${JSON.stringify(e.key || 'Enter')});`); steps.push({ tool: 'press_key', args: { key: e.key || 'Enter' } }); break;
+      case 'submit': break; // the click or Enter that caused it is already recorded
+      default: break;
+    }
+  }
+  if (!steps.some((s) => s.tool !== 'navigate' && s.tool !== 'wait_for')) throw new Error('nothing actionable was recorded — no clicks, typing or selections happened while recording');
+  const script = lines.join('\n');
+  return { script, steps, secrets: [...secrets], fragile };
+}
