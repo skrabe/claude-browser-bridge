@@ -116,5 +116,14 @@ const store = {};
   ok('a legacy bare-id record is ignored', !(await ctx.isAgentTab(USER_TAB)));
 }
 
+// A duplicate top-level `function` name does not throw — the last declaration silently wins and
+// every earlier caller starts getting the wrong implementation. That is invisible until something
+// far away breaks, so check it here where it is cheap.
+{
+  const names = [...code.matchAll(/^(?:async\s+)?function\s+([$\w]+)\s*\(/gm)].map((m) => m[1]);
+  const dupes = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
+  ok('no duplicate top-level function names' + (dupes.length ? ` (found: ${dupes.join(', ')})` : ''), dupes.length === 0);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

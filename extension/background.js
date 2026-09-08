@@ -229,7 +229,7 @@ async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId
 // so on its own it will happily offer you a button that a cookie modal is covering. DOMSnapshot
 // answers all of that at once — bounds, paint order and attributes for every node — for the price
 // of a single round trip, which is why it is worth doing here rather than per element.
-async function pageGeometry(tabId, sessionId) {
+async function domSnapshotIndex(tabId, sessionId) {
   let snap;
   try {
     snap = await cmd(dbgOf(tabId, sessionId), 'DOMSnapshot.captureSnapshot', {
@@ -953,7 +953,7 @@ async function dispatch(method, p) {
 
       // Enrich the main frame with geometry + attributes. Best-effort: if the snapshot fails we
       // still return a perfectly usable tree, just without the covered/format annotations.
-      const geo = await pageGeometry(p.tabId);
+      const geo = await domSnapshotIndex(p.tabId);
       let coveredCount = 0;
       if (geo) {
         for (const e of cur.values()) {
