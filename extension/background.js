@@ -285,7 +285,7 @@ const USER_RECORDER = `(() => {
   const esc = (v) => (window.CSS && CSS.escape ? CSS.escape(v) : v);
   const label = (el) => {
     const a = el.getAttribute('aria-label'); if (a) return a.trim();
-    if (el.labels && el.labels[0]) return (el.labels[0].textContent || '').trim();
+    if (el.labels && el.labels[0]) { let t = el.labels[0].textContent || ''; const own = el.textContent || ''; if (own && t.includes(own)) t = t.replace(own, ''); t = t.replace(/\\s+/g, ' ').trim(); if (t) return t.slice(0, 80); }
     const t = (el.innerText || el.textContent || el.value || el.getAttribute('placeholder') || el.getAttribute('title') || '').replace(/\\s+/g, ' ').trim();
     return t.slice(0, 80);
   };
@@ -1006,8 +1006,17 @@ async function resolveSelector(method, p) {
     const cands = await intentCandidates(p.tabId, p.intent);
     const mine = cands.find((c) => s.refs.get(c.ref)?.backendNodeId === node.backendNodeId);
     const best = cands[0];
-    if (!mine) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to an element that does not match ${JSON.stringify(p.intent)} at all${best ? ` — the intent points at ${best.ref} ${best.role} "${best.name}"` : ''}. Refusing; re-target by ref from a fresh read_page.`);
-    if (best && best.score > mine.score) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${mine.name}", but ${JSON.stringify(p.intent)} points more strongly at ${best.ref} ${best.role} "${best.name}". Refusing; re-target by ref.`);
+    if (mine) {
+      if (best && best.score > mine.score) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${mine.name}", but ${JSON.stringify(p.intent)} points more strongly at ${best.ref} ${best.role} "${best.name}". Refusing; re-target by ref.`);
+    } else {
+      // Not in the a11y candidates at all. That is what a role-less clickable looks like, not
+      // evidence of disagreement — so judge by the element's own label, strictly: one text must
+      // contain the other. A label that says something else entirely is the stale-id case.
+      let label = '';
+      try { const objectId = await objectFor(p.tabId, node.backendNodeId); const r = await cmd(p.tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: DESCRIBE_FN, returnByValue: true }); label = String(r.result?.value?.label || '').toLowerCase().trim(); } catch {}
+      const want = String(p.intent).toLowerCase().trim();
+      if (label && !label.includes(want) && !want.includes(label)) throw new Error(`selector ${JSON.stringify(p.selector)} resolves to "${label}", which does not look like ${JSON.stringify(p.intent)}${best ? ` — the intent points at ${best.ref} ${best.role} "${best.name}"` : ''}. Refusing; re-target by ref from a fresh read_page.`);
+    }
   }
   const ref = 's' + (++s.seq);
   s.refs.set(ref, { backendNodeId: node.backendNodeId, sessionId: undefined });
