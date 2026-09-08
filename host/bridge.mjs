@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { runScript } from './browserapi.mjs';
+import { makeRecorder, runFlow, listFlows, loadFlow, deleteFlow, FLOW_DIR } from './flows.mjs';
 
 const VERSION = '0.12.0';
 // Overridable so tests can run against their own socket instead of borrowing (and breaking) the
@@ -218,6 +219,9 @@ function runMcpServer() {
     { name: 'tabs_list', description: "List the user's real open tabs across all windows (id, title, url, tabGroup). Prefer claiming an existing tab over opening a new one.", inputSchema: { type: 'object', properties: {} } },
     { name: 'browser_manage', description: "Organize the browser itself (not page content): windows, tab groups, pinning, and bookmarks. namespace + method + args mirror the Chrome extension APIs — tabs.query({url}) / tabs.update(id,{pinned}) / tabs.group({tabIds}) / tabGroups.update(id,{title,color}) / windows.update(id,{focused,width,height}) / bookmarks.search({query}) / bookmarks.create({title,url,parentId}) / bookmarks.move(id,{parentId}). Use namespace:'audit' to list the changes made this session with the state before each one, which is how you tell the user what changed or put it back. Search/query first and act on the ids you get; confirm before deleting a bookmark or closing the user's tabs.", inputSchema: { type: 'object', properties: { namespace: str, method: str, args: { type: 'array' } }, required: ['namespace'] } },
     { name: 'validate', description: "Prove an action landed, in ONE cheap call, before you report it done. Every check runs and returns its evidence, so a failure tells you what the page actually shows. Page-level: urlIncludes / urlMatches(regex) / titleIncludes / text (present, string or array) / textAbsent. Element-level (by ref or a unique CSS selector): visible / enabled / checked / value / textContains. All given checks must pass for ok:true. Deterministic — no model call — so it is the right thing to run after every submit instead of a second read_page.", inputSchema: { type: 'object', properties: { tabId: num, ref: str, selector: str, urlIncludes: str, urlMatches: str, titleIncludes: str, text: {}, textAbsent: {}, visible: { type: 'boolean' }, enabled: { type: 'boolean' }, checked: { type: 'boolean' }, value: str, textContains: str }, required: ['tabId'] } },
+    { name: 'flow_record', description: "Compile what you are about to do into a REPLAYABLE flow, so next time it runs without you. action:'start' {name} — then work normally with the atomic tools (click/fill/press_key/navigate/wait_for/validate…); every state-changing call is captured with a fingerprint of the page it acted on, refs are converted to durable locators, and reads are NOT recorded (on replay they vanish — that is the point). action:'stop' {variables:{email:'ada@x.com'}} replaces those literal values with %email% so one flow serves every value; action:'cancel' discards. Use secret:'NAME' for passwords while recording — the name is stored, never the value. act_batch is not recorded; use atomic tools while recording.", inputSchema: { type: 'object', properties: { action: str, name: str, description: str, tabId: num, variables: { type: 'object' } }, required: ['action'] } },
+    { name: 'flow_run', description: "Replay a recorded flow in one call — no model turns per step. variables:{} fills the %placeholders%. Each step first compares the page against the fingerprint it was recorded on; a changed page with a still-unique target proceeds and is reported as drift (cacheStatus HIT-DRIFTED), a target that no longer resolves stops the flow with the failing step index and what the page shows, so you heal that ONE step by hand and re-record. cacheStatus: HIT | HIT-DRIFTED | STALE | FAILED. stopOnDrift:true to refuse any drift.", inputSchema: { type: 'object', properties: { name: str, tabId: num, variables: { type: 'object' }, stopOnDrift: { type: 'boolean' } }, required: ['name', 'tabId'] } },
+    { name: 'flows', description: "Saved flows on disk. action:'list' (name, origin, steps, variables, runs, last status) · 'show' {name} (the full step list, for editing) · 'delete' {name}. Flow files are plain JSON — portable, and can be committed alongside a project.", inputSchema: { type: 'object', properties: { action: str, name: str }, required: ['action'] } },
     { name: 'generate_locator', description: "Turn a ref into a DURABLE locator you can reuse — in a `run` script, or tomorrow. A ref only points into this session's tree; a locator is a rule that finds the element again. Walks the durability ladder (data-testid -> stable data-* / name -> href -> role + accessible name -> tag) and reports how many elements each candidate actually matches, so an already-ambiguous suggestion is visibly ambiguous. `best` is the one that resolves to exactly one element; if there is none it says so and you should scope to a container instead.", inputSchema: { type: 'object', properties: { tabId: num, ref: str, selector: str }, required: ['tabId'] } },
     { name: 'peek_tab', description: "Read one of the user's open tabs WITHOUT taking it over: returns title, url and visible text. No debugger attach, no 'being debugged' banner, nothing taken from the user — so this is the right way to answer 'what does that other tab say'. Claim the tab only when you need to ACT on it.", inputSchema: { type: 'object', properties: { tabId: num, limit: num }, required: ['tabId'] } },
     { name: 'tab_claim', description: 'Take control of an EXISTING tab in place by id (from tabs_list). Attaches the debugger; does not open a new tab.', inputSchema: { type: 'object', properties: { tabId: num }, required: ['tabId'] } },
@@ -273,6 +277,21 @@ function runMcpServer() {
     tabs_list: (a) => callHost('getUserTabs', {}),
     browser_manage: (a) => callHost('manage', a),
     validate: (a) => callHost('validate', a),
+    flow_record: async (a) => {
+      const act = String(a.action || '');
+      if (act === 'start') return recorder.start(a);
+      if (act === 'stop') return recorder.stop(a);
+      if (act === 'cancel') return recorder.cancel();
+      throw new Error('flow_record action must be start, stop, or cancel');
+    },
+    flow_run: (a) => runFlow({ MAP, name: a.name, tabId: a.tabId, variables: a.variables || {}, stopOnDrift: !!a.stopOnDrift }),
+    flows: async (a) => {
+      const act = String(a.action || 'list');
+      if (act === 'list') return { dir: FLOW_DIR, flows: await listFlows(), ...(recorder.active() ? { recording: recorder.name(), stepsSoFar: recorder.steps() } : {}) };
+      if (act === 'show') return loadFlow(a.name);
+      if (act === 'delete') return { deleted: await deleteFlow(a.name), name: a.name };
+      throw new Error('flows action must be list, show, or delete');
+    },
     generate_locator: (a) => callHost('generateLocator', a),
     peek_tab: (a) => callHost('peekTab', a),
     tab_claim: (a) => callHost('claimTab', a),
@@ -396,6 +415,8 @@ function runMcpServer() {
     },
   };
 
+  const recorder = makeRecorder({ MAP });
+
   const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
   let inbuf = '';
   process.stdin.on('data', (d) => {
@@ -410,7 +431,12 @@ function runMcpServer() {
     else if (msg.method === 'tools/call') {
       try {
         const fn = MAP[msg.params.name]; if (!fn) throw new Error('unknown tool: ' + msg.params.name);
-        const r = await fn(msg.params.arguments || {});
+        const args = msg.params.arguments || {};
+        // While a flow is being recorded, capture the page fingerprint BEFORE the action and the
+        // step itself only after it succeeded — a failed attempt is not something to replay.
+        const pre = await recorder.before(msg.params.name, args);
+        const r = await fn(args);
+        if (pre) recorder.after(msg.params.name, args, pre, r);
         // An image result carries its geometry alongside it (__meta): without the scale and origin
         // the model cannot map a pixel it reads off the picture back to a clickable coordinate.
         const content = (r && r.__image)
