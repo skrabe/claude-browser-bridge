@@ -99,8 +99,12 @@ Playwright's current name for `type(v)` — both work, and neither clears the fi
   to open, wait for the option to render, then click it.
 - **Secrets:** `.fill({secret:'NAME'})` fills a value registered via `secret_set` without putting
   the literal in your script — it's auto-redacted from every result. Prefer it for passwords/OTPs.
-- **Formatted fields lie:** after filling a phone/date/currency/card field, read `.inputValue()`
-  back and reconcile — a mask silently rewrites what you typed.
+- **Formatted fields lie:** a mask or `maxlength` silently rewrites what you typed. The atomic
+  `fill` now reads the value back for you and returns `mismatch` when the field didn't keep it —
+  act on that rather than assuming the value took. Inside `run`, check `.inputValue()` yourself.
+- **Date/time inputs take one format, whatever they display.** Chrome renders them by locale but
+  only accepts the wire format, so a plausible `03/15/2026` sets nothing at all. `read_page` states
+  the expected `format` on those elements — use it.
 - **Choice controls: match the EXACT rendered label, never a paraphrase.** "I am not a protected
   veteran" is not "No" — map yes/no-shaped data straight onto the matching exact-text option, and
   **never invert it**. A checkbox/radio that reports hidden or won't change → click its scoped
@@ -254,6 +258,10 @@ the verification you need.
   not routinely); `screenshot:true` returns structure *and* a marked picture of the same state in one
   call, for when you need to see layout rather than read it. A navigation resets the baseline, so the
   first read on a new page is automatically full.
+  - Elements marked **`covered:true`** are painted over by an overlay (modal, dropdown, cookie
+    banner) and cannot be clicked until it is dismissed — the result also carries a count. This is
+    the most common reason a click silently does nothing, so deal with the overlay first rather than
+    retrying the buried control.
   - **`unchanged:true` is a finding, not a retry cue.** It means your last action changed nothing.
     Don't fire the same action again and don't fall to coordinates — look for the reason: a modal or
     cookie banner over the target, a disabled control, a still-loading page (`wait_for`), or the
@@ -275,7 +283,9 @@ the verification you need.
 - **Lens choice:** `read_page` for structure/refs (and the cheap delta after each action), `read_text` for prose, `find_text` for "does X
   appear", `screenshot` for visual layout. Pick the **one** that answers the next question.
 
-**Act** (by ref): `click` (right/middle via `button:`, `double:true`) · `fill` · `type_text` ·
+**Act** (by ref, or by a unique CSS `selector` — which saves the `dom_query` round trip when you
+already know it; matching more than one element is an error, not a licence to take the first):
+`click` (right/middle via `button:`, `double:true`) · `fill` · `type_text` ·
 `press_key` · `select_option` · `scroll` · `hover` · `drag` · `upload_file` · `select_text`.
 `fill`/`type_text` also take `{secret:"NAME"}`. The acting judgment above (exact labels, checkbox
 `label[for]`, don't-assume-navigation) applies here too.
@@ -370,7 +380,10 @@ the verification you need.
   stale/not-ready (re-observe, don't busy-wait). Count >1 → scope to the right container, never take
   "the first" blindly.
 - **Durability ladder** for a re-findable selector: `data-testid` → other stable `data-*` → stable
-  `href` → role + accessible name → scoped text → scoped CSS.
+  `href` → role + accessible name → scoped text → scoped CSS. **`generate_locator({ref})` walks it
+  for you** and reports how many elements each candidate matches — use it whenever you're about to
+  write a ref into a `run` script or hand a selector back to the user, because a ref dies with the
+  page and a locator doesn't.
 - Generic labels (`Menu`, `Close`, `Search`, size letters `S/M/L`) and repeated `href`s on grids/
   carousels are **ambiguous by default** — identify the stable card/container first, then scope in.
 - Resolve "the first/last X" from **rendered order**, not DOM source order.

@@ -765,7 +765,26 @@ async function tabUrl(tabId, tab) {
 // console error/warning counts) so the model can often skip a follow-up read_page. Best-effort:
 // a failure here never affects the action's own result.
 const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'drag', 'navigate', 'reload', 'hover', 'goBack', 'goForward', 'setFiles', 'handleDialog']);
+// Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
+// once. Saves the dom_query round trip when you already know the selector — and it is strict on
+// purpose: matching several elements is an ambiguous instruction, not a licence to take the first.
+const REF_TOOLS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'hover', 'drag', 'setFiles', 'selectText', 'generateLocator', 'screenshot']);
+async function resolveSelector(method, p) {
+  if (!p || !p.selector || p.ref || !REF_TOOLS.has(method) || p.tabId == null) return p;
+  await need(p.tabId);
+  const s = st(p.tabId);
+  const { root } = await cmd(p.tabId, 'DOM.getDocument', { depth: 0 });
+  const { nodeIds } = await cmd(p.tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: p.selector });
+  if (!nodeIds.length) throw new Error(`selector ${JSON.stringify(p.selector)} matched no element — check it with dom_query, or target by ref from read_page (a selector cannot cross into a cross-origin frame)`);
+  if (nodeIds.length > 1) throw new Error(`selector ${JSON.stringify(p.selector)} matched ${nodeIds.length} elements — narrow it, or pick one with dom_query and act by ref`);
+  const { node } = await cmd(p.tabId, 'DOM.describeNode', { nodeId: nodeIds[0] });
+  const ref = 's' + (++s.seq);
+  s.refs.set(ref, { backendNodeId: node.backendNodeId, sessionId: undefined });
+  return { ...p, ref };
+}
+
 async function handle(method, p) {
+  p = await resolveSelector(method, p);
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
@@ -845,6 +864,70 @@ async function dispatch(method, p) {
         cursor: all.length ? all[all.length - 1].sequence : (s.evSeq || 0),
         events: hits, hasMore, truncated: !!s.evTruncated,
         ...(p.clear ? (s.events = [], s.evTruncated = false, { cleared: true }) : {}),
+      };
+    }
+
+    // A ref is a pointer into THIS session's tree — it dies with the page. A locator is a rule for
+    // finding the element again tomorrow, in a `run` script or a saved flow. This converts one to
+    // the other, walking the durability ladder and reporting how many elements each candidate
+    // actually matches, so a suggestion that is already ambiguous is visibly ambiguous.
+    case 'generateLocator': {
+      await need(p.tabId);
+      const s = st(p.tabId);
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const dbg = dbgOf(p.tabId, sessionId);
+      const objectId = await objectFor(dbg, backendNodeId);
+      const r = await cmd(dbg, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true,
+        functionDeclaration: `function(){
+          const el = this.nodeType === 3 ? this.parentElement : this;
+          if (!el || !el.tagName) return null;
+          const doc = el.ownerDocument;
+          const count = (sel) => { try { return doc.querySelectorAll(sel).length; } catch { return -1; } };
+          const esc = (v) => (window.CSS && CSS.escape ? CSS.escape(v) : String(v).replace(/["\\\\]/g, '\\\\$&'));
+          const at = (n) => (el.getAttribute ? el.getAttribute(n) : null);
+          const tag = el.tagName.toLowerCase();
+          const cands = [];
+          const add = (kind, selector) => { if (selector) cands.push({ kind, selector, count: count(selector) }); };
+          const testid = at('data-testid') || at('data-test-id') || at('data-test');
+          if (testid) add('testid', '[data-testid="' + testid + '"]');
+          // An id that looks generated (long hex, framework churn) is not durable, so don't lead with it.
+          if (el.id && !/^[0-9]|:r[0-9a-z]+:|^[0-9a-f]{8,}$/i.test(el.id)) add('id', '#' + esc(el.id));
+          for (const a of ['data-cy', 'data-qa', 'data-id', 'name']) { const v = at(a); if (v) add('attr', tag + '[' + a + '="' + v + '"]'); }
+          const href = at('href');
+          if (href && !/^https?:\\/\\/|^#$/.test(href)) add('href', 'a[href="' + href + '"]');
+          const type = at('type'); if (type && /^(input|button)$/.test(tag)) add('type', tag + '[type="' + type + '"]');
+          add('tag', tag);
+          return {
+            tag, text: (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
+            ariaLabel: at('aria-label'), candidates: cands,
+          };
+        }`,
+      });
+      const info = r.result?.value;
+      if (!info) throw new Error('that ref no longer resolves to an element — take a fresh read_page');
+
+      // Role + accessible name is usually the most readable durable locator, and its uniqueness is
+      // free: the tree from the last read_page already says how many elements share the pair.
+      const ax = s.ax;
+      let semantic = null;
+      if (ax) {
+        const me = [...ax.values()].find((e) => e.ref === p.ref);
+        if (me && me.name) {
+          const same = [...ax.values()].filter((e) => e.role === me.role && e.name === me.name).length;
+          semantic = { kind: 'role', locator: `page.getByRole(${JSON.stringify(String(me.role).toLowerCase())}, { name: ${JSON.stringify(me.name)} })`, count: same };
+        }
+      }
+      const unique = info.candidates.filter((c) => c.count === 1);
+      const best = (semantic && semantic.count === 1)
+        ? semantic.locator
+        : unique.length ? `page.locator(${JSON.stringify(unique[0].selector)})` : null;
+      return {
+        best,
+        ...(best ? {} : { warning: 'nothing here resolves to exactly one element — scope it to a container first (page.getByRole("row", {hasText:…}).getByRole(…))' }),
+        ...(semantic ? { semantic } : {}),
+        candidates: info.candidates,
+        element: { tag: info.tag, text: info.text, ariaLabel: info.ariaLabel },
       };
     }
 
