@@ -57,6 +57,6 @@ if [ "$FOUND" -eq 0 ]; then echo "no Chromium-family browser found"; exit 1; fi
 
 echo
 echo "Done. Now register the MCP server with Claude Code:"
-echo "  claude mcp add claude-browser -- \"$NODE\" \"$DIR/host/bridge.mjs\""
+echo "  claude mcp add browser-bridge -- \"$NODE\" \"$DIR/host/bridge.mjs\""
 echo
 echo "Then fully quit & reopen your browser so it picks up the native host."
