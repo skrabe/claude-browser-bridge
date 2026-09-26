@@ -56,9 +56,16 @@ node host/setup.mjs status       # what's installed
 node host/setup.mjs uninstall    # reverses everything (re-enables Claude-in-Chrome only if we disabled it)
 ```
 
-Installing globally also **disables the built-in Claude in Chrome** so you have one browser surface;
-`--scope project` scopes that to a single project. Uninstall restores it — but only if *we* turned
-it off. Reload the extension after any code change (a browser restart is **not** needed).
+Installing globally also **disables the built-in Claude in Chrome** so you have one browser surface:
+in the Claude Code CLI, and in the Claude Desktop app when it is installed (restart the app after
+installing; it reads its settings only at launch). `--scope project` scopes the CLI side to a single
+project and leaves the desktop app alone, since its setting is app-wide. Uninstall restores both —
+but only what *we* turned off.
+
+The MCP server is registered as `browser-bridge`, so its tools are `mcp__browser-bridge__*`.
+Installs before 0.13 used `claude-browser`, a name Claude Desktop reserves for its own browser
+server (it drops a same-named server from every desktop session). Reinstalling renames it and
+carries `mcp__claude-browser__*` permission rules over to the new name. Reload the extension after any code change (a browser restart is **not** needed).
 
 **Requirements:** macOS · Node 18+ · any Chromium-family browser on **v125+** (for
 cross-origin-iframe support). The installer detects browsers structurally — every Chromium

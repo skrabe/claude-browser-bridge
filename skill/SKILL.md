@@ -1,7 +1,7 @@
 ---
 name: browser
 description: >
-  Drive the user's real, logged-in browser from Claude Code via the claude-browser MCP
+  Drive the user's real, logged-in browser from Claude Code via the browser-bridge MCP
   tools. Use for ANY web interaction: reading pages, filling forms, clicking through flows,
   multi-tab work, debugging a live site. Everything is in this one file.
 ---

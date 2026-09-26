@@ -14,7 +14,7 @@ import { runScript } from './browserapi.mjs';
 import { makeRecorder, runFlow, listFlows, loadFlow, deleteFlow, FLOW_DIR, compileUserRecording, saveFlow, templatize } from './flows.mjs';
 import zlib from 'node:zlib';
 
-const VERSION = '0.12.0';
+const VERSION = '0.13.0';
 // Overridable so tests can run against their own socket instead of borrowing (and breaking) the
 // live one — a unix socket is bound to its path, so moving the real one aside is not reversible.
 const SOCK = process.env.CBB_SOCK || `/tmp/claude-browser-bridge-${os.userInfo().username}.sock`;
