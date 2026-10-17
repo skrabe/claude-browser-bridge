@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.13.0';
+const VERSION = '0.13.1';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -1021,6 +1021,24 @@ async function resolveSelector(method, p) {
   const ref = 's' + (++s.seq);
   s.refs.set(ref, { backendNodeId: node.backendNodeId, sessionId: undefined });
   return { ...p, ref };
+}
+
+// Hosts a public page has no business pointing the extension at: loopback, RFC 1918, link-local,
+// CGNAT (Tailscale), unique-local IPv6, single-label intranet names, and the suffixes that
+// conventionally resolve to them. A public name that resolves to a private address is not caught;
+// an extension has no DNS API to check with.
+function isPrivateHost(host) {
+  host = String(host).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (!host.includes('.') && !host.includes(':')) return true;
+  if (/(^|\.)(localhost|local|internal|lan|home\.arpa|ts\.net)$/.test(host)) return true;
+  const v4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const a = +v4[1], b = +v4[2];
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (host.includes(':')) return host === '::' || host === '::1' || host.startsWith('::ffff:') || /^f[cd][0-9a-f]{0,2}:/.test(host) || /^fe[89ab][0-9a-f]?:/.test(host);
+  return false;
 }
 
 async function handle(method, p) {
@@ -2056,6 +2074,7 @@ async function dispatch(method, p) {
 
     case 'pageAssets': {
       await need(p.tabId);
+      const before = (await cmd(p.tabId, 'Page.getFrameTree'))?.frameTree?.frame || {};
       const r = await cmd(p.tabId, 'Runtime.evaluate', {
         expression: `(()=>{
           const abs=(u)=>{try{return new URL(u,location.href).href}catch{return null}};
@@ -2082,9 +2101,15 @@ async function dispatch(method, p) {
         returnByValue: true,
       });
       const v = r.result?.value || { assets: [], inlineSvgs: [] };
+      // The origin bundle_assets trusts comes from the browser, not from the page: the page
+      // controls every value the expression above returns. Bracketing it with two reads also
+      // catches a navigation that lands mid-inventory.
+      const after = (await cmd(p.tabId, 'Page.getFrameTree'))?.frameTree?.frame || {};
+      if (!before.loaderId || before.loaderId !== after.loaderId) throw new Error('the page navigated during page_assets — call it again');
       const s = st(p.tabId);
       v.assets.forEach((a, i) => { a.id = 'a' + i; });
       s.assets = new Map(v.assets.filter((a) => a.url).map((a) => [a.id, a]));
+      s.assetsDoc = { loaderId: after.loaderId, origin: after.securityOrigin || null };
       if (p.kinds && p.kinds.length) v.assets = v.assets.filter((a) => p.kinds.includes(a.kind));
       return v;
     }
@@ -2095,10 +2120,25 @@ async function dispatch(method, p) {
       // download machinery, which means the user's own "ask where to save each file" setting opens a
       // native save panel per asset — and nobody is there to answer it during an automated bundle.
       // Fetching here and writing in the host has no UI, no permission gate, and doesn't litter the
-      // user's Downloads folder. credentials:'include' so assets behind the user's session still
-      // resolve, which is the whole point of driving their real browser.
+      // user's Downloads folder.
+      //
+      // The page chose every URL in the inventory, and this fetch runs with the extension's
+      // <all_urls> reach, so it must not hand the page more than it already has. Only the page's own
+      // origin gets the user's cookies, which the page could already read with its own fetch.
+      // Anything else goes out without cookies, a public page can't aim it at a private address, and
+      // no redirect is followed: a hop can't be checked before the browser takes it, so a
+      // same-origin URL could otherwise bounce the session, or the fetch, anywhere.
       const s = st(p.tabId);
       if (!s.assets || !s.assets.size) throw new Error('no asset inventory for this tab — call page_assets first');
+      await need(p.tabId);
+      const frame = (await cmd(p.tabId, 'Page.getFrameTree'))?.frameTree?.frame || {};
+      if (!s.assetsDoc || !frame.loaderId || frame.loaderId !== s.assetsDoc.loaderId) {
+        s.assets = null; s.assetsDoc = null;
+        throw new Error('the page has navigated since page_assets — call it again');
+      }
+      const pageOrigin = s.assetsDoc.origin;
+      let pagePrivate = false;
+      try { pagePrivate = isPrivateHost(new URL(pageOrigin).hostname); } catch {}
       let picked = [...s.assets.values()];
       if (p.assetIds && p.assetIds.length) picked = picked.filter((a) => p.assetIds.includes(a.id));
       else if (p.kinds && p.kinds.length) picked = picked.filter((a) => p.kinds.includes(a.kind));
@@ -2108,9 +2148,19 @@ async function dispatch(method, p) {
       const out = [], failures = [];
       let total = 0;
       for (const a of picked) {
+        const fail = (reason) => failures.push({ id: a.id, url: a.url.slice(0, 120), reason });
+        let u;
+        try { u = new URL(a.url); } catch { fail('not a valid URL'); continue; }
+        let init;
+        if (u.protocol === 'data:') init = { credentials: 'omit' };
+        else if (u.protocol !== 'http:' && u.protocol !== 'https:') { fail(`${u.protocol} URLs are not fetched`); continue; }
+        else if (u.origin === pageOrigin) init = { credentials: 'include', redirect: 'manual' };
+        else if (!pagePrivate && isPrivateHost(u.hostname)) { fail('private-network address on a public page; not fetched'); continue; }
+        else init = { credentials: 'omit', redirect: 'manual' };
         try {
-          const res = await fetch(a.url, { credentials: 'include' });
-          if (!res.ok) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: `HTTP ${res.status}` }); continue; }
+          const res = await fetch(u.href, init);
+          if (res.type === 'opaqueredirect') { fail('the URL redirects; bundle_assets does not follow redirects'); continue; }
+          if (!res.ok) { fail(`HTTP ${res.status}` + (init.credentials === 'omit' && u.protocol !== 'data:' ? " (fetched without cookies: not the page's origin)" : '')); continue; }
           const buf = new Uint8Array(await res.arrayBuffer());
           if (buf.length > PER_ASSET_CAP) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: `${(buf.length / 1e6).toFixed(1)} MB exceeds the 12 MB per-asset cap` }); continue; }
           if (total + buf.length > TOTAL_CAP) { failures.push({ id: a.id, url: a.url.slice(0, 120), reason: 'total bundle size cap (64 MB) reached' }); continue; }
@@ -2235,8 +2285,9 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     s.lastLoadTs = Date.now();
   } else if (cdpMethod === 'Page.frameNavigated' && !cdpParams.frame?.parentId) {
     // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
-    // it would be pure noise. Drop the baseline and let the next read_page return a full tree.
-    s.ax = null; s.listenerBids = null;
+    // it would be pure noise. Drop the baseline and let the next read_page return a full tree. The
+    // asset inventory goes too: its URLs and origin belong to the old document.
+    s.ax = null; s.listenerBids = null; s.assets = null; s.assetsDoc = null;
   } else if (cdpMethod === 'Target.attachedToTarget') {
     // A cross-origin child frame attached. Enable its domains, resolve its owner <iframe> in the
     // parent (needed for coordinate translation), and recurse auto-attach for nested frames.

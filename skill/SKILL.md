@@ -357,7 +357,10 @@ already know it; matching more than one element is an error, not a licence to ta
 - `page_assets` — inventory the files the page actually rendered (images incl. `srcset` and CSS
   backgrounds, video, stylesheets, scripts, loaded fonts, inline SVG markup). Load the UI state you
   care about first; it reports what's currently observable. `bundle_assets` downloads them and
-  returns local paths to Read. Don't navigate to an asset URL just to fetch it.
+  returns local paths to Read. Don't navigate to an asset URL just to fetch it. Only the page's own
+  origin is fetched with the user's session; other origins go without cookies, private-network
+  addresses are skipped on public pages, and redirects aren't followed. If the page navigated since
+  `page_assets`, call it again.
 
 ---
 
