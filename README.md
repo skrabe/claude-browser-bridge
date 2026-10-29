@@ -136,3 +136,5 @@ extension is a thin, generic CDP proxy — all behavior lives in the host and th
 
 Provenance: a clean-room implementation inspired by the shape of mature browser-agent tooling. All
 its own code.
+
+License: MIT, see [LICENSE](LICENSE).
