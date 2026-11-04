@@ -62,7 +62,7 @@ async function call(name, args) {
   return { data, image: image ? image.data : null };
 }
 const evalIn = async (tabId, expression) => (await call('cdp', {
-  tabId, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true },
+  tabId, method: 'Runtime.evaluate', world: 'page', params: { expression, returnByValue: true, awaitPromise: true },
 })).data?.result?.value;
 
 // ---- reporting ----
@@ -142,6 +142,7 @@ async function main() {
       const last = log[log.length - 1];
       if (last && last.hit) hit++;
       else {
+        if (process.env.CBB_DEBUG) console.log('    miss', s.name, t.tid, JSON.stringify({ want: [t.x, t.y], frame: t.frame, got: last, log: log.slice(-3), r }).slice(0, 400));
         missed++;
         if (last) offsets.push(Math.hypot(last.x - t.x, last.y - t.y));
       }

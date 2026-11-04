@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.13.1';
+const VERSION = '0.14.0';
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
@@ -175,14 +175,111 @@ async function onMessage(m) {
 
 // ---- low-level CDP ----
 // target: a tabId (number) → {tabId}, or a debuggee object {tabId, sessionId} for a child frame.
-function cmd(target, method, params = {}) {
-  const dbg = typeof target === 'number' ? { tabId: target } : target;
+function rawCmd(dbg, method, params = {}) {
   return new Promise((res, rej) => {
     chrome.debugger.sendCommand(dbg, method, params, (result) => {
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
   });
+}
+
+// ---- stealth: our own JS world ----
+//
+// The Runtime domain is the loudest thing a CDP client can turn on. With it enabled, every
+// console.* call on the page is serialized for the debugger — which reads getters on the logged
+// objects (the classic "is a debugger listening" bait) and makes logging a large object measurably
+// slower. So Runtime is never enabled. Instead every evaluation runs in an isolated world: a
+// separate JS global over the same DOM, created per frame with Page.createIsolatedWorld. Page
+// scripts cannot see anything we define there, and we get a stable contextId without the
+// executionContextCreated events Runtime.enable would have given us.
+//
+// A world dies with its document. Its id is cached per (session, frame) and re-created on demand;
+// a stale id is detected from the error and retried once.
+const WORLD = 'cbb';
+const worldKey = (dbg) => (dbg.sessionId || 'main');
+async function worldFor(dbg) {
+  const s = st(dbg.tabId);
+  if (!s.worlds) s.worlds = new Map();
+  const key = worldKey(dbg);
+  const hit = s.worlds.get(key);
+  if (hit) return hit;
+  const pending = (async () => {
+    const frameId = (await rawCmd(dbg, 'Page.getFrameTree'))?.frameTree?.frame?.id;
+    if (!frameId) throw new Error('no frame to evaluate in');
+    const { executionContextId } = await rawCmd(dbg, 'Page.createIsolatedWorld', { frameId, worldName: WORLD, grantUniveralAccess: false });
+    // Without the Runtime domain, V8 installs a named binding only into worlds that exist when
+    // addBinding is called. Re-adding it here covers every world created later (each navigation).
+    if (s.userRec) await rawCmd(dbg, 'Runtime.addBinding', { name: '__cbbUserEvent', executionContextName: WORLD }).catch(() => {});
+    return executionContextId;
+  })();
+  s.worlds.set(key, pending);
+  try { return await pending; } catch (e) { s.worlds.delete(key); throw e; }
+}
+// Only errors meaning the call never ran. "Execution context was destroyed" means it started and the
+// page navigated mid-await; re-running that could repeat a side effect (a second form submit).
+const STALE_CONTEXT = /Cannot find context|Cannot find default execution context|uniqueContextId not found/i;
+// Runtime methods that need a context (evaluate) or a node handle tied to one (resolveNode).
+// callFunctionOn carries its objectId's context, so it needs nothing as long as the object came
+// from our world — which resolveNode below guarantees.
+async function inWorld(dbg, method, params, attempt = 0) {
+  const ctx = await worldFor(dbg);
+  const p = method === 'DOM.resolveNode' ? { ...params, executionContextId: ctx } : { ...params, contextId: ctx };
+  try { return await rawCmd(dbg, method, p); }
+  catch (e) {
+    if (attempt === 0 && STALE_CONTEXT.test(String(e && e.message))) { st(dbg.tabId).worlds?.delete(worldKey(dbg)); return inWorld(dbg, method, params, 1); }
+    throw e;
+  }
+}
+// The page's own main world, for the few things that must talk to page-defined JS (WebMCP's
+// document.modelContext, a caller's explicit `cdp` Runtime.evaluate with world:"page").
+//
+// A context-less Runtime.evaluate is not the main world once any isolated world exists in the
+// frame (ours, or a content-script extension's), and nothing outside the Runtime domain reports
+// the main world's id. So this one path switches Runtime on for the few milliseconds it takes to
+// read the default context, then off again — unless console capture already has it on. Only
+// these opt-in calls pay that; every ordinary evaluation stays in the isolated world.
+async function mainWorldId(dbg) {
+  const s = st(dbg.tabId);
+  const key = 'main:' + worldKey(dbg);
+  if (!s.worlds) s.worlds = new Map();
+  const hit = s.worlds.get(key);
+  if (hit) return hit;
+  const wasOn = !!s.consoleOn;
+  const frameId = (await rawCmd(dbg, 'Page.getFrameTree'))?.frameTree?.frame?.id;
+  // Contexts are tracked from Runtime events (see the event handler), so this works whether the
+  // events arrive now (Runtime was off) or arrived earlier (console capture already on).
+  if (!wasOn) await rawCmd(dbg, 'Runtime.enable');
+  try {
+    const ctxs = s.contexts?.get(dbg.sessionId || 'main') || new Map();
+    const hit = [...ctxs.values()].find((c) => c.auxData?.isDefault && (!frameId || c.auxData?.frameId === frameId));
+    const id = hit ? hit.id : null;
+    if (id == null) throw new Error('could not find the page\'s main JS world');
+    s.worlds.set(key, id);
+    return id;
+  } finally {
+    if (!wasOn) {
+      await rawCmd(dbg, 'Runtime.disable').catch(() => {});
+      // Runtime.disable drops stored bindings; put the recorder's back.
+      if (s.userRec) await rawCmd(dbg, 'Runtime.addBinding', { name: '__cbbUserEvent', executionContextName: WORLD }).catch(() => {});
+    }
+  }
+}
+async function pageWorldEval(dbg, params, attempt = 0) {
+  const { contextId, uniqueContextId, ...rest } = params || {};
+  const ctx = await mainWorldId(dbg);
+  try { return await rawCmd(dbg, 'Runtime.evaluate', { ...rest, contextId: ctx }); }
+  catch (e) {
+    if (attempt === 0 && STALE_CONTEXT.test(String(e && e.message))) { st(dbg.tabId).worlds?.delete('main:' + worldKey(dbg)); return pageWorldEval(dbg, params, 1); }
+    throw e;
+  }
+}
+function cmd(target, method, params = {}) {
+  const dbg = typeof target === 'number' ? { tabId: target } : target;
+  // An explicit context (the `cdp` escape hatch) is honored as given.
+  if (method === 'Runtime.evaluate' && params.contextId == null && params.uniqueContextId == null) return inWorld(dbg, method, params);
+  if (method === 'DOM.resolveNode' && params.executionContextId == null) return inWorld(dbg, method, params);
+  return rawCmd(dbg, method, params);
 }
 function attach(tabId) {
   const s = st(tabId);
@@ -196,11 +293,15 @@ function attach(tabId) {
         if (s.attached || /already attached/i.test(chrome.runtime.lastError.message)) { s.attached = true; return res(); }
         return rej(new Error(chrome.runtime.lastError.message));
       }
-      s.attached = true;
+      s.attached = true; s.paused = false;
+      rawCmd({ tabId }, 'Page.getFrameTree').then((r) => { s.topFrameId = r?.frameTree?.frame?.id; }).catch(() => {});
       try {
-        for (const d of ['Page', 'DOM', 'Runtime', 'Accessibility', 'Network', 'Log']) {
+        // No Runtime here — see "stealth: our own JS world". Log carries network and
+        // intervention errors without serializing the page's own console calls.
+        for (const d of ['Page', 'DOM', 'Accessibility', 'Network', 'Log']) {
           await cmd(tabId, d + '.enable').catch(() => {});
         }
+        if (s.consoleOn) await rawCmd({ tabId }, 'Runtime.enable').catch(() => {});
         // Reach into cross-origin (out-of-process) iframes. Chrome 125+ flat sessions; older Chrome
         // just no-ops here and we stay main-frame-only.
         await cmd(tabId, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe', exclude: false }] }).catch(() => {});
@@ -221,7 +322,27 @@ function detach(tabId) {
     chrome.debugger.detach({ tabId }, () => { state.delete(tabId); res(); });
   });
 }
-async function need(tabId) { if (!state.get(tabId)?.attached) await attach(tabId); }
+async function need(tabId) {
+  const s = state.get(tabId);
+  if (s?.detaching) await s.detaching; // a handoff detach still in flight would race the attach
+  if (!state.get(tabId)?.attached) await attach(tabId);
+}
+// Let go of the debugger without forgetting the tab. Refs (backendNodeIds) stay valid for the
+// document, so work resumes where it stopped once need() re-attaches.
+function pauseTab(tabId, { keepHint = false } = {}) {
+  const s = state.get(tabId);
+  if (!s) return Promise.resolve();
+  s.paused = true;
+  const hint = keepHint ? s.challengeHint : null;
+  // Mark detached up front: everything that reads `attached` while the handoff runs (challenge
+  // detection, the next need()) must treat the tab as detached even before the callback lands.
+  const was = s.attached; s.attached = false; s.worlds = null; s.contexts = null; s.frames = new Map(); s.challengeHint = hint;
+  // Debugger-scoped work does not survive a detach; say so rather than leave flags that lie.
+  s.tracing = null; s.userRec = null; s.consoleOn = false; s.pointer = null;
+  if (!was) return Promise.resolve();
+  s.detaching = new Promise((res) => chrome.debugger.detach({ tabId }, () => { void chrome.runtime.lastError; s.detaching = null; res(); }));
+  return s.detaching;
+}
 
 // ---- page geometry + attributes, in one CDP call ----
 //
@@ -267,7 +388,9 @@ async function harvestListenerBids(tabId, candidateBids) {
     let objectId = null;
     try {
       objectId = (await cmd(tabId, 'DOM.resolveNode', { backendNodeId: bid })).object.objectId;
-      const { listeners } = await cmd(tabId, 'DOMDebugger.getEventListeners', { objectId, depth: 0 });
+      // pierce:true reports listeners from every world; our object comes from the isolated one,
+      // while the page's handlers live in its main world.
+      const { listeners } = await cmd(tabId, 'DOMDebugger.getEventListeners', { objectId, depth: 0, pierce: true });
       if ((listeners || []).some((l) => CLICKY_EVENTS.has(l.type))) bids.add(bid);
     } catch {}
     if (objectId) cmd(tabId, 'Runtime.releaseObject', { objectId }).catch(() => {});
@@ -627,19 +750,21 @@ async function checkCovered(tabId, backendNodeId, sessionId, x, y) {
 
 // Fill user-entered secrets into the page by selector (top document). Values arrive only here from
 // the popup; never logged or returned. Returns a status code (browserAuth-style).
-const SETTER_FN = 'function(v){this.focus&&this.focus();const p=Object.getOwnPropertyDescriptor(this.__proto__,"value");if(p&&p.set)p.set.call(this,v);else this.value=v;this.dispatchEvent(new Event("input",{bubbles:true}));this.dispatchEvent(new Event("change",{bubbles:true}));}';
 async function fillCredentials(pend, values) {
   const { tabId, origin, fields, submit } = pend;
   let curOrigin = ''; try { curOrigin = new URL((await chrome.tabs.get(tabId)).url).origin; } catch {}
   if (origin && curOrigin && origin !== curOrigin) return 'origin_changed';
+  await need(tabId);
   const { root } = await cmd(tabId, 'DOM.getDocument', { depth: 0 });
   for (const f of fields) {
     if (values[f.id] == null) continue;
     let nodeId;
     try { nodeId = (await cmd(tabId, 'DOM.querySelector', { nodeId: root.nodeId, selector: f.selector })).nodeId; } catch { return 'locator_invalid'; }
     if (!nodeId) return 'locator_invalid';
+    const { node } = await cmd(tabId, 'DOM.describeNode', { nodeId });
     const { object } = await cmd(tabId, 'DOM.resolveNode', { nodeId });
-    await cmd(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: SETTER_FN, arguments: [{ value: String(values[f.id]) }] });
+    // Typed, like a password manager's autofill would land: trusted keystrokes, not a value poke.
+    await fillField(tabId, tabId, object.objectId, node.backendNodeId, undefined, String(values[f.id]), { fast: true });
   }
   if (submit && submit.selector) {
     let snid;
@@ -652,6 +777,264 @@ async function fillCredentials(pend, values) {
     await cmd(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: fn });
   }
   return 'submitted';
+}
+
+// ---- human-shaped input ----
+//
+// CDP input is trusted (isTrusted:true), but its SHAPE is not human: a click with no pointer
+// movement before it, a press and release in the same millisecond, text that appears without a
+// single keystroke. Behavioral scoring (Turnstile, reCAPTCHA v3, DataDome, HUMAN) reads exactly
+// those shapes. So the pointer travels a curved path from where it last was, eases in and out,
+// and lands with a short dwell; keys go down and up with a typing rhythm.
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+// Points along a cubic Bezier from a to b, bowed off the straight line, with ease-in-out spacing.
+// Step count grows with distance (Fitts-like), so a long sweep is not a single teleport.
+function pointerPath(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, dist = Math.hypot(dx, dy);
+  if (dist < 2) return [b];
+  const steps = Math.max(6, Math.min(40, Math.round(dist / 14)));
+  const nx = -dy / dist, ny = dx / dist;
+  const bow = rnd(-0.25, 0.25) * Math.min(dist, 400);
+  const c1 = { x: a.x + dx * rnd(0.2, 0.4) + nx * bow, y: a.y + dy * rnd(0.2, 0.4) + ny * bow };
+  const c2 = { x: a.x + dx * rnd(0.6, 0.8) + nx * bow * 0.5, y: a.y + dy * rnd(0.6, 0.8) + ny * bow * 0.5 };
+  const pts = [];
+  for (let i = 1; i <= steps; i++) {
+    const u = i / steps, t = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    const m = 1 - t;
+    pts.push({
+      x: m * m * m * a.x + 3 * m * m * t * c1.x + 3 * m * t * t * c2.x + t * t * t * b.x,
+      y: m * m * m * a.y + 3 * m * m * t * c1.y + 3 * m * t * t * c2.y + t * t * t * b.y,
+    });
+  }
+  pts[pts.length - 1] = { x: b.x, y: b.y };
+  return pts;
+}
+// Glide the pointer to (x,y) from wherever this tab last left it. `buttons` keeps a held button
+// down for drags. The last position is remembered per tab so consecutive actions chain naturally.
+async function moveTo(tabId, x, y, opts = {}) {
+  const s = st(tabId);
+  const from = s.pointer || { x: Math.max(0, x - rnd(80, 260)), y: Math.max(0, y - rnd(40, 160)) };
+  for (const pt of pointerPath(from, { x, y })) {
+    await cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, ...(opts.buttons ? { button: 'left', buttons: opts.buttons } : {}) });
+    await pause(rnd(6, 16));
+  }
+  s.pointer = { x, y };
+}
+async function humanClick(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
+  await moveTo(tabId, x, y);
+  await pause(rnd(40, 110));
+  for (const clickCount of (double ? [1, 2] : [1])) {
+    await cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount, modifiers });
+    await pause(rnd(45, 120));
+    await cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount, modifiers });
+    if (double && clickCount === 1) await pause(rnd(70, 140));
+  }
+}
+// One keystroke per character with a typing rhythm. Characters that a US layout cannot produce
+// with a single key (accents, emoji, CJK) go through insertText, which an IME also uses, so the
+// field still receives a trusted input event.
+const SHIFTED_US = { '~': '`', '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0', '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\', ':': ';', '"': "'", '<': ',', '>': '.', '?': '/' };
+const CODE_US = { '`': 'Backquote', '-': 'Minus', '=': 'Equal', '[': 'BracketLeft', ']': 'BracketRight', '\\': 'Backslash', ';': 'Semicolon', "'": 'Quote', ',': 'Comma', '.': 'Period', '/': 'Slash', ' ': 'Space' };
+const VK_US = { '`': 192, '-': 189, '=': 187, '[': 219, ']': 221, '\\': 220, ';': 186, "'": 222, ',': 188, '.': 190, '/': 191, ' ': 32 };
+function keyFor(ch) {
+  if (/^[a-z]$/.test(ch)) return { key: ch, code: 'Key' + ch.toUpperCase(), vk: ch.toUpperCase().charCodeAt(0), shift: false };
+  if (/^[A-Z]$/.test(ch)) return { key: ch, code: 'Key' + ch, vk: ch.charCodeAt(0), shift: true };
+  if (/^[0-9]$/.test(ch)) return { key: ch, code: 'Digit' + ch, vk: ch.charCodeAt(0), shift: false };
+  if (CODE_US[ch]) return { key: ch, code: CODE_US[ch], vk: VK_US[ch], shift: false };
+  const base = SHIFTED_US[ch];
+  if (base) { const k = keyFor(base); return { ...k, key: ch, shift: true }; }
+  return null;
+}
+async function typeHuman(tabId, text, { fast = false, multiline = true } = {}) {
+  let prev = '';
+  // A long value types fast regardless, so a paragraph does not outrun the call budget.
+  if (String(text).length > 60) fast = true;
+  for (const ch of String(text)) {
+    // Enter in a single-line input submits its form, which a value with a newline must not do.
+    if (ch === '\n') { if (multiline) await pressNamed(tabId, 'Enter'); else await cmd(tabId, 'Input.insertText', { text: ' ' }); prev = ch; continue; }
+    const k = keyFor(ch);
+    if (!k) { await cmd(tabId, 'Input.insertText', { text: ch }); }
+    else {
+      const modifiers = k.shift ? 8 : 0;
+      await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, text: ch, unmodifiedText: ch });
+      await pause(fast ? rnd(4, 10) : rnd(25, 70));
+      await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, key: k.key, code: k.code, windowsVirtualKeyCode: k.vk });
+    }
+    // Inter-key gap: longer after spaces and punctuation, the way people pause between words.
+    const base = fast ? rnd(8, 22) : rnd(45, 140);
+    await pause(/[\s.,;:!?]/.test(prev) ? base * 1.6 : base);
+    prev = ch;
+  }
+}
+async function pressNamed(tabId, name, modifiers = 0) {
+  const k = KEYS[name];
+  await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k, ...(name === 'Enter' ? { text: '\r' } : {}) });
+  await pause(rnd(30, 80));
+  await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...k });
+}
+// Select everything in the focused field and delete it with real keys, so frameworks that track
+// edits through key/input events see the clear the same way they would see a user's.
+async function clearFocused(tabId) {
+  const mac = /Mac/i.test(navigator.userAgent);
+  const mod = mac ? 4 : 2;
+  await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mod, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, commands: ['selectAll'] });
+  await cmd(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mod, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await pause(rnd(30, 70));
+  await pressNamed(tabId, 'Backspace');
+}
+
+// Fill a field the way a person does: put the caret in it, clear what is there, type the value.
+// Inputs whose value cannot be typed character by character (date/time pickers, color, range,
+// file) and anything that is not a text control keep the direct value setter. Returns what the
+// field holds afterwards, so callers can report masks and truncation.
+const SETTER_TYPES = new Set(['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range', 'file', 'checkbox', 'radio', 'hidden', 'submit', 'button', 'reset', 'image']);
+const FIELD_INFO_FN = `function(){ const t=(this.type||'').toLowerCase(); return { tag:(this.tagName||'').toLowerCase(), type:t, editable:!!this.isContentEditable,
+  text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t)), secret:t==='password', focused:document.activeElement===this,
+  value:'value' in this?String(this.value):null }; }`;
+const SET_VALUE_FN = `function(v){
+  this.focus && this.focus();
+  const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
+  if (d && d.set) d.set.call(this, v); else this.value = v;
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+  return { got: this.value, secret: this.type === "password", type: (this.type || "").toLowerCase() };
+}`;
+async function fillField(tabId, dbg, objectId, backendNodeId, sessionId, value, { fast = false } = {}) {
+  const info = (await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FIELD_INFO_FN, returnByValue: true })).result?.value || {};
+  if (!info.text) {
+    const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: SET_VALUE_FN, arguments: [{ value }] });
+    return r.result?.value || {};
+  }
+  // Caret into the field with a real click when it is on screen; otherwise focus it directly.
+  try { const c = await absCenter(tabId, backendNodeId, sessionId); await humanClick(tabId, c.x, c.y); }
+  catch { await cmd(dbg, 'DOM.focus', { backendNodeId }).catch(() => {}); }
+  const FOCUS_FN = 'function(){return document.activeElement===this||this.contains(document.activeElement)}';
+  const isFocused = async () => (await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: FOCUS_FN })).result?.value === true;
+  if (!(await isFocused())) await cmd(dbg, 'DOM.focus', { backendNodeId }).catch(() => {});
+  // Keystrokes go to whatever has focus. If this field does not, typing could land in another box
+  // (a search field that sends as you type), so set the value directly instead.
+  if (!(await isFocused())) {
+    const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: SET_VALUE_FN, arguments: [{ value }] });
+    return { ...(r.result?.value || {}), viaSetter: true };
+  }
+  if (info.value) await clearFocused(tabId);
+  // A long value types fast; nobody waits a minute for a pasted paragraph to "type".
+  await typeHuman(tabId, value, { fast: fast || value.length > 60, multiline: info.tag === 'textarea' || info.editable });
+  const after = (await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FIELD_INFO_FN, returnByValue: true })).result?.value || {};
+  // Some widgets swallow synthetic keys (a canvas editor, an aggressive key filter). If typing left
+  // the field empty, fall back to setting the value so fill still does what it says.
+  if (value && !after.value) {
+    const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: SET_VALUE_FN, arguments: [{ value }] });
+    return { ...(r.result?.value || {}), viaSetter: true };
+  }
+  return { got: after.value, secret: info.secret, type: info.type };
+}
+
+// Resolve once a load event newer than t0 has fired, or after ms. Event-driven, so it returns the
+// moment the page loads rather than on the next poll tick.
+function loadAfter(s, t0, ms) {
+  if ((s.lastLoadTs || 0) > t0) return Promise.resolve(true);
+  return new Promise((res) => {
+    const timer = setTimeout(() => { s.loadWaiters = (s.loadWaiters || []).filter((w) => w !== wake); res(false); }, ms);
+    const wake = () => { clearTimeout(timer); res(true); };
+    (s.loadWaiters || (s.loadWaiters = [])).push(wake);
+  });
+}
+
+// ---- anti-bot challenge handoff ----
+//
+// When a site puts up a bot challenge, the right move for an agent on the user's own browser is to
+// get out of the way: detach the debugger (so not one CDP artifact is left for the challenge to
+// find), let an invisible check pass on its own, and if it needs a person, bring the tab forward
+// and wait for them. The bridge never tries to solve one.
+//
+// Detection uses only things the browser reports, never page-provided claims: the frames' URLs,
+// the document's title, and Cloudflare's cf-mitigated response header.
+// Two kinds of signal. A BLOCKING one means the site served a challenge in place of the page: the
+// cf-mitigated header, an interstitial title, or a visible challenge dialog frame (reCAPTCHA's
+// bframe, DataDome's captcha page). A WIDGET is a challenge iframe embedded in an ordinary page —
+// invisible reCAPTCHA v3, a passed Turnstile on a sign-up form — and many sites carry one on every
+// page. A widget alone is reported as information, never as a reason to stop.
+const CHALLENGE_FRAMES = [
+  { vendor: 'cloudflare', re: /^https:\/\/challenges\.cloudflare\.com\//i },
+  { vendor: 'hcaptcha', re: /^https:\/\/([a-z0-9-]+\.)*hcaptcha\.com\/captcha\//i },
+  { vendor: 'recaptcha', re: /^https:\/\/(www\.)?(google\.com|recaptcha\.net)\/recaptcha\/(api2|enterprise)\/anchor/i, skip: /[?&]size=invisible/i },
+  { vendor: 'recaptcha', re: /^https:\/\/(www\.)?(google\.com|recaptcha\.net)\/recaptcha\/(api2|enterprise)\/bframe/i, blocking: true },
+  { vendor: 'datadome', re: /^https:\/\/geo\.captcha-delivery\.com\//i, blocking: true },
+  { vendor: 'humansecurity', re: /^https:\/\/([a-z0-9-]+\.)*(px-cloud\.net|px-cdn\.net|perimeterx\.net)\/.*captcha/i, blocking: true },
+  { vendor: 'arkose', re: /^https:\/\/([a-z0-9-]+\.)*(arkoselabs\.com|funcaptcha\.com)\//i },
+];
+const CHALLENGE_TITLES = [
+  { vendor: 'cloudflare', re: /^(just a moment\.\.\.|attention required! \| cloudflare|un instant\.\.\.|einen moment\.\.\.|un momento\.\.\.|ちょっと待ってください\.\.\.)$/i },
+  { vendor: 'datadome', re: /^(captcha|access denied|blocked)$/i, needsFrame: true },
+];
+async function detectChallenge(tabId) {
+  const s = state.get(tabId);
+  const blocking = [], widgets = [];
+  let tab = null; try { tab = await chrome.tabs.get(tabId); } catch {}
+  // The cf-mitigated header belongs to one document. It stands while the tab still shows that
+  // document — attached, until the next document's response replaces it; detached for a handoff,
+  // while the tab is still on the URL that carried it.
+  const h = s?.challengeHint;
+  if (h && Date.now() - h.ts < 600000 && (s.attached || !h.url || (tab && tab.url === h.url))) blocking.push({ vendor: h.vendor, signal: h.signal, fromHeader: true });
+  const urls = [];
+  if (!s?.attached) { try { urls.push(...await framesWhileDetached(tabId)); } catch {} }
+  if (s?.frames) for (const fr of s.frames.values()) if (fr.url) urls.push(fr.url);
+  for (const u of urls) for (const c of CHALLENGE_FRAMES) {
+    if (!c.re.test(u) || (c.skip && c.skip.test(u))) continue;
+    let host = u; try { host = new URL(u).host; } catch {}
+    (c.blocking ? blocking : widgets).push({ vendor: c.vendor, signal: 'frame ' + host });
+  }
+  const title = (tab?.title || '').trim();
+  for (const c of CHALLENGE_TITLES) if (c.re.test(title) && (!c.needsFrame || blocking.length || widgets.length)) blocking.push({ vendor: c.vendor, signal: 'title "' + title + '"' });
+  if (!blocking.length && !widgets.length) return null;
+  const all = blocking.length ? blocking : widgets;
+  return { vendor: all[0].vendor, blocking: blocking.length > 0, signals: [...new Set([...blocking, ...widgets].map((f) => f.signal))] };
+}
+// Frame URLs without the debugger: chrome.scripting can enumerate frames of an http(s) tab via
+// allFrames injection, and reports each frame's URL from the browser (not from the page). Nothing
+// is left behind: the injected function only returns location.href.
+async function framesWhileDetached(tabId) {
+  const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: 'ISOLATED', func: () => location.href }).catch(() => []);
+  return (res || []).map((r) => r.result).filter((u) => typeof u === 'string');
+}
+// Wait out a challenge: detach, give an invisible check its chance, then hand the tab to the user
+// and wait for the challenge to clear. Polls with chrome.* only, so no debugger is attached while
+// the challenge page runs.
+async function waitOutChallenge(tabId, { timeoutMs = 120000, notify = true } = {}) {
+  const start = Date.now();
+  let ch = await detectChallenge(tabId);
+  if (!ch || !ch.blocking) return { cleared: true, challenge: null, waitedMs: 0, ...(ch ? { widget: ch, note: 'the page embeds a challenge widget but is not blocked by it — carry on' } : {}) };
+  await pauseTab(tabId, { keepHint: true });
+  // Detached, the response header of the next document is not visible to us. The browser still
+  // reports each new document committing in the top frame, which is enough: once one has, the
+  // header that marked the old document no longer describes the page.
+  const onCommit = (d) => { if (d.tabId === tabId && d.frameId === 0) { const st0 = state.get(tabId); if (st0) st0.challengeHint = null; } };
+  try { chrome.webNavigation?.onCommitted?.addListener(onCommit); } catch {}
+  const tabWatch = (id, info) => { if (id === tabId && info.status === 'loading') { const st0 = state.get(tabId); if (st0) st0.challengeHint = null; } };
+  try { chrome.tabs.onUpdated.addListener(tabWatch); } catch {}
+  const deadline = start + Math.min(timeoutMs, 600000);
+  let handedOff = false;
+  while (Date.now() < deadline) {
+    await pause(1000);
+    ch = await detectChallenge(tabId);
+    if (!ch || !ch.blocking) break;
+    // Most invisible checks finish within a few seconds. After that a person is needed.
+    if (!handedOff && Date.now() - start > 6000) {
+      handedOff = true;
+      if (notify) {
+        try { const t = await chrome.tabs.get(tabId); await chrome.windows.update(t.windowId, { focused: true, drawAttention: true }); await chrome.tabs.update(tabId, { active: true }); } catch {}
+        try { await chrome.action.setBadgeBackgroundColor({ color: '#d97706', tabId }); await chrome.action.setBadgeText({ text: '!', tabId }); await chrome.action.setTitle({ title: 'Claude is waiting for you to complete the check on this page', tabId }); } catch {}
+      }
+    }
+  }
+  try { chrome.webNavigation?.onCommitted?.removeListener(onCommit); } catch {}
+  try { chrome.tabs.onUpdated.removeListener(tabWatch); } catch {}
+  const s = state.get(tabId); if (s) s.challengeHint = null;
+  try { await chrome.action.setBadgeText({ text: '', tabId }); await chrome.action.setTitle({ title: 'Better Claude in Chrome', tabId }); } catch {}
+  if (ch && ch.blocking) return { cleared: false, challenge: ch, handedOff, waitedMs: Date.now() - start, note: 'the challenge is still up — the user has not completed it. The debugger stays detached until the next action on this tab.' };
+  return { cleared: true, handedOff, waitedMs: Date.now() - start };
 }
 
 // ---- key map for press_key ----
@@ -1056,7 +1439,9 @@ async function handle(method, p) {
       const errs = fresh.filter((m) => m.level === 'error').length;
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
-      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}) };
+      const challenge = await detectChallenge(tabId).catch(() => null);
+      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+        ...(challenge ? { challenge: { ...challenge, next: challenge.blocking ? 'an anti-bot check is blocking this page — call challenge_wait; do not click it or try to solve it' : 'the page embeds a challenge widget but is not blocked; carry on, and call challenge_wait only if it starts asking for a check' } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
   return result;
@@ -1161,7 +1546,9 @@ async function dispatch(method, p) {
       const s = st(p.tabId);
       if (s.tracing) throw new Error('a trace is already running on this tab — stop it first');
       // The collector must exist before the page we measure loads, or LCP/FCP of a reload are gone.
-      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: PERF_COLLECTOR });
+      // Installed in our isolated world, not the page's: PerformanceObserver sees the same entries
+      // there, and the page never sees a global it did not create.
+      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: PERF_COLLECTOR, worldName: WORLD });
       await cmd(p.tabId, 'Runtime.evaluate', { expression: PERF_COLLECTOR }).catch(() => {}); // and for the current document
       await cmd(p.tabId, 'Tracing.start', { categories: TRACE_CATEGORIES.join(','), transferMode: 'ReturnAsStream', options: 'sampling-frequency=10000' });
       s.tracing = { startedAt: Date.now(), scriptId: identifier };
@@ -1226,8 +1613,10 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const s = st(p.tabId);
       if (s.userRec) throw new Error('already recording the user on this tab');
-      await cmd(p.tabId, 'Runtime.addBinding', { name: '__cbbUserEvent' });
-      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: USER_RECORDER });
+      // Binding and recorder both live in our isolated world: the page shares the DOM events it
+      // fires but cannot see the binding or the recorder's state.
+      await cmd(p.tabId, 'Runtime.addBinding', { name: '__cbbUserEvent', executionContextName: WORLD });
+      const { identifier } = await cmd(p.tabId, 'Page.addScriptToEvaluateOnNewDocument', { source: USER_RECORDER, worldName: WORLD });
       await cmd(p.tabId, 'Runtime.evaluate', { expression: USER_RECORDER }).catch(() => {});
       s.userRec = { scriptId: identifier, events: [], startedAt: Date.now(), startUrl: (await chrome.tabs.get(p.tabId)).url };
       return { ok: true, recording: true, note: 'Recording what the user does in this tab. Stop with user_record {action:"stop"}.' };
@@ -1380,14 +1769,13 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const cur = (await chrome.tabs.get(p.tabId)).url;
       if (cur === p.url) return { ok: true, skipped: 'already on url' };
-      await cmd(p.tabId, 'Page.navigate', { url: p.url });
-      if (p.waitUntil !== 'none') { // settle so the next read isn't racing the load
-        const deadline = Date.now() + 10000;
-        while (Date.now() < deadline) {
-          const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({}));
-          if (r.result?.value === 'complete') break;
-          await new Promise((res) => setTimeout(res, 120));
-        }
+      const t0 = Date.now();
+      const s = st(p.tabId);
+      const nav = await cmd(p.tabId, 'Page.navigate', { url: p.url });
+      // A same-document (hash) navigation or a download commits no new document and fires no load.
+      if (p.waitUntil !== 'none' && nav && nav.loaderId) { // settle so the next read isn't racing the load
+        // Woken by Page.loadEventFired instead of polling readyState every 120 ms.
+        await loadAfter(s, t0, 10000);
       }
       return { ok: true };
     }
@@ -1650,11 +2038,7 @@ async function dispatch(method, p) {
         node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y) : Promise.resolve(null),
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }); // settle :hover before pressing
-      for (const clickCount of (p.double ? [1, 2] : [1])) {
-        await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount });
-        await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount });
-      }
+      await humanClick(p.tabId, x, y, { button, double: !!p.double });
       const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: before?.hit || null };
       if (before?.clickable) out.nearestClickable = before.clickable;
       if (covered?.covered) {
@@ -1707,20 +2091,8 @@ async function dispatch(method, p) {
       // silently rewrites what you set, and a maxlength quietly truncates it — so "fill succeeded"
       // is not the same as "the field holds what you asked for". Reporting the difference here is
       // what turns a wrong value discovered three steps later into one you see immediately.
-      const r = await cmd(dbg, 'Runtime.callFunctionOn', {
-        objectId, returnByValue: true,
-        functionDeclaration: `function(v){
-          this.focus && this.focus();
-          const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
-          if (d && d.set) d.set.call(this, v); else this.value = v;
-          this.dispatchEvent(new Event("input", { bubbles: true }));
-          this.dispatchEvent(new Event("change", { bubbles: true }));
-          return { got: this.value, secret: this.type === "password", type: (this.type || "").toLowerCase() };
-        }`,
-        arguments: [{ value: String(p.value ?? '') }],
-      });
       const want = String(p.value ?? '');
-      const { got, secret, type } = r.result?.value || {};
+      const { got, secret, type } = await fillField(p.tabId, dbg, objectId, backendNodeId, sessionId, want);
       // A date/time input silently rejects anything not in its wire format, leaving the field empty
       // while the page still displays a locale mask like mm/dd/yyyy. Without this the model sets a
       // perfectly reasonable-looking value, sees no error, and moves on with an empty field.
@@ -1780,14 +2152,9 @@ async function dispatch(method, p) {
       if (!out.ok) throw new Error('select_text: ' + (out.reason || 'failed') + (out.sample ? ' — element text starts: ' + JSON.stringify(out.sample) : ''));
       return out;
     }
-    case 'typeText': { // real per-char keystrokes (keyDown+keyUp) so search-as-you-type / key-filtered / per-key OTP widgets fire
+    case 'typeText': { // real per-char keystrokes so search-as-you-type / key-filtered / per-key OTP widgets fire
       await need(p.tabId);
-      for (const ch of String(p.text ?? '')) {
-        const up = ch.toUpperCase(); const code = /^[a-z]$/i.test(ch) ? 'Key' + up : /^[0-9]$/.test(ch) ? 'Digit' + ch : '';
-        const kc = /^[a-z0-9]$/i.test(ch) ? up.charCodeAt(0) : 0;
-        await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, code, windowsVirtualKeyCode: kc });
-        await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, windowsVirtualKeyCode: kc });
-      }
+      await typeHuman(p.tabId, String(p.text ?? ''));
       return { ok: true };
     }
     case 'pressKey': {
@@ -1833,8 +2200,12 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const from = p.fromRef != null ? await refPoint(p.tabId, p.fromRef) : await toViewport(p.tabId, p.fromX, p.fromY, p.space);
       const to = p.toRef != null ? await refPoint(p.tabId, p.toRef) : await toViewport(p.tabId, p.toX, p.toY, p.space);
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'left' });
+      await moveTo(p.tabId, from.x, from.y);
+      await pause(rnd(60, 140));
+      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1, buttons: 1 });
+      await pause(rnd(80, 160));
+      await moveTo(p.tabId, to.x, to.y, { buttons: 1 });
+      await pause(rnd(60, 140));
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
       return { ok: true };
     }
@@ -1921,11 +2292,32 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const c = p.ref != null ? await refPoint(p.tabId, p.ref) : await pointOf(p.tabId, p);
       if (!c) throw new Error('hover needs a ref or {x,y}');
-      await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: c.x, y: c.y });
+      await moveTo(p.tabId, c.x, c.y);
       return { ok: true };
     }
 
-    case 'readConsole': { const s = st(p.tabId); const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = []; return { messages: out }; }
+    case 'readConsole': {
+      // The page's own console.* calls need the Runtime domain, which pages can detect (see
+      // "stealth: our own JS world"). So it is switched on here, for this tab, only once someone
+      // actually asks — network/intervention errors from the Log domain are captured regardless.
+      await need(p.tabId);
+      const s = st(p.tabId);
+      let note;
+      if (!s.consoleOn) {
+        s.consoleOn = true;
+        await rawCmd({ tabId: p.tabId }, 'Runtime.enable').catch(() => {});
+        for (const sid of s.frames.keys()) await rawCmd({ tabId: p.tabId, sessionId: sid }, 'Runtime.enable').catch(() => {});
+        note = 'console capture is now on for this tab (page console.* calls are recorded from here on, plus any Chrome still held from earlier). Turning it on is detectable by anti-bot scripts — call read_console with stop:true when done.';
+      }
+      if (p.stop) {
+        s.consoleOn = false;
+        await rawCmd({ tabId: p.tabId }, 'Runtime.disable').catch(() => {});
+        for (const sid of s.frames.keys()) await rawCmd({ tabId: p.tabId, sessionId: sid }, 'Runtime.disable').catch(() => {});
+        note = 'console capture is off for this tab again.';
+      }
+      const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = [];
+      return { messages: out, ...(note ? { note } : {}) };
+    }
     case 'readNetwork': { const s = st(p.tabId); const out = [...s.network.values()].slice(-(p.limit || 50)); if (p.clear) s.network.clear(); return { requests: out }; }
 
     case 'getNetworkBody': {
@@ -1969,14 +2361,24 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const deadline = Date.now() + Math.min(p.timeoutMs || 10000, 25000); // under the 30s host timeout
       const s = st(p.tabId);
-      const ev = (expr) => cmd(p.tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true }).then((r) => r.result?.value).catch(() => undefined);
+      const ev = (expr) => cmd(p.tabId, 'Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }).then((r) => r.result?.value).catch(() => undefined);
+      // A DOM condition is checked inside the page and re-checked on each mutation, so it returns
+      // the moment it becomes true. The in-page wait is capped well under the call budget and the
+      // loop survives navigations (a new document just means a new world on the next round).
+      const domWait = (cond, ms) => ev(`new Promise((res)=>{const ok=()=>{try{return ${cond}}catch{return false}};if(ok())return res(true);
+        let done=false;const fin=(v)=>{if(done)return;done=true;try{mo.disconnect()}catch{}clearTimeout(t);res(v)};
+        const mo=new MutationObserver(()=>{if(ok())fin(true)});try{mo.observe(document,{subtree:true,childList:true,characterData:true,attributes:true})}catch{}
+        const t=setTimeout(()=>fin(ok()),${Math.max(50, Math.min(ms, 5000))});})`);
+      const cond = p.selector ? `!!document.querySelector(${JSON.stringify(p.selector)})`
+        : p.textGone != null ? `!(document.body?.innerText||'').includes(${JSON.stringify(p.textGone)})`
+        : p.text != null ? `(document.body?.innerText||'').includes(${JSON.stringify(p.text)})` : null;
+      const matched = p.selector ? 'selector' : p.textGone != null ? 'textGone' : 'text';
       while (Date.now() < deadline) {
-        if (p.selector) { if (await ev(`!!document.querySelector(${JSON.stringify(p.selector)})`)) return { ok: true, matched: 'selector' }; }
-        else if (p.textGone != null) { if (await ev(`!(document.body?.innerText||'').includes(${JSON.stringify(p.textGone)})`)) return { ok: true, matched: 'textGone' }; }
-        else if (p.text != null) { if (await ev(`(document.body?.innerText||'').includes(${JSON.stringify(p.text)})`)) return { ok: true, matched: 'text' }; }
-        else if (p.urlIncludes != null) { const t = await chrome.tabs.get(p.tabId); if ((t.url || '').includes(p.urlIncludes)) return { ok: true, matched: 'url', url: t.url }; }
+        const left = deadline - Date.now();
+        if (cond) { if (await domWait(cond, left)) return { ok: true, matched }; if (Date.now() < deadline) await new Promise((res) => setTimeout(res, 50)); continue; }
+        if (p.urlIncludes != null) { const t = await chrome.tabs.get(p.tabId); if ((t.url || '').includes(p.urlIncludes)) return { ok: true, matched: 'url', url: t.url }; }
         else if (p.state === 'networkidle') { if (s.lastRequestTs && Date.now() - s.lastRequestTs > 500) return { ok: true, matched: 'networkidle' }; }
-        else { if ((await ev('document.readyState')) === 'complete') return { ok: true, matched: 'load' }; }
+        else { if ((await ev('document.readyState')) === 'complete') return { ok: true, matched: 'load' }; await loadAfter(s, Date.now() - 1, Math.min(left, 1000)); continue; }
         await new Promise((res) => setTimeout(res, 120));
       }
       return { ok: false, timedOut: true };
@@ -2015,7 +2417,40 @@ async function dispatch(method, p) {
       });
     }
 
-    case 'executeCdp': { await need(p.tabId); return await cmd(dbgOf(p.tabId, p.sessionId), p.cdpMethod, p.cdpParams || {}); }
+    case 'challengeWait': {
+      // Optional pre-check without waiting, so a caller can ask "is there one?" cheaply.
+      if (p.check) return { challenge: await detectChallenge(p.tabId) };
+      return await waitOutChallenge(p.tabId, { timeoutMs: p.timeoutMs || 120000, notify: p.notify !== false });
+    }
+
+    // Human-shaped input for the host-side `page` API (run tool), so scripted clicks and typing get
+    // the same pointer paths, dwell and key rhythm as the atomic tools, sharing one pointer per tab.
+    case 'humanInput': {
+      await need(p.tabId);
+      const k = p.kind;
+      if (k === 'move') { await moveTo(p.tabId, p.x, p.y, p.buttons ? { buttons: p.buttons } : {}); return { ok: true }; }
+      if (k === 'click') { await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 }); return { ok: true }; }
+      if (k === 'drag') {
+        await moveTo(p.tabId, p.from.x, p.from.y); await pause(rnd(60, 140));
+        await rawCmd({ tabId: p.tabId }, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: p.from.x, y: p.from.y, button: 'left', clickCount: 1, buttons: 1 });
+        await pause(rnd(80, 160)); await moveTo(p.tabId, p.to.x, p.to.y, { buttons: 1 }); await pause(rnd(60, 140));
+        await rawCmd({ tabId: p.tabId }, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.to.x, y: p.to.y, button: 'left', clickCount: 1 });
+        return { ok: true };
+      }
+      if (k === 'type') { await typeHuman(p.tabId, String(p.text ?? ''), { fast: !!p.fast }); return { ok: true }; }
+      if (k === 'clear') { await clearFocused(p.tabId); return { ok: true }; }
+      throw new Error('humanInput: unknown kind ' + k);
+    }
+
+    case 'executeCdp': {
+      await need(p.tabId);
+      const dbg = dbgOf(p.tabId, p.sessionId);
+      // Runtime.evaluate runs in the bridge's isolated world by default (it shares the DOM, not the
+      // page's JS globals). world:"page" reaches page-defined globals, at the cost of running
+      // where the page can observe it.
+      if (p.cdpMethod === 'Runtime.evaluate' && p.world === 'page') return await pageWorldEval(typeof dbg === 'number' ? { tabId: dbg } : dbg, p.cdpParams || {});
+      return await cmd(dbg, p.cdpMethod, p.cdpParams || {});
+    }
     // Frame plumbing for the host-side programmable `page` API (run tool): enumerate cross-origin
     // frame sessions and get a frame's accumulated top-viewport offset for coordinate translation.
     case 'listFrames': { await need(p.tabId); return { frames: [...st(p.tabId).frames.entries()].map(([sessionId, fr]) => ({ sessionId, url: fr.url || null })) }; }
@@ -2041,23 +2476,24 @@ async function dispatch(method, p) {
       const text = String(p.text ?? '');
       const mac = /Mac/i.test(navigator.userAgent);
       const evalIn = (expression) => cmd(p.tabId, 'Runtime.evaluate', { expression, returnByValue: true });
-
+      // The scratch field is held by reference in our isolated world, so it carries no id or
+      // attribute a page could look for, and lives only for the length of this call.
       const ready = await evalIn(`(()=>{
         if(!document.body) return false;
-        let ta=document.getElementById('__cbb_clip');
-        if(!ta){ ta=document.createElement('textarea'); ta.id='__cbb_clip'; ta.setAttribute('aria-hidden','true');
+        let ta=globalThis.__clip;
+        if(!ta||!ta.isConnected){ ta=document.createElement('textarea'); ta.setAttribute('aria-hidden','true');
           ta.style.cssText='position:fixed;left:-9999px;top:0;width:10px;height:10px;opacity:0';
-          document.body.appendChild(ta); }
-        window.__cbbPrev=document.activeElement;
+          document.body.appendChild(ta); globalThis.__clip=ta; }
+        globalThis.__prevFocus=document.activeElement;
         ta.value=${JSON.stringify(writing ? text : '')};
         ta.focus(); ta.select();
         return document.activeElement===ta;
       })()`);
       if (!ready.result?.value) throw new Error('could not focus a scratch field for the clipboard (page has no body yet?)');
 
-      const restore = () => evalIn(`(()=>{const ta=document.getElementById('__cbb_clip'); if(ta)ta.remove();
-        try{ window.__cbbPrev&&window.__cbbPrev.focus&&window.__cbbPrev.focus(); }catch{}
-        delete window.__cbbPrev; return true;})()`).catch(() => {});
+      const restore = () => evalIn(`(()=>{const ta=globalThis.__clip; if(ta)ta.remove(); delete globalThis.__clip;
+        try{ globalThis.__prevFocus&&globalThis.__prevFocus.focus&&globalThis.__prevFocus.focus(); }catch{}
+        delete globalThis.__prevFocus; return true;})()`).catch(() => {});
       try {
         await cmd(p.tabId, 'Input.dispatchKeyEvent', {
           type: 'keyDown', key: writing ? 'c' : 'v', code: writing ? 'KeyC' : 'KeyV',
@@ -2066,7 +2502,7 @@ async function dispatch(method, p) {
         });
         await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: writing ? 'c' : 'v', code: writing ? 'KeyC' : 'KeyV', windowsVirtualKeyCode: writing ? 67 : 86, modifiers: mac ? 4 : 2 });
         if (writing) { await restore(); return { ok: true, length: text.length }; }
-        const got = await evalIn(`(document.getElementById('__cbb_clip')||{}).value ?? ''`);
+        const got = await evalIn(`(globalThis.__clip||{}).value ?? ''`);
         await restore();
         return { text: got.result?.value ?? '' };
       } catch (e) { await restore(); throw e; }
@@ -2180,7 +2616,7 @@ async function dispatch(method, p) {
       // spec moved from navigator to document, and the MCP-B polyfill still ships the older
       // listTools/callTool pair, so probe both rather than betting on either.
       await need(p.tabId);
-      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+      const r = await pageWorldEval({ tabId: p.tabId }, {
         expression: `(async()=>{
           const ctx = (typeof document!=='undefined'&&document.modelContext)
                    || (typeof navigator!=='undefined'&&navigator.modelContext) || null;
@@ -2221,7 +2657,7 @@ async function dispatch(method, p) {
       await need(p.tabId);
       // executeTool takes the registered tool OBJECT, not its name — so discovery and invocation
       // have to happen inside one evaluation; the object cannot survive the CDP boundary.
-      const r = await cmd(p.tabId, 'Runtime.evaluate', {
+      const r = await pageWorldEval({ tabId: p.tabId }, {
         expression: `(async()=>{
           const ctx=(document.modelContext)||(navigator.modelContext)||null;
           if(!ctx) throw new Error('this page does not expose WebMCP tools');
@@ -2263,6 +2699,15 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     try { const e = JSON.parse(cdpParams.payload); if (e.type !== 'noop' && s.userRec.events.length < 2000) s.userRec.events.push(e); } catch {}
     return;
   }
+  if (cdpMethod === 'Runtime.executionContextCreated' || cdpMethod === 'Runtime.executionContextDestroyed' || cdpMethod === 'Runtime.executionContextsCleared') {
+    if (!s.contexts) s.contexts = new Map();
+    const key = source.sessionId || 'main';
+    if (!s.contexts.has(key)) s.contexts.set(key, new Map());
+    const m = s.contexts.get(key);
+    if (cdpMethod === 'Runtime.executionContextCreated') m.set(cdpParams.context.id, cdpParams.context);
+    else if (cdpMethod === 'Runtime.executionContextDestroyed') m.delete(cdpParams.executionContextId);
+    else m.clear();
+  }
   if (cdpMethod === 'Runtime.consoleAPICalled') {
     s.console.push({ level: cdpParams.type, text: (cdpParams.args || []).map(a => a.value ?? a.description ?? '').join(' '), ts: cdpParams.timestamp });
     if (s.console.length > 500) s.console.shift();
@@ -2274,6 +2719,17 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     s.lastRequestTs = Date.now(); // for networkidle in waitFor
   } else if (cdpMethod === 'Network.responseReceived') {
     const e = s.network.get(cdpParams.requestId); if (e) { e.status = cdpParams.response?.status; e.type = cdpParams.type; }
+    // Cloudflare marks the document it serves in place of the page with this header.
+    // Only the top frame's document (its frameId equals the loaderId's frame — an in-process
+    // iframe's document arrives on this same session and must not clear the hint).
+    if (cdpParams.type === 'Document' && !source.sessionId && (!cdpParams.frameId || !s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+      const h = cdpParams.response?.headers || {};
+      const mitigated = h['cf-mitigated'] || h['Cf-Mitigated'];
+      // Tied to the document it came with (loaderId): a later document replaces it, and while the
+      // debugger is detached the hint only stands if the tab still shows that same document.
+      if (mitigated) s.challengeHint = { vendor: 'cloudflare', signal: 'cf-mitigated: ' + mitigated, ts: Date.now(), loaderId: cdpParams.loaderId || null, url: cdpParams.response?.url || null };
+      else if (s.challengeHint) s.challengeHint = null;
+    }
   } else if (cdpMethod === 'Page.javascriptDialogOpening') {
     // A dialog freezes the page's CDP — record it so the agent sees it in the status header and can
     // clear it (dialog_handle). beforeunload we auto-accept so it can't wedge navigation.
@@ -2281,32 +2737,57 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     if (cdpParams.type === 'beforeunload') { cmd(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {}); s.dialog = null; }
   } else if (cdpMethod === 'Page.javascriptDialogClosed') {
     s.dialog = null;
-  } else if (cdpMethod === 'Page.loadEventFired') {
+  } else if (cdpMethod === 'Page.loadEventFired' && !source.sessionId) {
     s.lastLoadTs = Date.now();
-  } else if (cdpMethod === 'Page.frameNavigated' && !cdpParams.frame?.parentId) {
-    // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
-    // it would be pure noise. Drop the baseline and let the next read_page return a full tree. The
-    // asset inventory goes too: its URLs and origin belong to the old document.
-    s.ax = null; s.listenerBids = null; s.assets = null; s.assetsDoc = null;
+    if (s.loadWaiters) { for (const w of s.loadWaiters) w(); s.loadWaiters = []; }
+  } else if (cdpMethod === 'Log.entryAdded') {
+    // Network and browser-intervention errors (failed loads, CSP, mixed content). This is the part
+    // of the old console stream that needs no Runtime domain.
+    const e = cdpParams.entry || {};
+    if (e.level === 'error' || e.level === 'warning') {
+      s.console.push({ level: e.level, text: (e.source ? e.source + ': ' : '') + (e.text || ''), ts: e.timestamp, ...(e.url ? { url: e.url } : {}) });
+      if (s.console.length > 500) s.console.shift();
+    }
+  } else if (cdpMethod === 'Page.frameNavigated') {
+    if (!cdpParams.frame?.parentId && !source.sessionId) s.topFrameId = cdpParams.frame?.id;
+    // A new document in some frame: the isolated world we made in its old document is gone.
+    if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); }
+    if (!cdpParams.frame?.parentId) {
+      // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
+      // it would be pure noise. Drop the baseline and let the next read_page return a full tree. The
+      // asset inventory goes too: its URLs and origin belong to the old document.
+      s.ax = null; s.listenerBids = null; s.assets = null; s.assetsDoc = null; s.challenge = null;
+      if (s.contexts) s.contexts.delete('main');
+      // The user recorder's document-start script runs in the new document's world; give that world
+      // the binding it reports through (bindings reach only worlds that exist when added).
+      if (s.userRec) rawCmd({ tabId }, 'Runtime.addBinding', { name: '__cbbUserEvent', executionContextName: WORLD }).catch(() => {});
+    }
   } else if (cdpMethod === 'Target.attachedToTarget') {
     // A cross-origin child frame attached. Enable its domains, resolve its owner <iframe> in the
     // parent (needed for coordinate translation), and recurse auto-attach for nested frames.
     const child = { tabId, sessionId: cdpParams.sessionId };
     (async () => {
-      for (const d of ['DOM', 'Runtime', 'Accessibility', 'Page']) await cmd(child, d + '.enable').catch(() => {});
+      for (const d of ['DOM', 'Accessibility', 'Page']) await cmd(child, d + '.enable').catch(() => {});
       let ownerBackendNodeId = null;
       try {
         const frameId = (await cmd(child, 'Page.getFrameTree'))?.frameTree?.frame?.id;
         if (frameId) ownerBackendNodeId = (await cmd(source, 'DOM.getFrameOwner', { frameId }))?.backendNodeId ?? null;
       } catch {}
       s.frames.set(cdpParams.sessionId, { parentSession: source, ownerBackendNodeId, url: cdpParams.targetInfo?.url });
+      if (s.consoleOn) await cmd(child, 'Runtime.enable').catch(() => {});
       await cmd(child, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe', exclude: false }] }).catch(() => {});
     })();
   } else if (cdpMethod === 'Target.detachedFromTarget') {
     s.frames.delete(cdpParams.sessionId);
+    if (s.worlds) s.worlds.delete(cdpParams.sessionId);
   }
 });
-chrome.debugger.onDetach.addListener((source) => { if (source.tabId != null) state.delete(source.tabId); });
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId == null) return;
+  const s = state.get(source.tabId);
+  if (s?.paused) { s.attached = false; s.worlds = null; return; }
+  state.delete(source.tabId);
+});
 
 // Popup ↔ worker channel for secure credential entry. Secret values arrive here and go straight to
 // the page fill (fillCredentials); they are never logged or forwarded to the host/MCP side.

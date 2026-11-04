@@ -41,6 +41,17 @@ async function callHost(method, params) {
     if (m === 'Page.reload') return {};
     return {};
   }
+  // Human-shaped input is implemented in the extension; record what the host asked for in the same
+  // shape the CDP-level assertions below read.
+  if (method === 'humanInput') {
+    const k = params.kind;
+    if (k === 'move') mouse.push({ type: 'mouseMoved', x: params.x, y: params.y });
+    if (k === 'click') { mouse.push({ type: 'mouseMoved', x: params.x, y: params.y }); for (let c = 1; c <= (params.clickCount || 1); c++) { mouse.push({ type: 'mousePressed', x: params.x, y: params.y, button: params.button, clickCount: c }); mouse.push({ type: 'mouseReleased', x: params.x, y: params.y, button: params.button, clickCount: c }); } }
+    if (k === 'drag') { mouse.push({ type: 'mousePressed', x: params.from.x, y: params.from.y }); mouse.push({ type: 'mouseMoved', x: params.to.x, y: params.to.y, buttons: 1 }); mouse.push({ type: 'mouseReleased', x: params.to.x, y: params.to.y }); }
+    if (k === 'type') { const el = win.document.activeElement; for (const ch of String(params.text)) { keys.push({ key: ch, text: ch, sessionId: null }); if (el && 'value' in el) { el.value += ch; el.dispatchEvent(new win.Event('input', { bubbles: true })); } } }
+    if (k === 'clear') { const el = win.document.activeElement; if (el && 'value' in el) el.value = ''; }
+    return { ok: true };
+  }
   if (method === 'listFrames') return { frames: [] };
   if (method === 'frameOffsetOf') return { ox: 0, oy: 0 };
   if (method === 'getUserTabs') return { tabs: [] };

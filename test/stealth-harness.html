@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>stealth harness</title></head>
+<body>
+<h1>Stealth harness</h1>
+<label>Name <input id="name" name="name"></label>
+<label>Password <input id="pw" type="password" name="pw"></label>
+<button id="go">Go</button>
+<pre id="out"></pre>
+<script>
+// Page-side detectors an anti-bot script can run. Each records into window.__probe (a name a
+// real site would never pick, so it cannot collide with the bridge's own globals).
+const P = window.__probe = { runtimeLeak: false, ownGlobals: [], inputs: [], clicks: [], keys: [], moves: 0 };
+// Runtime-domain leak: a CDP client with Runtime enabled serializes console arguments, which
+// reads getters on the logged object. A page that logs an object with a trapped getter learns a
+// debugger is listening.
+const baits = [];
+// 1. own-property getter on an Error-like object
+baits.push(Object.create(Error.prototype, { name: { get() { P.runtimeLeak = 'own-name'; return 'Error'; } } }));
+// 2. getter for `name` on the error's prototype (still read by V8's preview builder)
+{ const proto = Object.create(Error.prototype); Object.defineProperty(proto, 'name', { get() { P.runtimeLeak = 'proto-name'; return 'Error'; } }); baits.push(Object.create(proto)); }
+// 3. a real Error with a trapped stack (fixed in V8 2025, kept as a regression check)
+{ const e = new Error('x'); Object.defineProperty(e, 'stack', { get() { P.runtimeLeak = 'stack'; return ''; } }); baits.push(e); }
+// 4. a getter on a plain object (previews read own accessors only when the client asks)
+baits.push({ get probe() { P.runtimeLeak = 'plain-getter'; return 1; } });
+setInterval(() => { for (const b of baits) console.debug(b); }, 200);
+// 5. timing side channel: with a CDP client listening, console.debug serializes its argument, so
+// logging a large object costs measurable time. Without a listener it is a no-op.
+const big = {}; for (let i = 0; i < 20000; i++) big['k' + i] = { a: i, b: [i, i + 1], c: 'x' + i };
+P.consoleMs = [];
+setInterval(() => { const s = performance.now(); console.debug(big); P.consoleMs.push(performance.now() - s); if (P.consoleMs.length > 40) P.consoleMs.shift(); }, 150);
+setInterval(() => { P.ownGlobals = Object.getOwnPropertyNames(window).filter(k => /cbb/i.test(k)); }, 200);
+for (const id of ['name', 'pw']) {
+  const el = document.getElementById(id);
+  el.addEventListener('input', e => P.inputs.push({ id, trusted: e.isTrusted, type: e.inputType || null }));
+  el.addEventListener('keydown', e => P.keys.push({ id, trusted: e.isTrusted, t: performance.now() }));
+}
+document.addEventListener('mousemove', () => { P.moves++; });
+// The bridge evaluates in an isolated world and cannot read page globals (that is the point), so
+// the findings are mirrored into the DOM where any reader can see them.
+const out = document.getElementById('out');
+setInterval(() => { out.textContent = JSON.stringify(P); }, 100);
+document.getElementById('go').addEventListener('click', e => P.clicks.push({ trusted: e.isTrusted, moves: P.moves }));
+</script>
+</body></html>
