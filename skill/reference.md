@@ -170,15 +170,17 @@ opening a new one.
 
 - Upload: `await page.getByLabel('Resume').setInputFiles('/abs/file.pdf')`. No OS picker.
 - Download: trigger it, then `const {path} = await page.waitForDownload()` and `Read` that path.
-- Dialogs: a native `alert`/`confirm`/`prompt` freezes the tab until handled. After an action that
-  may open one, `const d = await page.getJsDialog()` returns `null` or
-  `{type, message, accept, dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a
+- Dialogs: a native `alert`/`confirm`/`prompt` freezes the tab until handled. A click or key that
+  opens one returns at once (the atomic `click` reports `openedDialog`); anything else that touches
+  the page fails fast naming the dialog until it is answered. After an action that may open one,
+  `const d = await page.getJsDialog()` returns `null` or `{type, message, accept, dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a
   "discard changes?"). `beforeunload` is auto-accepted so it can't wedge navigation.
 - Console: `await page.consoleLogs({limit})`, for debugging a local app.
 - Screenshot: `await page.screenshot({fullPage, marks, boxes, ref})` uses the same capture path as
   the atomic tool, so it returns the same `{scale, origin, space, …}` mapping and can draw marks.
-- Save the page: `await page.pdf({path})` or `page.export({format:'text'})` returns
-  `{path, bytes}`.
+- Save the page: `await page.pdf({path})` or `page.export({format:'text'})` writes a file and
+  returns `{path, bytes}` (plus `text` when it is under 8 KB). To just read the text, return
+  `await page.evaluate(() => document.body.innerText)` or use `read_text`.
 - Responsive: `await page.setViewport({width:390, height:844, mobile:true})`, then
   `page.resetViewport()`. Only for device or breakpoint testing.
 - Batch read: `await browser.readUrls([url1, url2])` loads each URL in a background tab (bounded
@@ -228,13 +230,23 @@ selector, box) plus a ref you can click. That turns a coordinate guess into a se
 `annotate:true` also returns a picture with a crosshair on the point, so you can see a misplaced
 guess.
 
-Every `click` returns a receipt. `landedOn` names the element the click reached; `intercepted`
+A click or Enter that starts a navigation waits for it to commit, so `status.url` is the new page
+(`navigated:true`); `navigating:true` means it started but has not committed yet. A page that
+navigates later on its own (a timer, a slow redirect after login) is not caught: follow the click
+with `wait_for {urlIncludes}`, or in a script wrap it in `page.expectNavigation(() => …)`.
+
+Every `click` returns a receipt. `landedOn` names the element that took the click (the button or
+link, not the icon inside it; `via` names the innermost element when it differs); `intercepted`
 appears when an overlay covered the element your ref pointed at:
 
 > `click at (412,388) was over <div> "Accept cookies", not the ref's <button> "Add to cart" —
 > something is covering the target. Clear it and retry.`
 
 That is the signal to dismiss the modal or banner, not to retry the same click.
+
+A ref click on a `disabled` control fails at once: complete whatever enables it. An `aria-disabled`
+control still takes the click (some sites use it to explain what is missing), and the receipt
+carries a `note` saying so.
 
 Inside `run`: `page.dom_cua.get_visible_dom()` (numbered nodes with boxes), then
 `click({node_id})` · `double_click({node_id})` · `type({text})` · `keypress({keys})` ·
@@ -253,8 +265,25 @@ a checked box, a toast, a cart line, a URL parameter.
 For a single action or a quick look. Each action (`click`, `fill`, `type_text`, `press_key`,
 `select_option`, `scroll`, `hover`, `drag`, `upload_file`, `navigate`, `reload`, `go_back`,
 `go_forward`, `dialog_handle`) returns a status:
-`{url, title, newConsoleErrors?, newConsoleWarnings?, openDialog?, challenge?}`. A `challenge`
-entry includes `blocking` and a `next` hint.
+`{url, title, loading?, newConsoleErrors?, firstErrors?, newConsoleWarnings?, openDialog?, challenge?}`
+(`firstErrors` quotes the first two; `read_console {firstPartyOnly:true}` drops third-party
+noise). A `challenge` entry includes `blocking` and a `next` hint.
+
+Which lens, by question:
+
+| Question | Tool |
+|---|---|
+| What can I act on, and what changed? | `read_page` |
+| Where is the control named X? | `find` (ranked refs) |
+| Does this text appear anywhere, frames included? | `find_text` |
+| What does the page say? | `read_text` |
+| Does this CSS selector exist, and is it unique? | `dom_query` |
+| What does another tab say, without claiming it? | `peek_tab` |
+| Is this outcome true right now? | `validate` (checks once, never waits) |
+| Wait until it becomes true | `wait_for` |
+
+Every ref works with every tool; its letter (`e` read_page, `f` find, `q` dom_query, `m`
+screenshot marks, `p` probe_point, `s` a resolved selector) only records where it came from.
 
 ### See and target
 
@@ -285,12 +314,15 @@ entry includes `blocking` and a `next` hint.
     fall back to coordinates; find the reason (overlay, disabled control, still-loading page
     — use `wait_for` — or the wrong element) and act on it.
   - A top-level `challenge` appears when an anti-bot check is present.
-- `read_text`: visible innerText, for reading prose once you're on the right page.
-- `find_text`: does a word or phrase appear anywhere, including off-screen? Returns a count and
-  context snippets. Cheaper than a scroll-and-read loop. `regex:true` for a pattern.
+- `read_text`: visible innerText, for reading prose once you're on the right page. Frame text
+  follows the page's, under a `— frame —` marker.
+- `find_text`: does a word or phrase appear anywhere, including off-screen and inside iframes?
+  Returns a count (`inFrames` for the share inside frames) and context snippets. Cheaper than a scroll-and-read loop. `regex:true` for a pattern.
 - `find`: keyword search over roles and names; up to 10 ranked candidate refs. Query with the
   element's label words ("subscribe newsletter"), not visual descriptions ("the blue button"
-  matches nothing). Confirm the winner before acting.
+  matches nothing). Confirm the winner before acting. An `intent` is stricter: it is taken only
+  when an element's name holds every content word, so "the Delete account button" on a page
+  with only "Delete order" fails with "nothing matches" and lists the near miss.
 - `dom_query`: a CSS selector returns the match count and a ref and attributes per match. Top
   document only (a selector can't cross an origin boundary; use `read_page` or `find` inside a
   cross-origin frame). Use it to confirm existence or uniqueness.

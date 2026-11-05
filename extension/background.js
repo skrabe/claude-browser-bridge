@@ -102,6 +102,33 @@ async function forgetAgentTab(tabId) {
 }
 // Don't let the set grow stale as the user closes tabs themselves.
 try { chrome.tabs.onRemoved.addListener((tabId) => { forgetAgentTab(tabId); state.delete(tabId); }); } catch {}
+// A tab a page opens because of the agent (a target=_blank link it clicked, a window.open its
+// script ran) is the agent's to close as well. The evidence is the browser's own: the controlled
+// tab reports Page.windowOpen / a new-tab navigation request, and a tab appears with that URL
+// within a few seconds. chrome.tabs' openerTabId cannot be used: Brave sets it to whichever tab is
+// active, which for a background agent tab is one of the user's. Only opens while the agent was
+// acting on that tab count, so a user's ctrl-click in a claimed tab later stays theirs.
+const ADOPT_WINDOW_MS = 4000;
+const pendingOpens = []; // { url, ts } announced by controlled tabs
+const recentTabs = [];   // { id, url, ts } created, not yet matched
+const sameOpenUrl = (a, b) => !a || !b || a === b || a === 'about:blank' || b === 'about:blank';
+const prune = (list) => { const floor = Date.now() - ADOPT_WINDOW_MS; while (list.length && list[0].ts < floor) list.shift(); };
+function noteAgentOpen(url) {
+  prune(recentTabs);
+  const hit = recentTabs.findIndex((t) => sameOpenUrl(t.url, url));
+  if (hit >= 0) { markAgentTab(recentTabs[hit].id); recentTabs.splice(hit, 1); return; }
+  prune(pendingOpens); pendingOpens.push({ url, ts: Date.now() });
+}
+async function adoptOpenedTab(tab) {
+  if (tab?.id == null) return false;
+  const url = tab.pendingUrl || tab.url || '';
+  prune(pendingOpens);
+  const hit = pendingOpens.findIndex((o) => sameOpenUrl(o.url, url));
+  if (hit >= 0) { pendingOpens.splice(hit, 1); await markAgentTab(tab.id); return true; }
+  prune(recentTabs); recentTabs.push({ id: tab.id, url, ts: Date.now() });
+  return false;
+}
+try { chrome.tabs.onCreated.addListener((tab) => { adoptOpenedTab(tab); }); } catch {}
 
 // Route a CDP command to a tab (number) or a specific frame session ({tabId, sessionId}). Chrome 125+
 // flat sessions: sendCommand takes {tabId, sessionId} to address an out-of-process child frame.
@@ -175,12 +202,36 @@ async function onMessage(m) {
 
 // ---- low-level CDP ----
 // target: a tabId (number) → {tabId}, or a debuggee object {tabId, sessionId} for a child frame.
+// While a JS dialog (alert/confirm/prompt) is up, the renderer answers neither input nor script
+// until someone closes it: a click whose handler calls alert() would wait on its mouseReleased for
+// as long as the dialog stays open. Those commands fail fast instead, and any already in flight are
+// released the moment Page.javascriptDialogOpening arrives, carrying the dialog so the action can
+// report it.
+const DIALOG_BLOCKED = /^(Input\.|Runtime\.(evaluate|callFunctionOn|awaitPromise)$)/;
+// What still works, or is the remedy, while a dialog is up: answering it, tab and window
+// bookkeeping, and reads of what was already captured.
+const DIALOG_SAFE = new Set(['handleDialog', 'getDialog', 'pageStatus', 'getInfo', 'getUserTabs', 'release', 'closeAgentTab', 'createTab', 'claimTab', 'activateTab', 'readConsole', 'readNetwork', 'cdpEvents', 'listDownloads', 'waitDownload', 'listFrames', 'browserManage', 'peekTab', 'reloadExtension']);
+function dialogError(d) {
+  const msg = String(d?.message ?? '').slice(0, 160);
+  const e = new Error(`a JS ${d?.type || 'dialog'} is open on the page${msg ? ` ("${msg}")` : ''} and blocks it until answered — `
+    + 'dialog_handle {accept:true|false} (in a script: (await page.getJsDialog()).accept() / .dismiss())');
+  e.dialogOpen = d;
+  return e;
+}
 function rawCmd(dbg, method, params = {}) {
-  return new Promise((res, rej) => {
+  const s = dbg.tabId != null && DIALOG_BLOCKED.test(method) ? state.get(dbg.tabId) : null;
+  if (s?.dialog) return Promise.reject(dialogError(s.dialog));
+  const sent = new Promise((res, rej) => {
     chrome.debugger.sendCommand(dbg, method, params, (result) => {
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
+  });
+  if (!s) return sent;
+  return new Promise((res, rej) => {
+    const waiter = (d) => rej(dialogError(d));
+    (s.dialogWaiters || (s.dialogWaiters = new Set())).add(waiter);
+    sent.then(res, rej).finally(() => s.dialogWaiters.delete(waiter));
   });
 }
 
@@ -480,9 +531,19 @@ async function domSnapshotIndex(tabId, sessionId) {
   } catch { return null; }
   const S = snap.strings || [];
   const str = (i) => (i == null || i < 0 ? undefined : S[i]);
-  const out = new Map();  // backendNodeId -> { tag, attrs, rect, paint }
-  const painted = [];     // { rect, paint, opaque } for the occlusion pass
-  for (const doc of snap.documents || []) {
+  const out = new Map();  // backendNodeId -> { tag, attrs, rect, paint, doc }
+  const painted = [];     // { rect, paint, opaque } for the occlusion pass — top document only
+  // Paint order is per document: a same-site iframe's nodes number their own paint from zero, and
+  // their bounds sit in a different coordinate space. Mixing them in made an iframe's input look
+  // buried under a top-page bar it does not touch. So occlusion is judged in the top document, and
+  // a node in a child document is covered exactly when the <iframe> that holds it is.
+  const ownerOfDoc = new Map(); // child document index -> owner <iframe> backendNodeId
+  (snap.documents || []).forEach((doc, di) => {
+    const nodes = doc.nodes || {};
+    const cdi = nodes.contentDocumentIndex || {};
+    (cdi.index || []).forEach((ni, k) => { const bid = (nodes.backendNodeId || [])[ni]; if (bid != null) ownerOfDoc.set(cdi.value[k], { bid, parentDoc: di }); });
+  });
+  for (const [di, doc] of (snap.documents || []).entries()) {
     const nodes = doc.nodes || {}, layout = doc.layout || {};
     const bids = nodes.backendNodeId || [];
     const byNodeIndex = new Map();
@@ -493,7 +554,7 @@ async function domSnapshotIndex(tabId, sessionId) {
       if (!b || paint == null) continue;
       const rect = { x1: b[0], y1: b[1], x2: b[0] + b[2], y2: b[1] + b[3] };
       byNodeIndex.set(ni, { rect, paint });
-      if (b[2] <= 0 || b[3] <= 0) continue;
+      if (di !== 0 || b[2] <= 0 || b[3] <= 0) continue;
       // Only something you cannot see through actually hides what is behind it. A transparent
       // layout wrapper spanning the page is the common case, and treating it as an occluder marks
       // the whole page unclickable — which is exactly the false positive this guards against.
@@ -512,9 +573,12 @@ async function domSnapshotIndex(tabId, sessionId) {
         const name = str(a[k]); if (name) attrs[name] = str(a[k + 1]) ?? '';
       }
       const geo = byNodeIndex.get(ni);
-      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint, cursor: geo?.cursor });
+      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint, cursor: geo?.cursor, doc: di });
     }
   }
+  // The top-document <iframe> each child document ultimately sits in.
+  const topOwner = (di) => { let o = ownerOfDoc.get(di), guard = 0; while (o && o.parentDoc !== 0 && guard++ < 16) o = ownerOfDoc.get(o.parentDoc); return o ? o.bid : null; };
+  for (const g of out.values()) if (g.doc) g.frameOwner = topOwner(g.doc);
   return { nodes: out, painted };
 }
 
@@ -581,12 +645,15 @@ function occludedNodes(geo) {
   }
   const union = new RectUnion();
   const byBid = new Map();
-  for (const [bid, g] of geo.nodes) if (g.rect && g.paint != null) byBid.set(bid, g);
+  // A zero-area box (a static <a> wrapping an absolutely placed image, say) has nothing to cover:
+  // any rect "contains" a point, which used to flag such links on every page.
+  for (const [bid, g] of geo.nodes) if (!g.doc && g.rect && g.paint != null && g.rect.x2 > g.rect.x1 && g.rect.y2 > g.rect.y1) byBid.set(bid, g);
   for (const paint of [...levels.keys()].sort((a, b) => b - a)) {
     const group = levels.get(paint);
     for (const [bid, g] of byBid) if (g.paint === paint && union.covers(g.rect)) covered.add(bid);
     for (const p of group) if (p.opaque) union.add(p.rect);
   }
+  for (const [bid, g] of geo.nodes) if (g.doc && g.frameOwner != null && covered.has(g.frameOwner)) covered.add(bid);
   return covered;
 }
 
@@ -598,6 +665,9 @@ const DATE_FORMATS = { date: 'YYYY-MM-DD', month: 'YYYY-MM', week: 'YYYY-Www', t
 // ---- ref resolution ----
 function refNode(tabId, ref) {
   const n = st(tabId).refs.get(ref);
+  // A CSS selector passed as a ref is a natural slip (the agent just used it as `selector`); say so
+  // rather than send it off to re-read the page.
+  if (n == null && /^[#.\[]|[\s>:=]/.test(String(ref))) throw new Error(`"${ref}" looks like a CSS selector, not a ref — pass it as selector:${JSON.stringify(String(ref))}`);
   if (n == null) throw new Error(`unknown ref "${ref}" — take a fresh read_page/dom_query`);
   return n; // { backendNodeId, sessionId }
 }
@@ -743,7 +813,10 @@ const DESCRIBE_FN = `function(){
   const e=this,a=(n)=>e.getAttribute&&e.getAttribute(n)||null;
   const label=(a('aria-label')||e.title||(e.tagName==='INPUT'?(a('placeholder')||a('name')||''):'')||(e.innerText||e.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,120);
   const r=e.getBoundingClientRect?e.getBoundingClientRect():null;
-  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null,
+  // disabled: the browser will not deliver the click (the attribute, or a disabled fieldset).
+  // ariaDisabled: only announced as disabled; the element still gets the click and may act on it.
+  let dis=!!e.disabled; if(!dis&&e.closest){const fs=e.closest('fieldset[disabled]'); if(fs&&/^(BUTTON|INPUT|SELECT|TEXTAREA|OPTGROUP|OPTION)$/.test(e.tagName)){const lg=fs.querySelector(':scope>legend'); dis=!(lg&&lg.contains(e));}}
+  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null, disabled:dis, ariaDisabled:!dis&&a('aria-disabled')==='true',
            box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
 }`;
 async function describeNode(tabId, backendNodeId, sessionId, frameId) {
@@ -866,7 +939,15 @@ async function moveTo(tabId, x, y, opts = {}) {
   await sent[sent.length - 1];
   s.pointer = { x, y };
 }
-async function humanClick(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
+// A click that opens a JS dialog has done its job; what remains of it (the release, a second click)
+// cannot reach a page the dialog is holding. Returns the dialog so the caller can report it.
+async function humanClick(tabId, x, y, opts = {}) {
+  const pending = state.get(tabId)?.dialog;
+  if (pending) throw dialogError(pending); // already open before this click: not something it opened
+  try { await pressAt(tabId, x, y, opts); return null; }
+  catch (e) { if (e.dialogOpen) return e.dialogOpen; throw e; }
+}
+async function pressAt(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
   await moveTo(tabId, x, y);
   await pause(rnd(40, 110));
   for (const clickCount of (double ? [1, 2] : [1])) {
@@ -943,6 +1024,7 @@ const FIELD_INFO_FN = `function(){ const t=(this.type||'').toLowerCase(); return
   text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t))||!!this.isContentEditable, secret:t==='password', focused:this.ownerDocument.activeElement===this,
   value:this.isContentEditable&&!/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)?${EDITOR_TEXT}:'value' in this?String(this.value):null }; }`;
 const SET_VALUE_FN = `function(v){
+  if (!this.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName || '')) return { notField: (this.tagName || '#text').toLowerCase() };
   this.focus && this.focus();
   if (this.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)) {
     const doc = this.ownerDocument, sel = doc.getSelection(); sel.removeAllRanges(); const r = doc.createRange(); r.selectNodeContents(this); sel.addRange(r);
@@ -959,7 +1041,9 @@ async function fillField(tabId, dbg, objectId, backendNodeId, sessionId, value, 
   const info = (await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FIELD_INFO_FN, returnByValue: true })).result?.value || {};
   if (!info.text) {
     const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: SET_VALUE_FN, arguments: [{ value }] });
-    return r.result?.value || {};
+    const v = r.result?.value || {};
+    if (v.notField) throw new Error(`fill: the target is a <${v.notField}>, not a field — target the input, textarea, select or editable region itself (read_page lists them; refs inside an iframe carry frame:true)`);
+    return v;
   }
   // Caret into the field with a real click when it is on screen; otherwise focus it directly.
   try { const c = await absCenter(tabId, backendNodeId, sessionId); await humanClick(tabId, c.x, c.y); }
@@ -984,6 +1068,68 @@ async function fillField(tabId, dbg, objectId, backendNodeId, sessionId, value, 
     return { ...(r.result?.value || {}), viaSetter: true };
   }
   return { got: after.value, secret: info.secret, type: info.type };
+}
+
+// A rich-text editor (TinyMCE, CKEditor 4, old Gmail) is an <iframe> whose document body is the
+// editable region, and the a11y tree offers the iframe as the thing to fill. Filling the iframe
+// element itself only sets a stray property, so step into the frame's document and take its
+// editable body, or its one editable element. Anything else passes through unchanged.
+const FRAME_EDITABLE_FN = `function(){
+  const d = this.ownerDocument ? this.ownerDocument : this; const doc = this.nodeType === 9 ? this : d;
+  const b = doc.body; if (b && b.isContentEditable) return b;
+  const c = [...doc.querySelectorAll('[contenteditable=""],[contenteditable=true],textarea,input:not([type=hidden]):not([type=button]):not([type=submit])')].filter((e) => e.getClientRects().length);
+  return c.length === 1 ? c[0] : null;
+}`;
+async function editableTarget(tabId, node) {
+  let desc;
+  try { desc = (await cmd(dbgOf(tabId, node.sessionId), 'DOM.describeNode', { backendNodeId: node.backendNodeId, depth: 1, pierce: true })).node; } catch { return node; }
+  if (!/^I?FRAME$/.test(desc?.nodeName || '')) return node;
+  const notFound = new Error('fill: this ref is an <iframe> with no single editable region inside — read_page lists the fields in the frame (frame:true); fill one of those');
+  let docDbg, docBid, frameId;
+  if (desc.contentDocument) { docDbg = dbgOf(tabId, node.sessionId); docBid = desc.contentDocument.backendNodeId; frameId = desc.frameId; }
+  else {
+    // Out-of-process frame: its document lives in its own session.
+    const sid = [...st(tabId).frames.entries()].find(([, f]) => f.ownerBackendNodeId === node.backendNodeId)?.[0];
+    if (!sid) throw notFound;
+    docDbg = { tabId, sessionId: sid };
+    docBid = (await cmd(docDbg, 'DOM.getDocument', { depth: 0 })).root.backendNodeId;
+  }
+  const objectId = await objectFor(docDbg, docBid, frameId);
+  const r = await cmd(docDbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FRAME_EDITABLE_FN });
+  if (!r.result?.objectId) throw notFound;
+  const { node: target } = await cmd(docDbg, 'DOM.describeNode', { objectId: r.result.objectId });
+  return { backendNodeId: target.backendNodeId, sessionId: typeof docDbg === 'number' ? node.sessionId : docDbg.sessionId, ...(frameId ? { frameId } : {}) };
+}
+
+// ERR_ABORTED means "this navigation did not finish", which is both a refusal (a top-frame data:
+// URL) and a navigation the page itself superseded (a JS redirect, a second navigate). The browser
+// tells them apart: a superseding one starts under a different loaderId, or commits. Wait briefly
+// for either; comparing URLs instead misjudged a redirect still in flight as a refusal.
+async function replacedNavigation(s, t0, loaderId, ms = 600) {
+  const other = () => (s.navCommitTs || 0) >= t0 || (s.lastNavStart && s.lastNavStart.ts >= t0 && s.lastNavStart.loaderId !== loaderId);
+  for (let waited = 0; !other() && waited < ms; waited += 30) await pause(30);
+  return other();
+}
+
+// After an action: did it start a top-level navigation? A link, a submit or a location assignment
+// asks for one while the click is being handled, so once the renderer has answered one more
+// command, a navigation the click caused has already been announced. That round trip costs a few
+// ms, where a fixed wait cost a quarter second on every click. A navigation that did start gets up
+// to `commitMs` to commit, so the status names the page the action led to. Returns 'committed',
+// 'pending' (started, not committed in time) or null.
+async function settleNavigation(tabId, t0, { commitMs = 3000 } = {}) {
+  const s = state.get(tabId); if (!s) return null;
+  const started = () => (s.navStartTs || 0) >= t0 || (s.navCommitTs || 0) >= t0;
+  if (!started()) { try { await cmd(tabId, 'Runtime.evaluate', { expression: '0', returnByValue: true }); } catch {} }
+  if (!started()) await pause(15); // events emitted with the answer may land a tick after it
+  if (!started()) return null;
+  if ((s.navCommitTs || 0) >= t0) return 'committed';
+  const ok = await new Promise((res) => {
+    const timer = setTimeout(() => { s.commitWaiters = (s.commitWaiters || []).filter((w) => w !== wake); res(false); }, commitMs);
+    const wake = () => { clearTimeout(timer); res(true); };
+    (s.commitWaiters || (s.commitWaiters = [])).push(wake);
+  });
+  return ok ? 'committed' : 'pending';
 }
 
 // Resolve once a load event newer than t0 has fired, or after ms. Event-driven, so it returns the
@@ -1251,8 +1397,8 @@ async function collectMarks(tabId, { space, origin, srcW, srcH, scroll }) {
   const s = st(tabId);
   const cands = [];
   for (const sessionId of [undefined, ...s.frames.keys()]) {
-    let nodes;
-    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    const nodes = await sessionAXNodes(dbgOf(tabId, sessionId));
+    if (!nodes) continue;
     for (const n of nodes) {
       if (n.ignored || n.backendDOMNodeId == null) continue;
       const role = n.role?.value; if (!role || !INTERACTIVE.has(role)) continue;
@@ -1349,6 +1495,37 @@ function drawProbePoint(ctx, x, y) {
   ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
+// Quote the page's own new errors, not a third-party beacon's: those are what an action can cause
+// and what the agent can do something about. Errors without a URL (the page's console calls and
+// thrown exceptions) count as the page's.
+function firstPartyQuotes(errs, pageUrl) {
+  let site = null; try { site = siteOf(new URL(pageUrl).hostname); } catch {}
+  const own = errs.filter((m) => { if (!m.url || !site) return true; try { return siteOf(new URL(m.url).hostname) === site; } catch { return true; } });
+  return own.length ? { firstErrors: own.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {};
+}
+
+// Registrable-ish site of a host, for first- vs third-party: the last two labels, or three under a
+// two-letter second-level like co.uk. Approximate by design; the public suffix list is not here.
+function siteOf(host) {
+  const h = String(host).toLowerCase().replace(/\.$/, '');
+  if (/^[\d.]+$/.test(h) || h.includes(':')) return h;
+  const parts = h.split('.');
+  const n = parts.length >= 3 && /^(co|com|org|net|gov|ac|edu)$/.test(parts[parts.length - 2]) && parts[parts.length - 1].length === 2 ? 3 : 2;
+  return parts.slice(-n).join('.');
+}
+
+// The page's visible text, frames included: same-origin iframes are read through contentDocument
+// (recursively), cross-origin ones through their own sessions. Each part is innerText, so hidden
+// text, <script> and <style> stay out of it.
+const FRAME_TEXT_EXPR = `(()=>{const out=[];const walk=(d,depth)=>{if(!d||depth>8)return;out.push(d.body?d.body.innerText:'');for(const f of d.querySelectorAll('iframe,frame')){let c=null;try{c=f.contentDocument;}catch{}if(c)walk(c,depth+1);}};walk(document,0);return out;})()`;
+async function pageTexts(tabId) {
+  const parts = [];
+  const read = async (dbg) => { try { const r = await cmd(dbg, 'Runtime.evaluate', { expression: FRAME_TEXT_EXPR, returnByValue: true }); for (const t of r.result?.value || []) if (t) parts.push(t); } catch {} };
+  await read(tabId);
+  for (const sessionId of st(tabId).frames.keys()) await read({ tabId, sessionId });
+  return parts;
+}
+
 // chrome.tabs.get() reports an EMPTY url for a tab whose navigation hasn't committed yet — which is
 // exactly the moment after a fresh attach or a just-started load, so the status header could come
 // back with url:null and read as "we lost the page" when nothing was wrong. Fall back to the
@@ -1370,24 +1547,58 @@ const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'select
 // Heuristic over the a11y tree (main + cross-origin frames): rank interactive nodes by fuzzy match
 // against the words of a query. Refs minted here use an 'f' prefix with the same monotonic seq, so
 // they never clobber read_page's.
+// Words that say how to refer to an element, not which one: "the Delete account button" names the
+// element by "delete account". Scoring them let "button" match every button and "the" match most
+// names, so a request for something absent came back "ambiguous" with unrelated buttons.
+const QUERY_STOPWORDS = new Set(['the', 'a', 'an', 'this', 'that', 'my', 'on', 'in', 'of', 'to', 'for', 'and', 'or', 'with', 'at', 'by', 'from', 'field', 'input', 'box', 'element', 'control', 'icon']);
+const ROLE_WORDS = { button: ['button'], btn: ['button'], link: ['link'], checkbox: ['checkbox'], radio: ['radio'], textbox: ['textbox', 'searchbox'], tab: ['tab'], menu: ['menu', 'menuitem'], option: ['option'], switch: ['switch'], slider: ['slider'], dropdown: ['combobox', 'listbox'], combobox: ['combobox'], select: ['combobox', 'listbox'], heading: ['heading'], image: ['image', 'img'] };
+// Every a11y node one session can see: its root document plus each same-site child frame, which
+// shares the session but which getFullAXTree without a frameId leaves out. Child-frame nodes carry
+// __frameId so their refs resolve in that frame's document. null when the session cannot be read.
+async function sessionAXNodes(dbg) {
+  let nodes;
+  try { nodes = (await cmd(dbg, 'Accessibility.getFullAXTree', {})).nodes; } catch { return null; }
+  try {
+    const kids = [];
+    const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
+    walk((await cmd(dbg, 'Page.getFrameTree')).frameTree);
+    for (const frameId of kids) {
+      try { nodes = nodes.concat((await cmd(dbg, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
+    }
+  } catch { /* frame tree unavailable — the root document still reads */ }
+  return nodes;
+}
 async function findCandidates(tabId, query) {
   const s = st(tabId);
-  const q = String(query || '').toLowerCase();
-  const terms = q.split(/\s+/).filter(Boolean);
+  const q = String(query || '').toLowerCase().trim();
+  const words = q.split(/[\s"'“”‘’]+/).filter(Boolean);
+  // Role words only steer: they boost a candidate with that role, never make a match on their own.
+  const roleHints = new Set(words.flatMap((w) => ROLE_WORDS[w] || []));
+  let terms = words.filter((w) => !QUERY_STOPWORDS.has(w) && !ROLE_WORDS[w]);
+  // A query that is only role words ("the button") still needs something to match on.
+  const roleOnly = !terms.length && roleHints.size > 0;
+  if (!terms.length && !roleOnly) terms = words;
   const scored = [];
   for (const sessionId of [undefined, ...s.frames.keys()]) {
-    let nodes;
-    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    const nodes = await sessionAXNodes(dbgOf(tabId, sessionId));
+    if (!nodes) continue;
     for (const n of nodes) {
       if (n.ignored || n.backendDOMNodeId == null) continue;
       const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
       if (!INTERACTIVE.has(role) && !name) continue;
-      const hay = (role + ' ' + name).toLowerCase();
-      let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
-      if (name && q.includes(name.toLowerCase())) score += 5;
-      if (score <= 0) continue;
-      const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
-      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, ...(sessionId ? { frame: true } : {}) });
+      const hay = name.toLowerCase();
+      let score = 0, full = false;
+      if (roleOnly) { if (!roleHints.has(role.toLowerCase())) continue; score = 1; }
+      else {
+        let hits = 0;
+        for (const t of terms) if (hay.includes(t)) { score += t.length; hits++; }
+        if (score <= 0) continue; // the name must carry the match; a role alone is not one
+        full = hits === terms.length;
+        if (hay && q.includes(hay)) score += 5;
+        if (roleHints.has(role.toLowerCase())) score += 3;
+      }
+      const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId, ...(n.__frameId ? { frameId: n.__frameId } : {}) });
+      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, full: roleOnly || full, ...(sessionId || n.__frameId ? { frame: true } : {}) });
     }
   }
   scored.sort((a, b) => b.score - a.score);
@@ -1396,10 +1607,16 @@ async function findCandidates(tabId, query) {
 
 // Rank the interactive elements an intent could mean. Controls first: a button's label is also
 // published as a StaticText, and letting the twin compete makes every intent look ambiguous.
+// Only a candidate whose name carries EVERY content word of the intent counts: "Delete account"
+// sharing "delete" with "Delete order" is exactly the near miss that must never be clicked.
 async function intentCandidates(tabId, intent) {
   const all = await findCandidates(tabId, intent);
   const controls = all.filter((c) => INTERACTIVE.has(c.role));
-  return controls.length ? controls : all;
+  const pool = controls.length ? controls : all;
+  const full = pool.filter((c) => c.full);
+  full.near = pool.filter((c) => !c.full).slice(0, 3);
+  full.pool = pool; // every ranked candidate, for confirming a selector against the intent
+  return full;
 }
 
 // Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
@@ -1424,7 +1641,11 @@ async function resolveSelector(method, p) {
     // scores Save 9 to Delete 5 — a clear pick, and a 2x rule would have called that ambiguous.
     if (top && (!second || top.score >= second.score * 1.5 || top.score - second.score >= 3)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
     const list = cands.slice(0, 5).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
-    throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list || 'none'}. Pick one by ref.`);
+    if (!top) {
+      const near = (cands.near || []).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
+      throw new Error(`${why ? why + '; and ' : ''}nothing on the page matches intent ${JSON.stringify(p.intent)}${near ? ` (partial matches, not taken: ${near})` : ''} — read_page or find to see what is there, and target by ref`);
+    }
+    throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list}. Pick one by ref.`);
   };
   if (!p.selector) return byIntent('');
   const { root } = await cmd(p.tabId, 'DOM.getDocument', { depth: 0 });
@@ -1440,7 +1661,7 @@ async function resolveSelector(method, p) {
     // the intent could mean, the selector's element ranks first. A shared word is not agreement —
     // "save the order" overlaps "Delete order" on "order", and that is exactly the click that does
     // damage when a stale id now points at the wrong control.
-    const cands = await intentCandidates(p.tabId, p.intent);
+    const cands = (await intentCandidates(p.tabId, p.intent)).pool;
     const mine = cands.find((c) => s.refs.get(c.ref)?.backendNodeId === node.backendNodeId);
     const best = cands[0];
     if (mine) {
@@ -1485,8 +1706,21 @@ async function handle(method, p) {
   p = await resolveSelector(method, p);
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
+  if ((track || method === 'humanInput' || method === 'executeCdp') && state.get(tabId)?.attached) st(tabId).lastActionTs = Date.now();
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
-  let result = await dispatch(method, p);
+  const dialogBefore = tabId != null ? state.get(tabId)?.dialog : null;
+  const actionT0 = Date.now();
+  // A JS dialog holds the renderer: anything that reads or drives the page would hang, or, where a
+  // helper swallows the error, come back looking like an empty page. Refuse up front instead.
+  if (dialogBefore && !DIALOG_SAFE.has(method)) throw dialogError(dialogBefore);
+  let result;
+  try { result = await dispatch(method, p); }
+  catch (e) {
+    // A key or keystroke whose handler opened a dialog did land; report it like a click does. Only
+    // when the dialog appeared during this call — one that was already up is a plain error.
+    if (!e.dialogOpen || dialogBefore || !(method === 'pressKey' || method === 'typeText')) throw e;
+    result = { ok: true, openedDialog: { ...e.dialogOpen, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' }, ...(method === 'typeText' ? { note: 'typing stopped when the dialog opened' } : {}) };
+  }
   if (method === 'pageStatus') return result;
   // Say when the target came from a fallback: the caller asked for a selector and got the intent.
   if (p && p.resolvedBy && result && typeof result === 'object' && !result.__image) result = { ...result, resolvedBy: p.resolvedBy, ...(p.note ? { note: p.note } : {}) };
@@ -1494,11 +1728,20 @@ async function handle(method, p) {
     try {
       const tab = await chrome.tabs.get(tabId);
       const fresh = state.get(tabId)?.console.slice(before) || [];
-      const errs = fresh.filter((m) => m.level === 'error').length;
+      const errList = fresh.filter((m) => m.level === 'error');
+      const errs = errList.length;
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
-      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+      // chrome.tabs lags the commit: right after a click navigated, tab.url and tab.title still
+      // name the page it left. The committed frame URL and the new document's own title do not.
+      const st0 = state.get(tabId);
+      let url = await tabUrl(tabId, tab), title = tab.title || null;
+      if (st0?.navCommitTs >= actionT0 && st0.commitUrl) {
+        url = st0.commitUrl;
+        try { title = (await cmd(tabId, 'Runtime.evaluate', { expression: 'document.title', returnByValue: true })).result?.value || title; } catch {}
+      }
+      result.status = { url, title, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, ...firstPartyQuotes(errList, tab.url) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
         ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
@@ -1853,10 +2096,28 @@ async function dispatch(method, p) {
     case 'navigate': {
       await need(p.tabId);
       const cur = (await chrome.tabs.get(p.tabId)).url;
-      if (cur === p.url) return { ok: true, skipped: 'already on url' };
-      const t0 = Date.now();
       const s = st(p.tabId);
+      // A failed load leaves Chrome's error page committed AT the target URL, so "already there" is
+      // only true when the last load of this URL succeeded. Otherwise a retry must load it again.
+      if (cur === p.url && s.navError?.url !== p.url) return { ok: true, skipped: 'already on url' };
+      const t0 = Date.now();
       const nav = await cmd(p.tabId, 'Page.navigate', { url: p.url });
+      if (nav?.isDownload) return { ok: true, download: true, note: 'the URL started a download; the page did not change — download_wait for the file' };
+      // Chrome reports a navigation it refused (a top-frame data: URL, a blocked scheme or port) as
+      // an errorText while the tab stays where it was. ERR_ABORTED is also what a navigation the page
+      // itself redirected looks like, so that one only fails when the tab really did not move.
+      if (nav?.errorText && nav.errorText !== 'net::ERR_ABORTED') {
+        // A network or TLS failure commits Chrome's own error page for that URL (it does not stay on
+        // the previous page). Say what the tab shows, so a retry or a read is not misread.
+        s.navError = { url: p.url, error: nav.errorText };
+        throw new Error(`navigation to ${p.url} failed: ${nav.errorText} — the tab now shows Chrome's error page for it, not the site. `
+          + (/CERT|SSL/.test(nav.errorText) ? 'The site\'s certificate is not trusted; do not bypass the warning unless the user says to.' : 'Retry navigate (it reloads), or report the site unreachable.'));
+      }
+      s.navError = null;
+      if (nav?.errorText && !(await replacedNavigation(s, t0, nav.loaderId))) {
+        throw new Error(`navigation to ${p.url} was refused (net::ERR_ABORTED) — the tab is still on ${cur}.`
+          + (/^data:/i.test(p.url) ? ' Chrome does not let a page navigate its top frame to a data: URL; open it with tab_create instead.' : ''));
+      }
       // A same-document (hash) navigation or a download commits no new document and fires no load.
       if (p.waitUntil !== 'none' && nav && nav.loaderId) { // settle so the next read isn't racing the load
         // Woken by Page.loadEventFired instead of polling readyState every 120 ms.
@@ -1897,19 +2158,8 @@ async function dispatch(method, p) {
       const generics = [];   // role-less main-frame nodes with a DOM node, to be promoted by geometry
       let mainById = null;   // AX nodes of the main frame by id, for ancestor walks
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
-        let nodes;
-        const dbgS = dbgOf(p.tabId, sessionId);
-        try { nodes = (await cmd(dbgS, 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
-        // getFullAXTree without a frameId covers only the session's root document. Same-site
-        // iframes live in this session too, so append each child frame's tree.
-        try {
-          const kids = [];
-          const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
-          walk((await cmd(dbgS, 'Page.getFrameTree')).frameTree);
-          for (const frameId of kids) {
-            try { nodes = nodes.concat((await cmd(dbgS, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
-          }
-        } catch { /* frame tree unavailable — the root document still reads */ }
+        const nodes = await sessionAXNodes(dbgOf(p.tabId, sessionId));
+        if (!nodes) continue;
         const byId = new Map(nodes.map((n) => [n.nodeId, n]));
         if (!sessionId) mainById = byId;
         for (const n of nodes) {
@@ -2057,7 +2307,9 @@ async function dispatch(method, p) {
       const frames = { ...(s.frames.size ? { frames: s.frames.size } : {}), ...(ignoreSel.length ? { ignoring: ignoreSel } : {}), ...(interactOnly ? { mode: 'interact' } : {}) };
       // An overlay is the single most common reason a click does nothing, and the a11y tree gives no
       // hint of it. Say it once, as a count, rather than flipping a flag on every buried element.
-      const overlay = coveredCount ? { covered: coveredCount, hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {};
+      // The explanation once per change in the count; after that the bare count is enough.
+      const overlay = coveredCount ? { covered: coveredCount, ...(s.coveredSaid !== coveredCount ? { hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {}) } : {};
+      s.coveredSaid = coveredCount;
       // A page with almost nothing on it is usually mid-load, not genuinely empty — worth saying,
       // because the alternative is the model concluding the content does not exist.
       const thin = next.size < 10 ? { note2: 'Very few elements — the page is probably still loading or rendering. wait_for a known element before concluding anything is missing.' } : {};
@@ -2080,8 +2332,8 @@ async function dispatch(method, p) {
 
     case 'readText': {
       await need(p.tabId);
-      const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.body?.innerText ?? ""', returnByValue: true });
-      return { text: r.result?.value ?? '' };
+      const [main, ...frames] = await pageTexts(p.tabId);
+      return { text: [main ?? '', ...frames.map((t) => '\n— frame —\n' + t)].join('') };
     }
 
     case 'domQuery': {
@@ -2105,7 +2357,7 @@ async function dispatch(method, p) {
     case 'find': {
       await need(p.tabId);
       const scored = await findCandidates(p.tabId, p.query);
-      return { candidates: scored.slice(0, 10).map(({ score, ...c }) => c) };
+      return { candidates: scored.slice(0, 10).map(({ score, full, ...c }) => c) };
     }
 
     case 'click': {
@@ -2116,6 +2368,8 @@ async function dispatch(method, p) {
         const c = await absCenter(p.tabId, node.backendNodeId, node.sessionId);
         x = c.x; y = c.y;
         intended = await describeNode(p.tabId, node.backendNodeId, node.sessionId, node.frameId);
+        // A disabled control ignores the click; saying ok here is how a stuck form looks like progress.
+        if (intended?.disabled) throw new Error(`the ref's <${intended.tag}>${intended.label ? ` "${intended.label}"` : ''} is disabled, so a click does nothing — complete whatever enables it first (validate {ref, enabled:true} or wait_for), or check you have the right element`);
       } else {
         const pt = await pointOf(p.tabId, p);
         if (!pt) throw new Error('click needs a ref or {x,y}');
@@ -2133,9 +2387,18 @@ async function dispatch(method, p) {
         node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y, node.frameId) : Promise.resolve(null),
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
-      await humanClick(p.tabId, x, y, { button, double: !!p.double });
-      const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: before?.hit || null };
-      if (before?.clickable) out.nearestClickable = before.clickable;
+      const clickT0 = Date.now();
+      const dialog = await humanClick(p.tabId, x, y, { button, double: !!p.double });
+      const nav = dialog ? null : await settleNavigation(p.tabId, clickT0);
+      // Lead with what took the click: the button, not the <svg><path> or <i> icon under the cursor.
+      // The innermost element follows as `via` when it differs, which is where an overlay shows up.
+      const leaf = before?.hit || null, target = before?.clickable || leaf;
+      const brief = (d) => d && { tag: d.tag, ...(d.role ? { role: d.role } : {}), ...(d.label ? { label: d.label } : {}), ...(d.href ? { href: d.href } : {}), ...(d.disabled ? { disabled: true } : {}), selector: d.selector, ...(d.selectorMatches > 1 ? { selectorMatches: d.selectorMatches } : {}) };
+      const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: brief(target), ...(before?.clickable ? { via: { tag: leaf.tag, ...(leaf.label && leaf.label !== target.label ? { label: leaf.label } : {}) } } : {}) };
+      if (dialog) out.openedDialog = { ...dialog, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' };
+      if (intended?.ariaDisabled) out.note = `the ref's <${intended.tag}> is aria-disabled: it took the click, but the page marks it unavailable — check what it did (read_page / validate)`;
+      if (nav === 'committed') out.navigated = true;
+      else if (nav === 'pending') out.navigating = true; // started, still loading: status.url may be the old page
       if (covered?.covered) {
         const by = covered.by;
         out.intercepted = `click at (${Math.round(x)},${Math.round(y)}) was over `
@@ -2179,7 +2442,7 @@ async function dispatch(method, p) {
 
     case 'fill': {
       await need(p.tabId);
-      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = await editableTarget(p.tabId, refNode(p.tabId, p.ref));
       const dbg = dbgOf(p.tabId, sessionId);
       const objectId = await objectFor(dbg, backendNodeId, frameId);
       // Read the value back in the same call. A phone/date/currency/card field with an input mask
@@ -2269,9 +2532,11 @@ async function dispatch(method, p) {
       // inserting the character (a chord like Ctrl+A intentionally omits text — it's a shortcut).
       const printable = base.length === 1 && !(modifiers & (1 | 2 | 4));
       const textField = printable ? { text: base } : {};
+      const keyT0 = Date.now();
       await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k, ...textField });
       await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...k });
-      return { ok: true };
+      const nav = base === 'Enter' ? await settleNavigation(p.tabId, keyT0) : null;
+      return { ok: true, ...(nav === 'committed' ? { navigated: true } : nav === 'pending' ? { navigating: true } : {}) };
     }
     case 'scroll': {
       await need(p.tabId);
@@ -2327,17 +2592,18 @@ async function dispatch(method, p) {
       const q = String(p.query ?? '');
       if (!q) throw new Error('find_text needs a non-empty query');
       const max = Math.min(p.limit || 20, 50);
-      const r = await cmd(p.tabId, 'Runtime.evaluate', {
-        expression: `(()=>{const q=${JSON.stringify(q)},rx=${p.regex ? 'true' : 'false'},max=${max};
-          const t=document.body?document.body.innerText:'';const out=[];let count=0;
-          const push=(i,len)=>{if(out.length<max){const s=Math.max(0,i-40);out.push(t.slice(s,i+len+40).replace(/\\s+/g,' ').trim());}};
-          if(rx){const re=new RegExp(q,'gi');let m;while((m=re.exec(t))&&count<10000){count++;push(m.index,m[0].length);if(m.index===re.lastIndex)re.lastIndex++;}}
-          else{const hay=t.toLowerCase(),n=q.toLowerCase();let i=0;while((i=hay.indexOf(n,i))>=0&&count<10000){count++;push(i,n.length);i+=n.length;}}
-          return{count,contexts:out};})()`,
-        returnByValue: true,
+      let re = null;
+      if (p.regex) { try { re = new RegExp(q, 'gi'); } catch (e) { throw new Error('find_text: invalid regex — ' + e.message); } }
+      const texts = await pageTexts(p.tabId);
+      const out = []; let count = 0, inFrames = 0;
+      texts.forEach((t, part) => {
+        const push = (i, len) => { if (out.length < max) { const st0 = Math.max(0, i - 40); out.push(t.slice(st0, i + len + 40).replace(/\s+/g, ' ').trim()); } };
+        const before = count;
+        if (re) { re.lastIndex = 0; let m; while ((m = re.exec(t)) && count < 10000) { count++; push(m.index, m[0].length); if (m.index === re.lastIndex) re.lastIndex++; } }
+        else { const hay = t.toLowerCase(), n = q.toLowerCase(); let i = 0; while ((i = hay.indexOf(n, i)) >= 0 && count < 10000) { count++; push(i, n.length); i += n.length; } }
+        if (part > 0) inFrames += count - before;
       });
-      const v = r.result?.value || { count: 0, contexts: [] };
-      return { query: q, count: v.count, matches: v.contexts };
+      return { query: q, count, ...(inFrames ? { inFrames } : {}), matches: out };
     }
 
     // "Did it land?" as one cheap, deterministic call. Every check runs and reports its evidence, so
@@ -2353,9 +2619,12 @@ async function dispatch(method, p) {
       if (p.urlMatches != null) { let ok = false; try { ok = new RegExp(String(p.urlMatches)).test(url); } catch { checks.push({ check: 'urlMatches', want: p.urlMatches, ok: false, got: 'invalid regex' }); }
         if (!checks.some((c) => c.check === 'urlMatches')) checks.push({ check: 'urlMatches', want: p.urlMatches, ok, got: url }); }
       if (p.titleIncludes != null) checks.push({ check: 'titleIncludes', want: p.titleIncludes, ok: String(t.title || '').includes(String(p.titleIncludes)), got: t.title });
+      let texts = null;
       const textCount = async (q) => {
-        const r = await cmd(p.tabId, 'Runtime.evaluate', { returnByValue: true, expression: `(()=>{const t=(document.body?document.body.innerText:'').toLowerCase();const n=${JSON.stringify(String(q).toLowerCase())};let i=0,c=0;while((i=t.indexOf(n,i))>=0&&c<1000){c++;i+=n.length;}return c;})()` });
-        return r.result?.value ?? 0;
+        if (!texts) texts = (await pageTexts(p.tabId)).map((t) => t.toLowerCase());
+        const n = String(q).toLowerCase(); let c = 0;
+        for (const t of texts) { let i = 0; while (n && (i = t.indexOf(n, i)) >= 0 && c < 1000) { c++; i += n.length; } }
+        return c;
       };
       for (const q of [].concat(p.text ?? [])) { const c = await textCount(q); checks.push({ check: 'text', want: q, ok: c > 0, got: c + ' occurrence(s)' }); }
       for (const q of [].concat(p.textAbsent ?? [])) { const c = await textCount(q); checks.push({ check: 'textAbsent', want: q, ok: c === 0, got: c + ' occurrence(s)' }); }
@@ -2413,8 +2682,22 @@ async function dispatch(method, p) {
         for (const sid of s.frames.keys()) await rawCmd({ tabId: p.tabId, sessionId: sid }, 'Runtime.disable').catch(() => {});
         note = 'console capture is off for this tab again.';
       }
-      const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = [];
-      return { messages: out, ...(note ? { note } : {}) };
+      // Third-party noise (an analytics beacon failing 50 times) drowns the errors that matter.
+      // firstPartyOnly keeps messages whose source URL is on the page's own site, plus the ones that
+      // carry no URL (the page's own console calls and thrown errors).
+      let list = s.console;
+      let dropped = 0;
+      if (p.firstPartyOnly || p.level) {
+        let site = null;
+        try { site = siteOf(new URL((await chrome.tabs.get(p.tabId)).url).hostname); } catch {}
+        list = list.filter((m) => {
+          if (p.level && m.level !== p.level && !(p.level === 'warning' && m.level === 'warn')) return false;
+          if (p.firstPartyOnly && m.url && site) { let h = ''; try { h = new URL(m.url).hostname; } catch {} if (h && siteOf(h) !== site) { dropped++; return false; } }
+          return true;
+        });
+      }
+      const out = list.slice(-(p.limit || 50)); if (p.clear) s.console = [];
+      return { messages: out, ...(dropped ? { thirdPartyHidden: dropped } : {}), ...(note ? { note } : {}) };
     }
     case 'readNetwork': { const s = st(p.tabId); const out = [...s.network.values()].slice(-(p.limit || 50)); if (p.clear) s.network.clear(); return { requests: out }; }
 
@@ -2445,7 +2728,7 @@ async function dispatch(method, p) {
     }
 
     case 'closeAgentTab': {
-      if (!(await isAgentTab(p.tabId))) throw new Error('refusing to close a tab the agent did not open — use tab_release to hand it back');
+      if (!(await isAgentTab(p.tabId))) throw new Error('refusing to close a tab the agent did not open, or that a page opened outside an agent action — use tab_release to hand it back');
       await detach(p.tabId).catch(() => {});
       await chrome.tabs.remove(p.tabId);
       await forgetAgentTab(p.tabId);
@@ -2527,7 +2810,12 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const k = p.kind;
       if (k === 'move') { await moveTo(p.tabId, p.x, p.y, p.buttons ? { buttons: p.buttons } : {}); return { ok: true }; }
-      if (k === 'click') { await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 }); return { ok: true }; }
+      if (k === 'click') {
+        const t0 = Date.now();
+        const dialog = await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 });
+        const nav = dialog ? null : await settleNavigation(p.tabId, t0); // like Playwright: a click's navigation has committed when it returns
+        return { ok: true, ...(dialog ? { dialog } : {}), ...(nav ? { nav } : {}) };
+      }
       if (k === 'drag') {
         await moveTo(p.tabId, p.from.x, p.from.y); await pause(rnd(60, 140));
         await rawCmd({ tabId: p.tabId }, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: p.from.x, y: p.from.y, button: 'left', clickCount: 1, buttons: 1 });
@@ -2833,6 +3121,7 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     // clear it (dialog_handle). beforeunload we auto-accept so it can't wedge navigation.
     s.dialog = { type: cdpParams.type, message: cdpParams.message, defaultPrompt: cdpParams.defaultPrompt };
     if (cdpParams.type === 'beforeunload') { cmd(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {}); s.dialog = null; }
+    else if (s.dialogWaiters) for (const w of [...s.dialogWaiters]) w(s.dialog);
   } else if (cdpMethod === 'Page.javascriptDialogClosed') {
     s.dialog = null;
   } else if (cdpMethod === 'Page.loadEventFired' && !source.sessionId) {
@@ -2846,8 +3135,17 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
       s.console.push({ level: e.level, text: (e.source ? e.source + ': ' : '') + (e.text || ''), ts: e.timestamp, ...(e.url ? { url: e.url } : {}) });
       if (s.console.length > 500) s.console.shift();
     }
+  } else if (cdpMethod === 'Page.frameStartedNavigating' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navStartTs = Date.now(); s.lastNavStart = { loaderId: cdpParams.loaderId, ts: Date.now() };
+  } else if (cdpMethod === 'Page.windowOpen' || (cdpMethod === 'Page.frameRequestedNavigation' && /^new/.test(cdpParams.disposition || ''))) {
+    if (s.lastActionTs && Date.now() - s.lastActionTs < ADOPT_WINDOW_MS) noteAgentOpen(cdpParams.url);
+  } else if ((cdpMethod === 'Page.frameRequestedNavigation' || cdpMethod === 'Page.frameStartedLoading') && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navStartTs = Date.now();
+  } else if (cdpMethod === 'Page.navigatedWithinDocument' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navCommitTs = Date.now(); s.commitUrl = cdpParams.url;
+    if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; }
   } else if (cdpMethod === 'Page.frameNavigated') {
-    if (!cdpParams.frame?.parentId && !source.sessionId) s.topFrameId = cdpParams.frame?.id;
+    if (!cdpParams.frame?.parentId && !source.sessionId) { s.topFrameId = cdpParams.frame?.id; s.navCommitTs = Date.now(); s.commitUrl = (cdpParams.frame?.url || '') + (cdpParams.frame?.urlFragment || ''); if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; } }
     // A new document in some frame: the isolated world we made in its old document is gone.
     if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); if (cdpParams.frame?.id) s.worlds.delete((source.sessionId || 'main') + '#' + cdpParams.frame.id); }
     if (!cdpParams.frame?.parentId) {

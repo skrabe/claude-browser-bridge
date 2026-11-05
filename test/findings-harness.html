@@ -1,0 +1,31 @@
+<!doctype html><html><head><title>Findings Lab</title>
+<script>var greeting = "Hello World!"; /* code mentioning the visible text below */</script>
+<style>.x::before{content:"Hello World!"}</style></head>
+<body style="margin:0;font:14px sans-serif">
+<div id=bar style="position:fixed;top:0;left:0;right:0;height:50px;background:rgba(0,0,0,.85);z-index:5"></div>
+<button id=under style="position:fixed;top:10px;left:300px;z-index:1">Buried</button>
+<button id=above style="position:fixed;top:10px;left:10px;z-index:9">Above bar</button>
+<div style="height:70px"></div>
+<p id=hw>Hello World!</p>
+<button id=alert onclick="alert('hi from alert')">Alert</button>
+<button id=confirm onclick="document.getElementById('cres').textContent=String(confirm('Proceed?'))">Confirm</button>
+<span id=cres></span>
+<button id=prompt onclick="document.getElementById('pres').textContent=String(prompt('Name?','x'))">Prompt</button>
+<span id=pres></span>
+<input id=keyalert aria-label="Key alert" onkeydown="if(event.key==='Enter')alert('enter pressed')">
+<button id=off disabled>Disabled</button>
+<button id=ariaoff aria-disabled="true" onclick="document.getElementById('why').textContent='explained'">Soft disabled</button>
+<span id=why></span>
+<a id=nav href="/page2">Go to page 2</a>
+<button id=slow onclick="setTimeout(()=>location.href='/page2',1500)">Slow nav</button>
+<button id=jsredir onclick="location.href='/page2'">JS nav</button>
+<a id=blank href="/page2" target=_blank>New tab</a>
+<button id=icon aria-label="Settings"><svg width=20 height=20><path d="M0 0h20v20H0z"/></svg></button>
+<button id=save>Save order</button><button id=del>Delete order</button>
+<button id=err onclick="console.error('lab-error');throw new Error('boom')">Throw</button>
+<div id=wrap><button id=leaf>Leaf</button></div>
+<section id=tm><textarea style="display:none">Editor text</textarea>
+<iframe id=ed title="Rich Text Area" style="width:300px;height:80px" srcdoc="<html><body contenteditable=true><p>Editor text</p></body></html>"></iframe></section>
+<iframe id=plain srcdoc="<body><input id=in2 aria-label=Inner><p>Only in frame</p></body>" style="width:300px;height:60px"></iframe>
+<script>window.pageGlobal = 42;</script>
+</body></html>

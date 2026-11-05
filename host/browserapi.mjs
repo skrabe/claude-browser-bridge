@@ -65,6 +65,20 @@ if (!window.__cbb) {
   const isEnabled = (e) => !(e.disabled || e.getAttribute && (e.getAttribute('aria-disabled') === 'true'));
   // aria-hidden/hidden subtrees are pruned from the a11y tree — exclude them from role/text/label
   // matching so hidden duplicates don't inflate the count and trip strict mode (like Playwright).
+  // Elements whose text is code, inert markup or a form field's source, never something a user
+  // reads as page text: a <script> containing the searched string must not match it, and nor may a
+  // hidden editor's <textarea> (TinyMCE keeps one beside its iframe) or the ancestors around it.
+  // Like Playwright, button-type inputs match by their value.
+  const NOT_TEXT = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE', 'META', 'LINK', 'IFRAME', 'FRAME', 'OBJECT', 'TEXTAREA', 'SELECT']);
+  const BUTTON_INPUT = /^(button|submit|reset)$/i;
+  const shownText = (e) => {
+    const tag = (e.tagName || '').toUpperCase();
+    if (tag === 'INPUT') return BUTTON_INPUT.test(e.type || '') ? String(e.value || '') : '';
+    if (NOT_TEXT.has(tag)) return '';
+    let out = '';
+    const walk = (n) => { for (const c of n.childNodes) { if (c.nodeType === 3) out += c.nodeValue; else if (c.nodeType === 1) { const t = c.tagName.toUpperCase(); if (t === 'INPUT') { if (BUTTON_INPUT.test(c.type || '')) out += ' ' + (c.value || '') + ' '; } else if (!NOT_TEXT.has(t)) walk(c); } } };
+    walk(e); return out;
+  };
   const aHidden = (e) => { let n = e; while (n && n.nodeType === 1) { if (n.getAttribute && (n.getAttribute('aria-hidden') === 'true' || n.hasAttribute('hidden'))) return true; n = n.parentElement; } return false; };
   const isChecked = (e) => { if (typeof e.checked === 'boolean') return e.checked; const a = e.getAttribute && e.getAttribute('aria-checked'); return a === 'true'; };
   const isEditable = (e) => (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA' || e.isContentEditable) && isEnabled(e) && !e.readOnly;
@@ -96,7 +110,7 @@ if (!window.__cbb) {
       for (const e of all) {
         if (aHidden(e)) continue;
         if (step.by === 'role') { if (roleOf(e) !== step.role) continue; if (step.name != null && !M(accName(e), step.name, step.exact)) continue; out.push(e); }
-        else if (step.by === 'text') { if (M(e.textContent, step.text, step.exact)) out.push(e); }
+        else if (step.by === 'text') { if (M(shownText(e), step.text, step.exact)) out.push(e); }
         else if (step.by === 'label') { const l = labelForm(e); const ar = e.getAttribute && e.getAttribute('aria-label'); if ((l && M(l, step.text, step.exact)) || (ar && M(ar, step.text, step.exact))) out.push(e); }
         else if (step.by === 'placeholder') { const ph = e.getAttribute && e.getAttribute('placeholder'); if (ph && M(ph, step.text, step.exact)) out.push(e); }
         else if (step.by === 'testid') { const t = e.getAttribute && (e.getAttribute('data-testid') || e.getAttribute('data-test-id') || e.getAttribute('data-test')); if (t === step.testId) out.push(e); }
@@ -114,7 +128,7 @@ if (!window.__cbb) {
       if (step.op === 'nth') { scopes = scopes[step.n < 0 ? scopes.length + step.n : step.n] ? [scopes[step.n < 0 ? scopes.length + step.n : step.n]] : []; }
       else if (step.op === 'first') scopes = scopes.slice(0, 1);
       else if (step.op === 'last') scopes = scopes.slice(-1);
-      else if (step.op === 'filter') { scopes = scopes.filter((s) => { if (step.hasText != null && !M(s.textContent, step.hasText, false)) return false; if (step.hasNotText != null && M(s.textContent, step.hasNotText, false)) return false; return true; }); }
+      else if (step.op === 'filter') { scopes = scopes.filter((s) => { if (step.hasText != null && !M(shownText(s), step.hasText, false)) return false; if (step.hasNotText != null && M(shownText(s), step.hasNotText, false)) return false; return true; }); }
       else scopes = queryStep(scopes, step);
     }
     return scopes;
@@ -133,7 +147,9 @@ if (!window.__cbb) {
     if (op === 'el') return el || null; // raw element — host reads it back as a Runtime objectId (file inputs)
     if (op === 'text') { if (!el) return null; return a.kind === 'inner' ? (el.innerText != null ? el.innerText : el.textContent) : a.kind === 'value' ? ('value' in el ? String(el.value) : null) : a.kind === 'attr' ? el.getAttribute(a.name) : (el.textContent == null ? null : el.textContent); }
     if (op === 'bool') { if (!el) return false; return a.q === 'visible' ? isVisible(el) : a.q === 'enabled' ? isEnabled(el) : a.q === 'checked' ? isChecked(el) : a.q === 'editable' ? isEditable(el) : false; }
-    if (op === 'fill') { if (!el) return { ok: false, err: 'not found' }; el.focus && el.focus(); if (el.isContentEditable) { el.textContent = a.value; el.dispatchEvent(new Event('input', { bubbles: true })); } else nativeSet(el, a.value); return { ok: true }; }
+    if (op === 'fill') { if (!el) return { ok: false, err: 'not found' };
+      if (!el.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return { ok: false, err: 'the target is a <' + el.tagName.toLowerCase() + '>, not a field' + (el.tagName === 'IFRAME' ? ' — for an editor iframe use page.frameLocator(sel).locator("body").fill(v)' : '') };
+      el.focus && el.focus(); if (el.isContentEditable) { el.textContent = a.value; el.dispatchEvent(new Event('input', { bubbles: true })); } else nativeSet(el, a.value); return { ok: true }; }
     if (op === 'select') { if (!el || el.tagName !== 'SELECT') return { ok: false, err: 'not a <select>' }; const want = a.values; let sel = []; for (const o of el.options) { const hit = want.some((w) => (w.value != null && o.value === String(w.value)) || (w.label != null && (o.label || o.text) === String(w.label)) || (w.index != null && o.index === Number(w.index)) || (typeof w === 'string' && (o.value === w || o.label === w || o.text === w)) || (typeof w === 'number' && (o.value === String(w) || o.index === w))); o.selected = hit; if (hit) sel.push(o.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return { ok: sel.length > 0, selected: sel }; }
     if (op === 'focus') { if (!el) return { ok: false }; el.focus && el.focus(); return { ok: true }; }
     if (op === 'fieldinfo') { if (!el) return null; const t = (el.type || '').toLowerCase(); const NOT = ['date','time','datetime-local','month','week','color','range','file','checkbox','radio','hidden','submit','button','image','reset'];
@@ -161,9 +177,11 @@ if (!window.__cbb) {
       // open dialogs/dropdowns render at end-of-body (portals) → surface them first so truncation can't drop them
       const inPortal = (e) => { let n = e; while (n && n.nodeType === 1) { const rr = n.getAttribute && n.getAttribute('role'); if (rr && /^(dialog|alertdialog|menu|listbox)$/.test(rr.trim())) return true; if (n.getAttribute && n.getAttribute('aria-modal') === 'true') return true; n = n.parentElement; } return false; };
       const portal = [], rest = [];
-      for (const e of universe(root.documentElement ? root : root)) { if (!isVisible(e) || excluded(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; (inPortal(e) ? portal : rest).push({ e, r, nm }); }
+      const scope = root.nodeType === 9 ? universe(root) : [root, ...universe(root)];
+      for (const e of scope) { if (!isVisible(e) || excluded(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; (inPortal(e) ? portal : rest).push({ e, r, nm }); }
       const lines = []; let ref = 0;
       for (const it of portal.concat(rest)) { const b = a.boxes ? topBox(it.e) : null; const line = '[' + (++ref) + '] ' + it.r + (it.nm ? ' "' + it.nm.slice(0, 160) + '"' : '') + ('value' in it.e && it.e.value ? ' =' + String(it.e.value).slice(0, 80) : '') + (b ? ' [box=' + Math.round(b.x) + ',' + Math.round(b.y) + ',' + Math.round(b.w) + ',' + Math.round(b.h) + ']' : ''); lines.push(line); if (lines.join('\\n').length > (a.max || 20000)) { lines.push('… (truncated)'); break; } }
+      if (!lines.length) return a.selector ? '(selector matched, but nothing visible and named is under it)' : '(nothing visible and named on the page)';
       return lines.join('\\n');
     }
     if (op === 'vdom') {
@@ -267,6 +285,19 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   const clickAt = (x, y, o = {}) => human('click', { x, y, button: o.button || 'left', clickCount: o.clickCount || 1, modifiers: o.modifiers || 0 });
   const dragPath = (from, to) => human('drag', { from, to });
 
+  // Name a locator and a match in error messages, so a failure says which lookup failed and what
+  // it collided with instead of a bare count.
+  const describeSteps = (steps) => steps.map((st) => {
+    const v = (x) => (x && x.__re ? '/' + x.source + '/' + x.flags : JSON.stringify(x));
+    if (st.op === 'nth') return `.nth(${st.n})`; if (st.op === 'first') return '.first()'; if (st.op === 'last') return '.last()';
+    if (st.op === 'filter') return `.filter(${st.hasText != null ? 'hasText ' + v(st.hasText) : 'hasNotText ' + v(st.hasNotText)})`;
+    if (st.by === 'role') return `getByRole(${JSON.stringify(st.role)}${st.name != null ? ', ' + v(st.name) : ''})`;
+    if (st.by === 'css') return `locator(${JSON.stringify(st.selector)})`;
+    if (st.by === 'testid') return `getByTestId(${JSON.stringify(st.testId)})`;
+    return `getBy${st.by[0].toUpperCase() + st.by.slice(1)}(${v(st.text)})`;
+  }).join('.');
+  const describeMatch = (m) => `<${m.tag}>${m.role ? ' ' + m.role : ''}${m.name ? ' "' + String(m.name).slice(0, 50) + '"' : ''}${m.sessionId ? ' (in a frame)' : ''}${m.vis ? '' : ' hidden'}${m.en === false ? ' disabled' : ''}`;
+
   class Locator {
     constructor(steps) { this.steps = steps; }
     _child(step) { return new Locator([...this.steps, step]); }
@@ -288,16 +319,17 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async all() { const g = await resolveGlobal(this.steps); return g.map((_, i) => this.nth(i)); }
     // actionable: true → visible+enabled; 'visible' → visible only (hover); false → attached only.
     async _one(actionable, timeoutMs = 15000) {
-      const deadline = Date.now() + Math.min(timeoutMs, 60000);
+      const budget = Math.min(timeoutMs, 60000), deadline = Date.now() + budget;
       let last = null;
       while (Date.now() < deadline) {
         const g = await resolveGlobal(this.steps);
         if (g.length === 1) { const t = g[0]; const ok = actionable === 'visible' ? t.vis : actionable ? (t.vis && t.en) : true; if (ok) return t; last = t; }
-        else if (g.length > 1) throw new Error(`strict mode: ${g.length} elements match — add .first()/.nth()/.filter()`);
+        else if (g.length > 1) throw new Error(`strict mode: ${describeSteps(this.steps)} matches ${g.length} elements — ${g.slice(0, 4).map(describeMatch).join('; ')}${g.length > 4 ? '; …' : ''}. Add .first()/.nth()/.filter(), or a role/exact name`);
         await settle(deadline);
       }
-      if (last) throw new Error('element not actionable in time (visible/enabled)');
-      throw new Error('locator matched no element in time');
+      const secs = Math.round(budget / 1000) + 's';
+      if (last) throw new Error(`${describeSteps(this.steps)} stayed ${!last.vis ? 'hidden' : 'disabled'} for ${secs} (${describeMatch(last)})${!last.vis ? '' : ' — it is disabled; complete whatever enables it first'}`);
+      throw new Error(`${describeSteps(this.steps)} matched no element in ${secs} — check the name with read_page/find, or pass {timeoutMs} for a slow page (use .count() to test for existence without waiting)`);
     }
     async waitFor(o = {}) { const state = o.state || 'visible'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const g = await resolveGlobal(this.steps); const t = g[0]; const ok = state === 'attached' ? !!t : state === 'detached' ? !t : state === 'visible' ? (t && t.vis) : state === 'hidden' ? (!t || !t.vis) : !!t; if (ok) return; await settle(deadline); } throw new Error('waitFor(' + state + ') timed out'); }
     async textContent(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'text' }, t.sessionId); }
@@ -362,7 +394,10 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     }
   }
 
-  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: ch } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
+  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); // Enter's default action (submit a form, commit an input's change) runs only when the key
+    // event carries its text, as a real keypress does; without it the page sees keydown and nothing.
+    const text = printable ? ch : base === 'Enter' && !(mods & (1 | 2 | 4)) ? '\r' : null;
+    await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(text != null ? { text } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
   const rootLoc = (step) => new Locator([step]);
   const dom_cua = {
     async get_visible_dom() { return evalIn('vdom', { cap: 400 }); },
@@ -388,8 +423,12 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     // a third argument to reach page-defined JS — the page can observe that call.
     async evaluate(fn, arg, o = {}) { const expr = typeof fn === 'function' ? `(${fn.toString()})(${JSON.stringify(arg ?? null)})` : String(fn); const r = o && o.world === 'page' ? await callHost('executeCdp', { tabId, cdpMethod: 'Runtime.evaluate', cdpParams: { expression: expr, returnByValue: true, awaitPromise: true }, world: 'page' }) : await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) throw new Error('evaluate failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; },
     async goto(url, o = {}) {
+      const before = await this.url();
       const r = await cdp('Page.navigate', { url });
-      if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ')');
+      if (r && r.isDownload) return null;
+      if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ') — the tab is still on ' + before);
+      // ERR_ABORTED is also a navigation the page redirected; it only failed if the tab did not move.
+      if (r && r.errorText) { let now = before; for (let w = 0; w < 600 && now === before; w += 60) { await sleep(60); now = await this.url(); } if (!now || now === before) throw new Error('goto refused: net::ERR_ABORTED (' + url + ') — the tab is still on ' + before + (/^data:/i.test(url) ? '. Chrome does not let a page navigate its top frame to a data: URL; use browser.newTab(url).' : '')); }
       if ((o.waitUntil || 'load') === 'commit') return null;
       // wait for the NEW document to commit (readyState leaves the old 'complete') before waiting for
       // its load state — otherwise a slow/blocked nav resolves against the stale page.
@@ -445,7 +484,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async setViewport(o = {}) { await cdp('Emulation.setDeviceMetricsOverride', { width: o.width || 1280, height: o.height || 800, deviceScaleFactor: o.deviceScaleFactor || 0, mobile: !!o.mobile }); },
     async resetViewport() { await cdp('Emulation.clearDeviceMetricsOverride', {}); },
     async pdf(o = {}) { const r = await cdp('Page.printToPDF', { printBackground: o.printBackground !== false, ...(o.landscape ? { landscape: true } : {}) }); const buf = Buffer.from(r.data, 'base64'); const p = o.path || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.pdf'); await writeFile(p, buf); return { path: p, bytes: buf.length }; },
-    async export(o = {}) { const fmt = (o && o.format) || 'pdf'; if (fmt === 'pdf') return this.pdf(o); if (fmt === 'text' || fmt === 'md' || fmt === 'markdown') { const text = await this.evaluate(() => (document.body ? document.body.innerText : '')); const p = (o && o.path) || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.txt'); await writeFile(p, text || ''); return { path: p, bytes: Buffer.byteLength(text || '') }; } throw new Error('export: unsupported format "' + fmt + '"'); },
+    async export(o = {}) { const fmt = (o && o.format) || 'pdf'; if (fmt === 'pdf') return this.pdf(o); if (fmt === 'text' || fmt === 'md' || fmt === 'markdown') { const text = await this.evaluate(() => (document.body ? document.body.innerText : '')); const p = (o && o.path) || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.txt'); await writeFile(p, text || ''); const bytes = Buffer.byteLength(text || ''); return { path: p, bytes, ...(bytes <= 8000 ? { text } : {}) }; } throw new Error('export: unsupported format "' + fmt + '"'); },
     dom_cua,
     cua: dom_cua,
     capabilities: { async list() { return ['viewport', 'screenshot', 'domSnapshot']; }, async get() { return null; } },

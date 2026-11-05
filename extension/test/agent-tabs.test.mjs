@@ -32,7 +32,7 @@ function makeChrome(local) {
       getURL: (p) => 'chrome-extension://test/' + p,
     },
     downloads: { onCreated: listeners(), onChanged: listeners() },
-    tabs: { onRemoved: listeners(), async get() { return {}; }, async query() { return []; } },
+    tabs: { onRemoved: listeners(), onCreated: listeners(), async get() { return {}; }, async query() { return []; } },
     tabGroups: { async query() { return []; } },
     windows: { async getAll() { return []; } },
     bookmarks: {},
@@ -123,6 +123,21 @@ const store = {};
   const names = [...code.matchAll(/^(?:async\s+)?function\s+([$\w]+)\s*\(/gm)].map((m) => m[1]);
   const dupes = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
   ok('no duplicate top-level function names' + (dupes.length ? ` (found: ${dupes.join(', ')})` : ''), dupes.length === 0);
+}
+
+// A tab a page opens: adopted only when a controlled tab announced the open (Page.windowOpen) while
+// the agent was acting on it. Either order of arrival works: the event first, or the tab first.
+{
+  const { ctx } = boot({});
+  ctx.noteAgentOpen('https://x.test/a');
+  ok('a tab matching an announced open is adopted', await ctx.adoptOpenedTab({ id: 501, pendingUrl: 'https://x.test/a' }) && await ctx.isAgentTab(501));
+  await ctx.adoptOpenedTab({ id: 502, pendingUrl: 'https://x.test/b' });
+  ok('a tab nothing announced is not', !(await ctx.isAgentTab(502)));
+  ctx.noteAgentOpen('https://x.test/b');
+  ok('a tab that appears before its announcement is adopted when it arrives', await ctx.isAgentTab(502));
+  await ctx.adoptOpenedTab({ id: 503, pendingUrl: 'https://x.test/c' });
+  ctx.noteAgentOpen('https://x.test/other');
+  ok('an announcement for another URL does not adopt it', !(await ctx.isAgentTab(503)));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
