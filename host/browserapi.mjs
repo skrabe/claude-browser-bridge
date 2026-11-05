@@ -256,6 +256,14 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   // dwell, a typing rhythm), which also keeps one remembered pointer position per tab across the
   // atomic tools and scripts.
   const human = (kind, params) => { if (abort.aborted) throw new Error('run aborted (timeout)'); return callHost('humanInput', { tabId, kind, ...params }); };
+  // Type in short chunks so a run that times out stops within one chunk instead of finishing a long
+  // value it no longer owns, and so no single host call grows with the text's length. The typing
+  // rhythm is per key, so chunking does not change what the page sees. fast is decided once for the
+  // whole value; a 200-char value must not type its last chunk slowly.
+  const typeText = async (text, fast) => {
+    const s = String(text), f = fast || s.length > 60;
+    for (let i = 0; i < s.length; i += 24) await human('type', { text: s.slice(i, i + 24), fast: f });
+  };
   const clickAt = (x, y, o = {}) => human('click', { x, y, button: o.button || 'left', clickCount: o.clickCount || 1, modifiers: o.modifiers || 0 });
   const dragPath = (from, to) => human('drag', { from, to });
 
@@ -319,7 +327,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
       if (info && info.typeable) {
         await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId);
         if (info.value) await human('clear', {});
-        await human('type', { text: v, fast: v.length > 60 });
+        await typeText(v, false);
         const got = await evalIn('text', { steps: this._q, i: t.i, kind: info.editable ? 'text' : 'value' }, t.sessionId);
         if (!v || got) return;
       }
@@ -327,7 +335,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     }
     // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
     // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
-    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await human('type', { text: String(secretVal(value)), fast: !!o.fast }); }
+    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await typeText(secretVal(value), !!o.fast); }
     // Playwright renamed .type() to .pressSequentially(); accept both so a script written against
     // either generation of the API works here. Both append — neither clears first.
     async pressSequentially(value, o = {}) { return this.type(value, o); }
@@ -360,7 +368,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async get_visible_dom() { return evalIn('vdom', { cap: 400 }); },
     async click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.click: ' + (r && r.err)); await clickAt(r.box.cx, r.box.cy); },
     async double_click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.double_click: ' + (r && r.err)); await clickAt(r.box.cx, r.box.cy, { clickCount: 2 }); },
-    async type({ text }) { await human('type', { text: String(text) }); },
+    async type({ text }) { await typeText(text, false); },
     async keypress({ keys }) { for (const k of (Array.isArray(keys) ? keys : [keys])) await pressChord(cdp, k); },
     async scroll({ node_id, x = 0, y = 300 }) { let cx = 200, cy = 300; if (node_id) { const r = await evalIn('vact', { node_id, action: 'box' }); if (r && r.ok) { cx = r.box.cx; cy = r.box.cy; } } await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x: cx, y: cy, deltaX: x, deltaY: y }); },
   };

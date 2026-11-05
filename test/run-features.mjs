@@ -133,6 +133,41 @@ async function main() {
     console.log(dim('  – skipped OS-clipboard check (pbcopy unavailable)'));
   }
 
+  console.log(bold('\nEditing') + dim('  (same-site iframe, contenteditable, background-tab speed)'));
+  {
+    const edit = `<!doctype html><body><textarea id=ta>t</textarea>`
+      + `<div contenteditable id=ce aria-label=editor><p>old</p></div>`
+      + `<iframe id=f srcdoc='<input aria-label=inner value=framevalue>'></iframe></body>`;
+    const es = http.createServer((_, r) => { r.writeHead(200, { 'content-type': 'text/html' }); r.end(edit); });
+    await new Promise((r) => es.listen(0, '127.0.0.1', r));
+    const et = (await call('tab_create', { url: `http://127.0.0.1:${es.address().port}/`, active: false })).data.id;
+    await call('wait_for', { tabId: et, state: 'load' });
+    await new Promise((r) => setTimeout(r, 300));
+
+    const els = (await call('read_page', { tabId: et, full: true })).data?.elements || [];
+    const inner = els.find((e) => e.role === 'textbox' && e.value === 'framevalue');
+    check('read_page lists a field inside a same-site iframe', !!inner, inner ? inner.ref : 'missing');
+    if (inner) {
+      const f = await call('fill', { tabId: et, ref: inner.ref, value: 'typed' });
+      const got = await ev(et, 'f.contentDocument.querySelector("input").value');
+      check('fill writes into the iframe field', !f.isError && got === 'typed', f.isError ? String(f.data).slice(0, 90) : `value = ${JSON.stringify(got)}`);
+    }
+
+    const ce = await call('fill', { tabId: et, selector: '#ce', value: 'first\nsecond' });
+    const ceText = await ev(et, 'ce.innerText');
+    check('fill changes a contenteditable editor', !ce.isError && /first/.test(ceText) && /second/.test(ceText), JSON.stringify(ceText));
+    const v = (await call('validate', { tabId: et, selector: '#ce', value: 'first\nsecond' })).data;
+    check('validate reads an editor\'s text, not an invented .value', v?.ok === true && !(await ev(et, '"value" in ce')), JSON.stringify(v?.checks?.[0]));
+
+    const t0 = Date.now();
+    await call('fill', { tabId: et, selector: '#ta', value: 'hello world' });
+    const ms = Date.now() - t0;
+    check('fill in a background tab stays fast', ms < 5000, `${ms}ms for 11 chars`);
+
+    await call('tab_close', { tabId: et });
+    es.close();
+  }
+
   console.log(bold('\nSet-of-mark cost') + dim('  (a box measurement per interactable element)'));
   for (const url of [PAGE, 'https://en.wikipedia.org/wiki/Set_cover_problem']) {
     const t2 = (await call('tab_create', { url, active: false })).data.id;

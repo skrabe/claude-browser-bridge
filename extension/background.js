@@ -216,6 +216,18 @@ async function worldFor(dbg) {
   s.worlds.set(key, pending);
   try { return await pending; } catch (e) { s.worlds.delete(key); throw e; }
 }
+// The isolated world for one child frame in a session. Keyed by frame id, so it is created once per
+// child document; a stale id is dropped and recreated on the next miss.
+async function worldForFrame(dbg, frameId) {
+  const s = st(dbg.tabId);
+  if (!s.worlds) s.worlds = new Map();
+  const key = worldKey(dbg) + '#' + frameId;
+  const hit = s.worlds.get(key);
+  if (hit) return hit;
+  const pending = rawCmd(dbg, 'Page.createIsolatedWorld', { frameId, worldName: WORLD, grantUniveralAccess: false }).then((r) => r.executionContextId);
+  s.worlds.set(key, pending);
+  try { return await pending; } catch (e) { s.worlds.delete(key); throw e; }
+}
 // Only errors meaning the call never ran. "Execution context was destroyed" means it started and the
 // page navigated mid-await; re-running that could repeat a side effect (a second form submit).
 const STALE_CONTEXT = /Cannot find context|Cannot find default execution context|uniqueContextId not found/i;
@@ -587,9 +599,34 @@ function refNode(tabId, ref) {
   if (n == null) throw new Error(`unknown ref "${ref}" — take a fresh read_page/dom_query`);
   return n; // { backendNodeId, sessionId }
 }
+// A node inside an in-process child frame (a same-site iframe) shares the top session but lives in
+// its own document, so it must resolve in that frame's isolated world. Resolving it in the top
+// frame's world fails outright on Chrome ("Node with given id does not belong to the document").
 async function objectFor(dbg, backendNodeId) {
-  const { object } = await cmd(dbg, 'DOM.resolveNode', { backendNodeId });
-  return object.objectId;
+  try {
+    const { object } = await cmd(dbg, 'DOM.resolveNode', { backendNodeId });
+    return object.objectId;
+  } catch (e) {
+    const frameId = await nodeFrameId(dbg, backendNodeId).catch(() => null);
+    if (!frameId) throw e;
+    const ctx = await worldForFrame(dbg, frameId);
+    const { object } = await rawCmd(dbg, 'DOM.resolveNode', { backendNodeId, executionContextId: ctx });
+    return object.objectId;
+  }
+}
+async function nodeFrameId(dbg, backendNodeId) {
+  const { node } = await cmd(dbg, 'DOM.describeNode', { backendNodeId, depth: 0 });
+  if (node.frameId) return node.frameId;
+  // describeNode reports frameId only on documents and frame owners; walk to the owning document.
+  const { nodeIds } = await cmd(dbg, 'DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [backendNodeId] });
+  let id = nodeIds && nodeIds[0];
+  for (let i = 0; id && i < 200; i++) {
+    const d = (await cmd(dbg, 'DOM.describeNode', { nodeId: id, depth: 0 })).node;
+    if (d.nodeType === 9 && d.frameId) return d.frameId;
+    if (!d.parentId) break;
+    id = d.parentId;
+  }
+  return null;
 }
 // Accumulated top-left offset of a frame chain, in top-level viewport CSS px. In a real
 // (non-headless) browser DOM.getBoxModel returns FRAME-LOCAL coords, so an OOPIF element's viewport
@@ -692,7 +729,7 @@ const HIT_TEST_FN = `function(x,y){
     break;
   }
   // the nearest clickable ancestor is usually what the user "meant" (text node inside a button)
-  let act=el; for(let i=0;i<8&&act;i++){ const t=act.tagName; if(t==='A'||t==='BUTTON'||t==='INPUT'||t==='SELECT'||t==='TEXTAREA'||t==='LABEL'||act.getAttribute('role')||act.onclick||act.tabIndex>=0) break; act=act.parentElement; }
+  let act=el; for(let i=0;i<8&&act;i++){ const t=act.tagName; if(t==='A'||t==='BUTTON'||t==='INPUT'||t==='SELECT'||t==='TEXTAREA'||t==='LABEL'||act.getAttribute('role')||act.hasAttribute('onclick')||act.tabIndex>=0) break; act=act.parentElement; }
   const out={ hit:desc(el) };
   if(act&&act!==el) out.clickable=desc(act);
   if(frames) out.crossedFrames=frames;
@@ -815,10 +852,16 @@ function pointerPath(a, b) {
 async function moveTo(tabId, x, y, opts = {}) {
   const s = st(tabId);
   const from = s.pointer || { x: Math.max(0, x - rnd(80, 260)), y: Math.max(0, y - rnd(40, 160)) };
+  // The renderer acknowledges a mouse move only when it next produces a frame, and a background tab
+  // produces about one a second. Waiting for each acknowledgement turned a short glide into a
+  // ten-second click there. Send the moves on the human cadence without waiting; commands stay in
+  // order, and only the last one is awaited.
+  const sent = [];
   for (const pt of pointerPath(from, { x, y })) {
-    await cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, ...(opts.buttons ? { button: 'left', buttons: opts.buttons } : {}) });
+    sent.push(cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, ...(opts.buttons ? { button: 'left', buttons: opts.buttons } : {}) }).catch(() => {}));
     await pause(rnd(6, 16));
   }
+  await sent[sent.length - 1];
   s.pointer = { x, y };
 }
 async function humanClick(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
@@ -890,10 +933,15 @@ async function clearFocused(tabId) {
 // field holds afterwards, so callers can report masks and truncation.
 const SETTER_TYPES = new Set(['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range', 'file', 'checkbox', 'radio', 'hidden', 'submit', 'button', 'reset', 'image']);
 const FIELD_INFO_FN = `function(){ const t=(this.type||'').toLowerCase(); return { tag:(this.tagName||'').toLowerCase(), type:t, editable:!!this.isContentEditable,
-  text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t)), secret:t==='password', focused:document.activeElement===this,
-  value:'value' in this?String(this.value):null }; }`;
+  text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t))||!!this.isContentEditable, secret:t==='password', focused:document.activeElement===this,
+  value:this.isContentEditable&&!('value' in this)?String(this.innerText).replace(/\\n\\n+/g,'\\n').replace(/\\n$/,''):'value' in this?String(this.value):null }; }`;
 const SET_VALUE_FN = `function(v){
   this.focus && this.focus();
+  if (this.isContentEditable && !("value" in this)) {
+    const sel = getSelection(); sel.removeAllRanges(); const r = document.createRange(); r.selectNodeContents(this); sel.addRange(r);
+    document.execCommand("insertText", false, v);
+    return { got: String(this.innerText).replace(/\\n\\n+/g, "\\n").replace(/\\n$/, ""), secret: false, type: "" };
+  }
   const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
   if (d && d.set) d.set.call(this, v); else this.value = v;
   this.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1420,6 +1468,8 @@ function isPrivateHost(host) {
 }
 
 async function handle(method, p) {
+  // Load new extension code without a trip to chrome://extensions (development: setup and tests).
+  if (method === 'reloadExtension') { setTimeout(() => chrome.runtime.reload(), 50); return { ok: true, version: chrome.runtime.getManifest().version }; }
   p = await resolveSelector(method, p);
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
@@ -1809,7 +1859,18 @@ async function dispatch(method, p) {
       let mainById = null;   // AX nodes of the main frame by id, for ancestor walks
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
         let nodes;
-        try { nodes = (await cmd(dbgOf(p.tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+        const dbgS = dbgOf(p.tabId, sessionId);
+        try { nodes = (await cmd(dbgS, 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+        // getFullAXTree without a frameId covers only the session's root document. Same-site
+        // iframes live in this session too, so append each child frame's tree.
+        try {
+          const kids = [];
+          const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
+          walk((await cmd(dbgS, 'Page.getFrameTree')).frameTree);
+          for (const frameId of kids) {
+            try { nodes = nodes.concat((await cmd(dbgS, 'Accessibility.getFullAXTree', { frameId })).nodes); } catch { /* out-of-process child: its own session covers it */ }
+          }
+        } catch { /* frame tree unavailable — the root document still reads */ }
         const byId = new Map(nodes.map((n) => [n.nodeId, n]));
         if (!sessionId) mainById = byId;
         for (const n of nodes) {
@@ -2266,7 +2327,7 @@ async function dispatch(method, p) {
           const visible = cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0 && b.width > 0 && b.height > 0;
           const checked = typeof el.checked === 'boolean' ? el.checked : el.getAttribute('aria-checked') === 'true';
           const enabled = !(el.disabled || el.getAttribute('aria-disabled') === 'true');
-          return { visible, checked, enabled, value: 'value' in el ? String(el.value) : null, text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 300), secret: el.type === 'password' };
+          return { visible, checked, enabled, value: el.isContentEditable && !('value' in el) ? String(el.innerText).replace(/\\n\\n+/g, '\\n').replace(/\\n$/, '') : 'value' in el ? String(el.value) : null, text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 300), secret: el.type === 'password' };
         }` });
         const e = r.result?.value;
         if (!e) checks.push({ check: 'element', ok: false, got: 'ref no longer resolves to an element' });
