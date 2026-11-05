@@ -229,7 +229,8 @@ selector, box) plus a ref you can click. That turns a coordinate guess into a se
 `annotate:true` also returns a picture with a crosshair on the point, so you can see a misplaced
 guess.
 
-Every `click` returns a receipt. `landedOn` names the element the click reached; `intercepted`
+Every `click` returns a receipt. `landedOn` names the element that took the click (the button or
+link, not the icon inside it; `via` names the innermost element when it differs); `intercepted`
 appears when an overlay covered the element your ref pointed at:
 
 > `click at (412,388) was over <div> "Accept cookies", not the ref's <button> "Add to cart" —

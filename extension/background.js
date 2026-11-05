@@ -2249,9 +2249,12 @@ async function dispatch(method, p) {
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
       const dialog = await humanClick(p.tabId, x, y, { button, double: !!p.double });
-      const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: before?.hit || null };
+      // Lead with what took the click: the button, not the <svg><path> or <i> icon under the cursor.
+      // The innermost element follows as `via` when it differs, which is where an overlay shows up.
+      const leaf = before?.hit || null, target = before?.clickable || leaf;
+      const brief = (d) => d && { tag: d.tag, ...(d.role ? { role: d.role } : {}), ...(d.label ? { label: d.label } : {}), ...(d.href ? { href: d.href } : {}), ...(d.disabled ? { disabled: true } : {}), selector: d.selector, ...(d.selectorMatches > 1 ? { selectorMatches: d.selectorMatches } : {}) };
+      const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: brief(target), ...(before?.clickable ? { via: { tag: leaf.tag, ...(leaf.label && leaf.label !== target.label ? { label: leaf.label } : {}) } } : {}) };
       if (dialog) out.openedDialog = { ...dialog, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' };
-      if (before?.clickable) out.nearestClickable = before.clickable;
       if (covered?.covered) {
         const by = covered.by;
         out.intercepted = `click at (${Math.round(x)},${Math.round(y)}) was over `
