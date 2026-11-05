@@ -1534,13 +1534,13 @@ async function findCandidates(tabId, query) {
       const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
       if (!INTERACTIVE.has(role) && !name) continue;
       const hay = name.toLowerCase();
-      let score = 0;
+      let score = 0, full = false;
       if (roleOnly) { if (!roleHints.has(role.toLowerCase())) continue; score = 1; }
       else {
         let hits = 0;
         for (const t of terms) if (hay.includes(t)) { score += t.length; hits++; }
         if (score <= 0) continue; // the name must carry the match; a role alone is not one
-        n.__full = hits === terms.length;
+        full = hits === terms.length;
         if (hay && q.includes(hay)) score += 5;
         if (roleHints.has(role.toLowerCase())) score += 3;
       }
