@@ -798,8 +798,10 @@ const DESCRIBE_FN = `function(){
   const e=this,a=(n)=>e.getAttribute&&e.getAttribute(n)||null;
   const label=(a('aria-label')||e.title||(e.tagName==='INPUT'?(a('placeholder')||a('name')||''):'')||(e.innerText||e.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,120);
   const r=e.getBoundingClientRect?e.getBoundingClientRect():null;
-  let dis=!!e.disabled||a('aria-disabled')==='true'; if(!dis&&e.closest){const fs=e.closest('fieldset[disabled]'); if(fs&&/^(BUTTON|INPUT|SELECT|TEXTAREA)$/.test(e.tagName)){const lg=fs.querySelector(':scope>legend'); dis=!(lg&&lg.contains(e));}}
-  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null, disabled:dis,
+  // disabled: the browser will not deliver the click (the attribute, or a disabled fieldset).
+  // ariaDisabled: only announced as disabled; the element still gets the click and may act on it.
+  let dis=!!e.disabled; if(!dis&&e.closest){const fs=e.closest('fieldset[disabled]'); if(fs&&/^(BUTTON|INPUT|SELECT|TEXTAREA|OPTGROUP|OPTION)$/.test(e.tagName)){const lg=fs.querySelector(':scope>legend'); dis=!(lg&&lg.contains(e));}}
+  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null, disabled:dis, ariaDisabled:!dis&&a('aria-disabled')==='true',
            box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
 }`;
 async function describeNode(tabId, backendNodeId, sessionId, frameId) {
@@ -2382,6 +2384,7 @@ async function dispatch(method, p) {
     case 'fill': {
       await need(p.tabId);
       const { backendNodeId, sessionId, frameId } = await editableTarget(p.tabId, refNode(p.tabId, p.ref));
+      if (intended?.ariaDisabled) out.note = `the ref's <${intended.tag}> is aria-disabled: it took the click, but the page marks it unavailable — check what it did (read_page / validate)`;
       const dbg = dbgOf(p.tabId, sessionId);
       const objectId = await objectFor(dbg, backendNodeId, frameId);
       // Read the value back in the same call. A phone/date/currency/card field with an input mask
