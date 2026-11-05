@@ -125,16 +125,19 @@ const store = {};
   ok('no duplicate top-level function names' + (dupes.length ? ` (found: ${dupes.join(', ')})` : ''), dupes.length === 0);
 }
 
-// A tab a page opens: adopted only when the agent caused it.
+// A tab a page opens: adopted only when a controlled tab announced the open (Page.windowOpen) while
+// the agent was acting on it. Either order of arrival works: the event first, or the tab first.
 {
   const { ctx } = boot({});
-  await ctx.markAgentTab(500);
-  ok('a tab opened from an agent tab is adopted', await ctx.adoptOpenedTab({ id: 501, openerTabId: 500 }) && await ctx.isAgentTab(501));
-  ctx.st(600).attached = true; ctx.st(600).lastActionTs = Date.now();
-  ok('a tab opened from a claimed tab right after an agent action is adopted', await ctx.adoptOpenedTab({ id: 601, openerTabId: 600 }) && await ctx.isAgentTab(601));
-  ctx.st(600).lastActionTs = Date.now() - 60000;
-  ok('a tab the user opens from a claimed tab later is not', !(await ctx.adoptOpenedTab({ id: 602, openerTabId: 600 })) && !(await ctx.isAgentTab(602)));
-  ok('a tab with no opener is not', !(await ctx.adoptOpenedTab({ id: 603 })));
+  ctx.noteAgentOpen('https://x.test/a');
+  ok('a tab matching an announced open is adopted', await ctx.adoptOpenedTab({ id: 501, pendingUrl: 'https://x.test/a' }) && await ctx.isAgentTab(501));
+  await ctx.adoptOpenedTab({ id: 502, pendingUrl: 'https://x.test/b' });
+  ok('a tab nothing announced is not', !(await ctx.isAgentTab(502)));
+  ctx.noteAgentOpen('https://x.test/b');
+  ok('a tab that appears before its announcement is adopted when it arrives', await ctx.isAgentTab(502));
+  await ctx.adoptOpenedTab({ id: 503, pendingUrl: 'https://x.test/c' });
+  ctx.noteAgentOpen('https://x.test/other');
+  ok('an announcement for another URL does not adopt it', !(await ctx.isAgentTab(503)));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

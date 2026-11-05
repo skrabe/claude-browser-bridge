@@ -103,18 +103,30 @@ async function forgetAgentTab(tabId) {
 // Don't let the set grow stale as the user closes tabs themselves.
 try { chrome.tabs.onRemoved.addListener((tabId) => { forgetAgentTab(tabId); state.delete(tabId); }); } catch {}
 // A tab a page opens because of the agent (a target=_blank link it clicked, a window.open its
-// script ran) is the agent's to close as well. Adopted when its opener is a tab the agent opened,
-// or a tab it controls that it acted on in the last few seconds; a tab the user opens from their
-// own tab at any other moment stays theirs.
+// script ran) is the agent's to close as well. The evidence is the browser's own: the controlled
+// tab reports Page.windowOpen / a new-tab navigation request, and a tab appears with that URL
+// within a few seconds. chrome.tabs' openerTabId cannot be used: Brave sets it to whichever tab is
+// active, which for a background agent tab is one of the user's. Only opens while the agent was
+// acting on that tab count, so a user's ctrl-click in a claimed tab later stays theirs.
 const ADOPT_WINDOW_MS = 4000;
+const pendingOpens = []; // { url, ts } announced by controlled tabs
+const recentTabs = [];   // { id, url, ts } created, not yet matched
+const sameOpenUrl = (a, b) => !a || !b || a === b || a === 'about:blank' || b === 'about:blank';
+const prune = (list) => { const floor = Date.now() - ADOPT_WINDOW_MS; while (list.length && list[0].ts < floor) list.shift(); };
+function noteAgentOpen(url) {
+  prune(recentTabs);
+  const hit = recentTabs.findIndex((t) => sameOpenUrl(t.url, url));
+  if (hit >= 0) { markAgentTab(recentTabs[hit].id); recentTabs.splice(hit, 1); return; }
+  prune(pendingOpens); pendingOpens.push({ url, ts: Date.now() });
+}
 async function adoptOpenedTab(tab) {
-  const opener = tab?.openerTabId;
-  if (tab?.id == null || opener == null) return false;
-  const os = state.get(opener);
-  const actedRecently = os?.attached && os.lastActionTs && Date.now() - os.lastActionTs < ADOPT_WINDOW_MS;
-  if (!actedRecently && !(await isAgentTab(opener))) return false;
-  await markAgentTab(tab.id);
-  return true;
+  if (tab?.id == null) return false;
+  const url = tab.pendingUrl || tab.url || '';
+  prune(pendingOpens);
+  const hit = pendingOpens.findIndex((o) => sameOpenUrl(o.url, url));
+  if (hit >= 0) { pendingOpens.splice(hit, 1); await markAgentTab(tab.id); return true; }
+  prune(recentTabs); recentTabs.push({ id: tab.id, url, ts: Date.now() });
+  return false;
 }
 try { chrome.tabs.onCreated.addListener((tab) => { adoptOpenedTab(tab); }); } catch {}
 
@@ -3082,6 +3094,8 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
       s.console.push({ level: e.level, text: (e.source ? e.source + ': ' : '') + (e.text || ''), ts: e.timestamp, ...(e.url ? { url: e.url } : {}) });
       if (s.console.length > 500) s.console.shift();
     }
+  } else if (cdpMethod === 'Page.windowOpen' || (cdpMethod === 'Page.frameRequestedNavigation' && /^new/.test(cdpParams.disposition || ''))) {
+    if (s.lastActionTs && Date.now() - s.lastActionTs < ADOPT_WINDOW_MS) noteAgentOpen(cdpParams.url);
   } else if ((cdpMethod === 'Page.frameRequestedNavigation' || cdpMethod === 'Page.frameStartedLoading') && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
     s.navStartTs = Date.now();
   } else if (cdpMethod === 'Page.navigatedWithinDocument' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
