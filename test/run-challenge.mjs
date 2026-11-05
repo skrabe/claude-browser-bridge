@@ -16,6 +16,18 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLEAR_AFTER_MS = 4000;
 let firstHit = 0;
 const site = http.createServer((req, res) => {
+  if (req.url.startsWith('/checkbox')) {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    return res.end(`<!doctype html><title>Just a moment...</title><label><input type="checkbox" onchange="location.href='/verified'">Verify you are human</label>`);
+  }
+  if (req.url.startsWith('/verified')) {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    return res.end('<!doctype html><title>Verified</title><h1>Verification complete</h1>');
+  }
+  if (req.url.startsWith('/blocked')) {
+    res.writeHead(403, { 'content-type': 'text/html', 'cf-mitigated': 'challenge' });
+    return res.end('<!doctype html><title>Just a moment...</title><p>Waiting for user verification</p>');
+  }
   if (req.url.startsWith('/widget')) {
     // An ordinary page that embeds a challenge widget (as a sign-up form with Turnstile does).
     res.writeHead(200, { 'content-type': 'text/html' });
@@ -70,6 +82,17 @@ try {
   check('an embedded widget alone is not reported as blocking', !wc || wc.blocking === false, JSON.stringify(wc));
   const wres = await call('challenge_wait', { tabId, timeoutMs: 8000, notify: false });
   check('challenge_wait does not wait on a widget-only page', wres.cleared === true && wres.waitedMs < 2000, JSON.stringify(wres).slice(0, 160));
+  const checkbox = await call('navigate', { tabId, url: BASE + '/checkbox' });
+  check('a visible verification checkbox is reported as blocking', checkbox.status?.challenge?.blocking === true);
+  const clicked = await call('run', { tabId, script: "await page.getByRole('checkbox', {name:'Verify you are human'}).check(); await page.waitForURL(/\\/verified$/); return await page.url();" });
+  check('normal browser interaction completes visible verification', clicked.result === BASE + '/verified', JSON.stringify(clicked));
+  const verified = await call('read_text', { tabId });
+  const cleared = await call('challenge_wait', { tabId, check: true });
+  check('the verified page is available without a challenge', /Verification complete/.test(verified.text || '') && !cleared.challenge);
+  await call('navigate', { tabId, url: BASE + '/blocked' });
+  const blocked = await call('challenge_wait', { tabId, timeoutMs: 8000, notify: false });
+  check('an unresolved check retains user handoff', blocked.cleared === false && blocked.handedOff === true, JSON.stringify(blocked));
+  check('a failed handoff preserves the blocking evidence', blocked.challenge?.blocking === true);
   const quiet = await call('navigate', { tabId, url: BASE + '/' });
   check('an ordinary page carries no challenge', !(quiet.status && quiet.status.challenge));
 } finally {
