@@ -208,6 +208,9 @@ async function onMessage(m) {
 // released the moment Page.javascriptDialogOpening arrives, carrying the dialog so the action can
 // report it.
 const DIALOG_BLOCKED = /^(Input\.|Runtime\.(evaluate|callFunctionOn|awaitPromise)$)/;
+// What still works, or is the remedy, while a dialog is up: answering it, tab and window
+// bookkeeping, and reads of what was already captured.
+const DIALOG_SAFE = new Set(['handleDialog', 'getDialog', 'pageStatus', 'getInfo', 'getUserTabs', 'release', 'closeAgentTab', 'createTab', 'claimTab', 'activateTab', 'readConsole', 'readNetwork', 'cdpEvents', 'listDownloads', 'waitDownload', 'listFrames', 'browserManage', 'peekTab', 'reloadExtension']);
 function dialogError(d) {
   const msg = String(d?.message ?? '').slice(0, 160);
   const e = new Error(`a JS ${d?.type || 'dialog'} is open on the page${msg ? ` ("${msg}")` : ''} and blocks it until answered — `
@@ -220,9 +223,6 @@ function rawCmd(dbg, method, params = {}) {
   if (s?.dialog) return Promise.reject(dialogError(s.dialog));
   const sent = new Promise((res, rej) => {
     chrome.debugger.sendCommand(dbg, method, params, (result) => {
-// What still works, or is the remedy, while a dialog is up: answering it, tab and window
-// bookkeeping, and reads of what was already captured.
-const DIALOG_SAFE = new Set(['handleDialog', 'getDialog', 'pageStatus', 'getInfo', 'getUserTabs', 'release', 'closeAgentTab', 'createTab', 'claimTab', 'activateTab', 'readConsole', 'readNetwork', 'cdpEvents', 'listDownloads', 'waitDownload', 'listFrames', 'browserManage', 'peekTab', 'reloadExtension']);
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
