@@ -1492,6 +1492,15 @@ function drawProbePoint(ctx, x, y) {
   ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
+// Quote the page's own new errors, not a third-party beacon's: those are what an action can cause
+// and what the agent can do something about. Errors without a URL (the page's console calls and
+// thrown exceptions) count as the page's.
+function firstPartyQuotes(errs, pageUrl) {
+  let site = null; try { site = siteOf(new URL(pageUrl).hostname); } catch {}
+  const own = errs.filter((m) => { if (!m.url || !site) return true; try { return siteOf(new URL(m.url).hostname) === site; } catch { return true; } });
+  return own.length ? { firstErrors: own.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {};
+}
+
 // Registrable-ish site of a host, for first- vs third-party: the last two labels, or three under a
 // two-letter second-level like co.uk. Approximate by design; the public suffix list is not here.
 function siteOf(host) {
@@ -1729,7 +1738,7 @@ async function handle(method, p) {
         url = st0.commitUrl;
         try { title = (await cmd(tabId, 'Runtime.evaluate', { expression: 'document.title', returnByValue: true })).result?.value || title; } catch {}
       }
-      result.status = { url, title, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, firstErrors: errList.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+      result.status = { url, title, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, ...firstPartyQuotes(errList, tab.url) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
         ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
