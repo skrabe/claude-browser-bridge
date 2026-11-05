@@ -186,6 +186,16 @@ function runMcpServer() {
       catch { clearTimeout(t); reqs.delete(pid); resolve(false); }
     });
   }
+  // The page status of a tab, over the raw socket (callHost would re-enter the timeout path).
+  function statusOf(s, tabId, ms = 3000) {
+    return new Promise((resolve) => {
+      const pid = `p${idc++}`;
+      const t = setTimeout(() => { reqs.delete(pid); resolve(null); }, ms);
+      reqs.set(pid, (msg) => { clearTimeout(t); resolve(msg && msg.result || null); });
+      try { s.write(encode({ id: pid, method: 'pageStatus', params: { tabId } })); }
+      catch { clearTimeout(t); reqs.delete(pid); resolve(null); }
+    });
+  }
   const dropSocket = (s) => { try { s.destroy(); } catch {} if (sock === s) sock = null; };
 
   async function callHost(method, params) {
@@ -218,6 +228,11 @@ function runMcpServer() {
         // must not cost other callers their working connection.
         const alive = await probeAlive(s, 3000);
         if (!alive) dropSocket(s);
+        // A JS dialog freezes the page, and a call stuck behind one looks exactly like a busy page.
+        let dialog = null;
+        if (alive && params && params.tabId != null) dialog = (await statusOf(s, params.tabId))?.openDialog || null;
+        if (dialog) return done(reject, new Error(`"${method}" is blocked by an open JS ${dialog.type} on the page`
+          + `${dialog.message ? ` ("${String(dialog.message).slice(0, 160)}")` : ''} — answer it with dialog_handle {accept:true|false}.`));
         done(reject, new Error(alive
           ? `"${method}" exceeded ${Math.round(budget / 1000)}s while the extension stayed responsive — `
             + 'the page is still busy (a heavy first compile, a stalled request, or a load that never '

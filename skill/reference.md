@@ -170,9 +170,10 @@ opening a new one.
 
 - Upload: `await page.getByLabel('Resume').setInputFiles('/abs/file.pdf')`. No OS picker.
 - Download: trigger it, then `const {path} = await page.waitForDownload()` and `Read` that path.
-- Dialogs: a native `alert`/`confirm`/`prompt` freezes the tab until handled. After an action that
-  may open one, `const d = await page.getJsDialog()` returns `null` or
-  `{type, message, accept, dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a
+- Dialogs: a native `alert`/`confirm`/`prompt` freezes the tab until handled. A click or key that
+  opens one returns at once (the atomic `click` reports `openedDialog`); anything else that touches
+  the page fails fast naming the dialog until it is answered. After an action that may open one,
+  `const d = await page.getJsDialog()` returns `null` or `{type, message, accept, dismiss}`. Decide by the task goal (accept a "proceed?"; weigh a
   "discard changes?"). `beforeunload` is auto-accepted so it can't wedge navigation.
 - Console: `await page.consoleLogs({limit})`, for debugging a local app.
 - Screenshot: `await page.screenshot({fullPage, marks, boxes, ref})` uses the same capture path as

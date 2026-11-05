@@ -175,12 +175,33 @@ async function onMessage(m) {
 
 // ---- low-level CDP ----
 // target: a tabId (number) → {tabId}, or a debuggee object {tabId, sessionId} for a child frame.
+// While a JS dialog (alert/confirm/prompt) is up, the renderer answers neither input nor script
+// until someone closes it: a click whose handler calls alert() would wait on its mouseReleased for
+// as long as the dialog stays open. Those commands fail fast instead, and any already in flight are
+// released the moment Page.javascriptDialogOpening arrives, carrying the dialog so the action can
+// report it.
+const DIALOG_BLOCKED = /^(Input\.|Runtime\.(evaluate|callFunctionOn|awaitPromise)$)/;
+function dialogError(d) {
+  const msg = String(d?.message ?? '').slice(0, 160);
+  const e = new Error(`a JS ${d?.type || 'dialog'} is open on the page${msg ? ` ("${msg}")` : ''} and blocks it until answered — `
+    + 'dialog_handle {accept:true|false} (in a script: (await page.getJsDialog()).accept() / .dismiss())');
+  e.dialogOpen = d;
+  return e;
+}
 function rawCmd(dbg, method, params = {}) {
-  return new Promise((res, rej) => {
+  const s = dbg.tabId != null && DIALOG_BLOCKED.test(method) ? state.get(dbg.tabId) : null;
+  if (s?.dialog) return Promise.reject(dialogError(s.dialog));
+  const sent = new Promise((res, rej) => {
     chrome.debugger.sendCommand(dbg, method, params, (result) => {
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
+  });
+  if (!s) return sent;
+  return new Promise((res, rej) => {
+    const waiter = (d) => rej(dialogError(d));
+    (s.dialogWaiters || (s.dialogWaiters = new Set())).add(waiter);
+    sent.then(res, rej).finally(() => s.dialogWaiters.delete(waiter));
   });
 }
 
@@ -866,7 +887,15 @@ async function moveTo(tabId, x, y, opts = {}) {
   await sent[sent.length - 1];
   s.pointer = { x, y };
 }
-async function humanClick(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
+// A click that opens a JS dialog has done its job; what remains of it (the release, a second click)
+// cannot reach a page the dialog is holding. Returns the dialog so the caller can report it.
+async function humanClick(tabId, x, y, opts = {}) {
+  const pending = state.get(tabId)?.dialog;
+  if (pending) throw dialogError(pending); // already open before this click: not something it opened
+  try { await pressAt(tabId, x, y, opts); return null; }
+  catch (e) { if (e.dialogOpen) return e.dialogOpen; throw e; }
+}
+async function pressAt(tabId, x, y, { button = 'left', double = false, modifiers = 0 } = {}) {
   await moveTo(tabId, x, y);
   await pause(rnd(40, 110));
   for (const clickCount of (double ? [1, 2] : [1])) {
@@ -1486,7 +1515,15 @@ async function handle(method, p) {
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
-  let result = await dispatch(method, p);
+  const dialogBefore = tabId != null ? state.get(tabId)?.dialog : null;
+  let result;
+  try { result = await dispatch(method, p); }
+  catch (e) {
+    // A key or keystroke whose handler opened a dialog did land; report it like a click does. Only
+    // when the dialog appeared during this call — one that was already up is a plain error.
+    if (!e.dialogOpen || dialogBefore || !(method === 'pressKey' || method === 'typeText')) throw e;
+    result = { ok: true, openedDialog: { ...e.dialogOpen, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' }, ...(method === 'typeText' ? { note: 'typing stopped when the dialog opened' } : {}) };
+  }
   if (method === 'pageStatus') return result;
   // Say when the target came from a fallback: the caller asked for a selector and got the intent.
   if (p && p.resolvedBy && result && typeof result === 'object' && !result.__image) result = { ...result, resolvedBy: p.resolvedBy, ...(p.note ? { note: p.note } : {}) };
@@ -2133,8 +2170,9 @@ async function dispatch(method, p) {
         node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y, node.frameId) : Promise.resolve(null),
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
-      await humanClick(p.tabId, x, y, { button, double: !!p.double });
+      const dialog = await humanClick(p.tabId, x, y, { button, double: !!p.double });
       const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: before?.hit || null };
+      if (dialog) out.openedDialog = { ...dialog, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' };
       if (before?.clickable) out.nearestClickable = before.clickable;
       if (covered?.covered) {
         const by = covered.by;
@@ -2527,7 +2565,7 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const k = p.kind;
       if (k === 'move') { await moveTo(p.tabId, p.x, p.y, p.buttons ? { buttons: p.buttons } : {}); return { ok: true }; }
-      if (k === 'click') { await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 }); return { ok: true }; }
+      if (k === 'click') { const dialog = await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 }); return { ok: true, ...(dialog ? { dialog } : {}) }; }
       if (k === 'drag') {
         await moveTo(p.tabId, p.from.x, p.from.y); await pause(rnd(60, 140));
         await rawCmd({ tabId: p.tabId }, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: p.from.x, y: p.from.y, button: 'left', clickCount: 1, buttons: 1 });
@@ -2833,6 +2871,7 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
     // clear it (dialog_handle). beforeunload we auto-accept so it can't wedge navigation.
     s.dialog = { type: cdpParams.type, message: cdpParams.message, defaultPrompt: cdpParams.defaultPrompt };
     if (cdpParams.type === 'beforeunload') { cmd(tabId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {}); s.dialog = null; }
+    else if (s.dialogWaiters) for (const w of [...s.dialogWaiters]) w(s.dialog);
   } else if (cdpMethod === 'Page.javascriptDialogClosed') {
     s.dialog = null;
   } else if (cdpMethod === 'Page.loadEventFired' && !source.sessionId) {
