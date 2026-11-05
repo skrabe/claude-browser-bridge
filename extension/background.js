@@ -208,6 +208,9 @@ function rawCmd(dbg, method, params = {}) {
   if (s?.dialog) return Promise.reject(dialogError(s.dialog));
   const sent = new Promise((res, rej) => {
     chrome.debugger.sendCommand(dbg, method, params, (result) => {
+// What still works, or is the remedy, while a dialog is up: answering it, tab and window
+// bookkeeping, and reads of what was already captured.
+const DIALOG_SAFE = new Set(['handleDialog', 'getDialog', 'pageStatus', 'getInfo', 'getUserTabs', 'release', 'closeAgentTab', 'createTab', 'claimTab', 'activateTab', 'readConsole', 'readNetwork', 'cdpEvents', 'listDownloads', 'waitDownload', 'listFrames', 'browserManage', 'peekTab', 'reloadExtension']);
       if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message));
       else res(result);
     });
@@ -1651,6 +1654,9 @@ async function handle(method, p) {
   if ((track || method === 'humanInput' || method === 'executeCdp') && state.get(tabId)?.attached) st(tabId).lastActionTs = Date.now();
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
   const dialogBefore = tabId != null ? state.get(tabId)?.dialog : null;
+  // A JS dialog holds the renderer: anything that reads or drives the page would hang, or, where a
+  // helper swallows the error, come back looking like an empty page. Refuse up front instead.
+  if (dialogBefore && !DIALOG_SAFE.has(method)) throw dialogError(dialogBefore);
   let result;
   try { result = await dispatch(method, p); }
   catch (e) {
