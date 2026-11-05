@@ -764,7 +764,8 @@ const DESCRIBE_FN = `function(){
   const e=this,a=(n)=>e.getAttribute&&e.getAttribute(n)||null;
   const label=(a('aria-label')||e.title||(e.tagName==='INPUT'?(a('placeholder')||a('name')||''):'')||(e.innerText||e.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,120);
   const r=e.getBoundingClientRect?e.getBoundingClientRect():null;
-  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null,
+  let dis=!!e.disabled||a('aria-disabled')==='true'; if(!dis&&e.closest){const fs=e.closest('fieldset[disabled]'); if(fs&&/^(BUTTON|INPUT|SELECT|TEXTAREA)$/.test(e.tagName)){const lg=fs.querySelector(':scope>legend'); dis=!(lg&&lg.contains(e));}}
+  return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null, disabled:dis,
            box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
 }`;
 async function describeNode(tabId, backendNodeId, sessionId, frameId) {
@@ -2210,6 +2211,8 @@ async function dispatch(method, p) {
         const c = await absCenter(p.tabId, node.backendNodeId, node.sessionId);
         x = c.x; y = c.y;
         intended = await describeNode(p.tabId, node.backendNodeId, node.sessionId, node.frameId);
+        // A disabled control ignores the click; saying ok here is how a stuck form looks like progress.
+        if (intended?.disabled) throw new Error(`the ref's <${intended.tag}>${intended.label ? ` "${intended.label}"` : ''} is disabled, so a click does nothing — complete whatever enables it first (validate {ref, enabled:true} or wait_for), or check you have the right element`);
       } else {
         const pt = await pointOf(p.tabId, p);
         if (!pt) throw new Error('click needs a ref or {x,y}');
