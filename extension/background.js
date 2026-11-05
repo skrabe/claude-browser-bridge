@@ -1369,8 +1369,8 @@ async function collectMarks(tabId, { space, origin, srcW, srcH, scroll }) {
   const s = st(tabId);
   const cands = [];
   for (const sessionId of [undefined, ...s.frames.keys()]) {
-    let nodes;
-    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    const nodes = await sessionAXNodes(dbgOf(tabId, sessionId));
+    if (!nodes) continue;
     for (const n of nodes) {
       if (n.ignored || n.backendDOMNodeId == null) continue;
       const role = n.role?.value; if (!role || !INTERACTIVE.has(role)) continue;
@@ -1527,8 +1527,8 @@ async function findCandidates(tabId, query) {
   if (!terms.length && !roleOnly) terms = words;
   const scored = [];
   for (const sessionId of [undefined, ...s.frames.keys()]) {
-    let nodes;
-    try { nodes = (await cmd(dbgOf(tabId, sessionId), 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
+    const nodes = await sessionAXNodes(dbgOf(tabId, sessionId));
+    if (!nodes) continue;
     for (const n of nodes) {
       if (n.ignored || n.backendDOMNodeId == null) continue;
       const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
@@ -1544,11 +1544,27 @@ async function findCandidates(tabId, query) {
         if (hay && q.includes(hay)) score += 5;
         if (roleHints.has(role.toLowerCase())) score += 3;
       }
-      const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
-      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, full: roleOnly || !!n.__full, ...(sessionId ? { frame: true } : {}) });
+      const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId, ...(n.__frameId ? { frameId: n.__frameId } : {}) });
+      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, full: roleOnly || full, ...(sessionId || n.__frameId ? { frame: true } : {}) });
     }
   }
   scored.sort((a, b) => b.score - a.score);
+// Every a11y node one session can see: its root document plus each same-site child frame, which
+// shares the session but which getFullAXTree without a frameId leaves out. Child-frame nodes carry
+// __frameId so their refs resolve in that frame's document. null when the session cannot be read.
+async function sessionAXNodes(dbg) {
+  let nodes;
+  try { nodes = (await cmd(dbg, 'Accessibility.getFullAXTree', {})).nodes; } catch { return null; }
+  try {
+    const kids = [];
+    const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
+    walk((await cmd(dbg, 'Page.getFrameTree')).frameTree);
+    for (const frameId of kids) {
+      try { nodes = nodes.concat((await cmd(dbg, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
+    }
+  } catch { /* frame tree unavailable — the root document still reads */ }
+  return nodes;
+}
   return scored;
 }
 
@@ -2089,19 +2105,8 @@ async function dispatch(method, p) {
       const generics = [];   // role-less main-frame nodes with a DOM node, to be promoted by geometry
       let mainById = null;   // AX nodes of the main frame by id, for ancestor walks
       outer: for (const sessionId of [undefined, ...s.frames.keys()]) { // main frame + each cross-origin iframe
-        let nodes;
-        const dbgS = dbgOf(p.tabId, sessionId);
-        try { nodes = (await cmd(dbgS, 'Accessibility.getFullAXTree', {})).nodes; } catch { continue; }
-        // getFullAXTree without a frameId covers only the session's root document. Same-site
-        // iframes live in this session too, so append each child frame's tree.
-        try {
-          const kids = [];
-          const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
-          walk((await cmd(dbgS, 'Page.getFrameTree')).frameTree);
-          for (const frameId of kids) {
-            try { nodes = nodes.concat((await cmd(dbgS, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
-          }
-        } catch { /* frame tree unavailable — the root document still reads */ }
+        const nodes = await sessionAXNodes(dbgOf(p.tabId, sessionId));
+        if (!nodes) continue;
         const byId = new Map(nodes.map((n) => [n.nodeId, n]));
         if (!sessionId) mainById = byId;
         for (const n of nodes) {
