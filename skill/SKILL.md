@@ -59,10 +59,10 @@ if needed. If it returns `cleared:false`, tell the user the page is waiting for 
    act, then `read_page`, then decide. Script what you can foresee; step through what you can't.
 3. Verify, in this order:
    - The status every result carries. Atomic actions and `run` return
-     `status: {url, title, newConsoleErrors?, openDialog?, challenge?}`; `read_page` carries a
+     `status: {url, title, loading?, newConsoleErrors?, openDialog?, challenge?}`; `read_page` carries a
      top-level `challenge` when one is present. Often this is all you need.
-   - `validate` to prove a specific outcome: `urlIncludes`, `text`/`textAbsent`, or an element's
-     `visible`/`checked`/`value`. Run it before reporting a submit done.
+   - `validate` to prove a specific outcome: `urlIncludes`, `text`/`textAbsent` (frames included),
+     or an element's `visible`/`checked`/`value`. Run it before reporting a submit done.
    - A fresh `read_page` when you need to see what changed.
 
 A click that returned ok is an attempt, not a result. Stop at one authoritative signal (URL param,
@@ -90,8 +90,10 @@ return { url: await page.url(), rows };              // return a distilled value
   `.filter({hasText})`, `.first()`, `.nth(i)` or chaining.
 - `page.evaluate` runs in an isolated world: same DOM, but not the page's own `window` globals.
   Pass `{ world: 'page' }` as the third argument when you need them.
-- Default timeout is 60s (`timeoutMs` to raise). On failure you get `{error, logs}`; `log()` your
-  progress so the trail survives.
+- The script's default timeout is 60s (`timeoutMs` to raise). Each locator action waits up to 15s
+  for its element (pass `{timeoutMs}` to change it); to test whether something exists without
+  waiting, use `.count()`. On failure you get `{error, logs}` naming the locator that failed;
+  `log()` your progress so the trail survives.
 - Split a script at a confirmation boundary: stage the form, return, get the user's OK, then commit
   in a second `run`.
 
@@ -100,6 +102,8 @@ return { url: await page.url(), rows };              // return a distilled value
 - Make sure the target resolves to exactly one element before acting. Zero matches means wrong,
   not ready, or gone; more than one means scope to the right container. Never take "the first"
   blindly.
+- Refs from any tool (`e12` from read_page, `f3` from find, `q5` from dom_query, `m7` from marks,
+  `p9` from probe_point) are interchangeable; the letter only says where it came from.
 - Prefer ref, role or label over CSS, and CSS over coordinates. `fill`, `select_option`,
   `select_text` and `upload_file` (like `click`) accept `ref`, a unique CSS `selector`, or an
   `intent` ("the Save button"); `selector` plus `intent` refuses a selector that now points at the
@@ -109,6 +113,8 @@ return { url: await page.url(), rows };              // return a distilled value
   screenshot pixel is not a CSS pixel.
 - `covered:true` in `read_page`, or `intercepted` on a click receipt, means an overlay is in the
   way. Dismiss it; don't retry the buried control.
+- A JS `alert`/`confirm`/`prompt` freezes the page. A click that opens one returns `openedDialog`
+  at once; answer it with `dialog_handle` before anything else.
 - `read_page` returning `unchanged:true` means your last action changed nothing. Find the reason
   (overlay, disabled control, still loading, wrong element) instead of repeating it.
 

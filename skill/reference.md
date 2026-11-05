@@ -262,8 +262,24 @@ For a single action or a quick look. Each action (`click`, `fill`, `type_text`, 
 `select_option`, `scroll`, `hover`, `drag`, `upload_file`, `navigate`, `reload`, `go_back`,
 `go_forward`, `dialog_handle`) returns a status:
 `{url, title, loading?, newConsoleErrors?, firstErrors?, newConsoleWarnings?, openDialog?, challenge?}`
-(`firstErrors` quotes the first two; `read_console {firstPartyOnly:true}` drops third-party noise). A `challenge`
-entry includes `blocking` and a `next` hint.
+(`firstErrors` quotes the first two; `read_console {firstPartyOnly:true}` drops third-party
+noise). A `challenge` entry includes `blocking` and a `next` hint.
+
+Which lens, by question:
+
+| Question | Tool |
+|---|---|
+| What can I act on, and what changed? | `read_page` |
+| Where is the control named X? | `find` (ranked refs) |
+| Does this text appear anywhere, frames included? | `find_text` |
+| What does the page say? | `read_text` |
+| Does this CSS selector exist, and is it unique? | `dom_query` |
+| What does another tab say, without claiming it? | `peek_tab` |
+| Is this outcome true right now? | `validate` (checks once, never waits) |
+| Wait until it becomes true | `wait_for` |
+
+Every ref works with every tool; its letter (`e` read_page, `f` find, `q` dom_query, `m`
+screenshot marks, `p` probe_point, `s` a resolved selector) only records where it came from.
 
 ### See and target
 
@@ -294,12 +310,15 @@ entry includes `blocking` and a `next` hint.
     fall back to coordinates; find the reason (overlay, disabled control, still-loading page
     — use `wait_for` — or the wrong element) and act on it.
   - A top-level `challenge` appears when an anti-bot check is present.
-- `read_text`: visible innerText, for reading prose once you're on the right page.
-- `find_text`: does a word or phrase appear anywhere, including off-screen? Returns a count and
-  context snippets. Cheaper than a scroll-and-read loop. `regex:true` for a pattern.
+- `read_text`: visible innerText, for reading prose once you're on the right page. Frame text
+  follows the page's, under a `— frame —` marker.
+- `find_text`: does a word or phrase appear anywhere, including off-screen and inside iframes?
+  Returns a count (`inFrames` for the share inside frames) and context snippets. Cheaper than a scroll-and-read loop. `regex:true` for a pattern.
 - `find`: keyword search over roles and names; up to 10 ranked candidate refs. Query with the
   element's label words ("subscribe newsletter"), not visual descriptions ("the blue button"
-  matches nothing). Confirm the winner before acting.
+  matches nothing). Confirm the winner before acting. An `intent` is stricter: it is taken only
+  when an element's name holds every content word, so "the Delete account button" on a page
+  with only "Delete order" fails with "nothing matches" and lists the near miss.
 - `dom_query`: a CSS selector returns the match count and a ref and attributes per match. Top
   document only (a selector can't cross an origin boundary; use `read_page` or `find` inside a
   cross-origin frame). Use it to confirm existence or uniqueness.
