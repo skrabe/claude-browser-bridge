@@ -102,6 +102,21 @@ async function forgetAgentTab(tabId) {
 }
 // Don't let the set grow stale as the user closes tabs themselves.
 try { chrome.tabs.onRemoved.addListener((tabId) => { forgetAgentTab(tabId); state.delete(tabId); }); } catch {}
+// A tab a page opens because of the agent (a target=_blank link it clicked, a window.open its
+// script ran) is the agent's to close as well. Adopted when its opener is a tab the agent opened,
+// or a tab it controls that it acted on in the last few seconds; a tab the user opens from their
+// own tab at any other moment stays theirs.
+const ADOPT_WINDOW_MS = 4000;
+async function adoptOpenedTab(tab) {
+  const opener = tab?.openerTabId;
+  if (tab?.id == null || opener == null) return false;
+  const os = state.get(opener);
+  const actedRecently = os?.attached && os.lastActionTs && Date.now() - os.lastActionTs < ADOPT_WINDOW_MS;
+  if (!actedRecently && !(await isAgentTab(opener))) return false;
+  await markAgentTab(tab.id);
+  return true;
+}
+try { chrome.tabs.onCreated.addListener((tab) => { adoptOpenedTab(tab); }); } catch {}
 
 // Route a CDP command to a tab (number) or a specific frame session ({tabId, sessionId}). Chrome 125+
 // flat sessions: sendCommand takes {tabId, sessionId} to address an out-of-process child frame.
@@ -1604,6 +1619,7 @@ async function handle(method, p) {
   p = await resolveSelector(method, p);
   const tabId = p && p.tabId;
   const track = ACTION_METHODS.has(method) && tabId != null;
+  if ((track || method === 'humanInput' || method === 'executeCdp') && state.get(tabId)?.attached) st(tabId).lastActionTs = Date.now();
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
   const dialogBefore = tabId != null ? state.get(tabId)?.dialog : null;
   let result;
@@ -2595,7 +2611,7 @@ async function dispatch(method, p) {
     }
 
     case 'closeAgentTab': {
-      if (!(await isAgentTab(p.tabId))) throw new Error('refusing to close a tab the agent did not open — use tab_release to hand it back');
+      if (!(await isAgentTab(p.tabId))) throw new Error('refusing to close a tab the agent did not open, or that a page opened outside an agent action — use tab_release to hand it back');
       await detach(p.tabId).catch(() => {});
       await chrome.tabs.remove(p.tabId);
       await forgetAgentTab(p.tabId);

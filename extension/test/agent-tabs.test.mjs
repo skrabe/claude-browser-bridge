@@ -32,7 +32,7 @@ function makeChrome(local) {
       getURL: (p) => 'chrome-extension://test/' + p,
     },
     downloads: { onCreated: listeners(), onChanged: listeners() },
-    tabs: { onRemoved: listeners(), async get() { return {}; }, async query() { return []; } },
+    tabs: { onRemoved: listeners(), onCreated: listeners(), async get() { return {}; }, async query() { return []; } },
     tabGroups: { async query() { return []; } },
     windows: { async getAll() { return []; } },
     bookmarks: {},
@@ -123,6 +123,18 @@ const store = {};
   const names = [...code.matchAll(/^(?:async\s+)?function\s+([$\w]+)\s*\(/gm)].map((m) => m[1]);
   const dupes = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
   ok('no duplicate top-level function names' + (dupes.length ? ` (found: ${dupes.join(', ')})` : ''), dupes.length === 0);
+}
+
+// A tab a page opens: adopted only when the agent caused it.
+{
+  const { ctx } = boot({});
+  await ctx.markAgentTab(500);
+  ok('a tab opened from an agent tab is adopted', await ctx.adoptOpenedTab({ id: 501, openerTabId: 500 }) && await ctx.isAgentTab(501));
+  ctx.st(600).attached = true; ctx.st(600).lastActionTs = Date.now();
+  ok('a tab opened from a claimed tab right after an agent action is adopted', await ctx.adoptOpenedTab({ id: 601, openerTabId: 600 }) && await ctx.isAgentTab(601));
+  ctx.st(600).lastActionTs = Date.now() - 60000;
+  ok('a tab the user opens from a claimed tab later is not', !(await ctx.adoptOpenedTab({ id: 602, openerTabId: 600 })) && !(await ctx.isAgentTab(602)));
+  ok('a tab with no opener is not', !(await ctx.adoptOpenedTab({ id: 603 })));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
