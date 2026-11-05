@@ -972,6 +972,7 @@ const FIELD_INFO_FN = `function(){ const t=(this.type||'').toLowerCase(); return
   text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t))||!!this.isContentEditable, secret:t==='password', focused:this.ownerDocument.activeElement===this,
   value:this.isContentEditable&&!/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)?${EDITOR_TEXT}:'value' in this?String(this.value):null }; }`;
 const SET_VALUE_FN = `function(v){
+  if (!this.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName || '')) return { notField: (this.tagName || '#text').toLowerCase() };
   this.focus && this.focus();
   if (this.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)) {
     const doc = this.ownerDocument, sel = doc.getSelection(); sel.removeAllRanges(); const r = doc.createRange(); r.selectNodeContents(this); sel.addRange(r);
@@ -988,7 +989,9 @@ async function fillField(tabId, dbg, objectId, backendNodeId, sessionId, value, 
   const info = (await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FIELD_INFO_FN, returnByValue: true })).result?.value || {};
   if (!info.text) {
     const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: SET_VALUE_FN, arguments: [{ value }] });
-    return r.result?.value || {};
+    const v = r.result?.value || {};
+    if (v.notField) throw new Error(`fill: the target is a <${v.notField}>, not a field — target the input, textarea, select or editable region itself (read_page lists them; refs inside an iframe carry frame:true)`);
+    return v;
   }
   // Caret into the field with a real click when it is on screen; otherwise focus it directly.
   try { const c = await absCenter(tabId, backendNodeId, sessionId); await humanClick(tabId, c.x, c.y); }
@@ -1013,6 +1016,37 @@ async function fillField(tabId, dbg, objectId, backendNodeId, sessionId, value, 
     return { ...(r.result?.value || {}), viaSetter: true };
   }
   return { got: after.value, secret: info.secret, type: info.type };
+}
+
+// A rich-text editor (TinyMCE, CKEditor 4, old Gmail) is an <iframe> whose document body is the
+// editable region, and the a11y tree offers the iframe as the thing to fill. Filling the iframe
+// element itself only sets a stray property, so step into the frame's document and take its
+// editable body, or its one editable element. Anything else passes through unchanged.
+const FRAME_EDITABLE_FN = `function(){
+  const d = this.ownerDocument ? this.ownerDocument : this; const doc = this.nodeType === 9 ? this : d;
+  const b = doc.body; if (b && b.isContentEditable) return b;
+  const c = [...doc.querySelectorAll('[contenteditable=""],[contenteditable=true],textarea,input:not([type=hidden]):not([type=button]):not([type=submit])')].filter((e) => e.getClientRects().length);
+  return c.length === 1 ? c[0] : null;
+}`;
+async function editableTarget(tabId, node) {
+  let desc;
+  try { desc = (await cmd(dbgOf(tabId, node.sessionId), 'DOM.describeNode', { backendNodeId: node.backendNodeId, depth: 1, pierce: true })).node; } catch { return node; }
+  if (!/^I?FRAME$/.test(desc?.nodeName || '')) return node;
+  const notFound = new Error('fill: this ref is an <iframe> with no single editable region inside — read_page lists the fields in the frame (frame:true); fill one of those');
+  let docDbg, docBid, frameId;
+  if (desc.contentDocument) { docDbg = dbgOf(tabId, node.sessionId); docBid = desc.contentDocument.backendNodeId; frameId = desc.frameId; }
+  else {
+    // Out-of-process frame: its document lives in its own session.
+    const sid = [...st(tabId).frames.entries()].find(([, f]) => f.ownerBackendNodeId === node.backendNodeId)?.[0];
+    if (!sid) throw notFound;
+    docDbg = { tabId, sessionId: sid };
+    docBid = (await cmd(docDbg, 'DOM.getDocument', { depth: 0 })).root.backendNodeId;
+  }
+  const objectId = await objectFor(docDbg, docBid, frameId);
+  const r = await cmd(docDbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: FRAME_EDITABLE_FN });
+  if (!r.result?.objectId) throw notFound;
+  const { node: target } = await cmd(docDbg, 'DOM.describeNode', { objectId: r.result.objectId });
+  return { backendNodeId: target.backendNodeId, sessionId: typeof docDbg === 'number' ? node.sessionId : docDbg.sessionId, ...(frameId ? { frameId } : {}) };
 }
 
 // Resolve once a load event newer than t0 has fired, or after ms. Event-driven, so it returns the
@@ -2240,7 +2274,7 @@ async function dispatch(method, p) {
 
     case 'fill': {
       await need(p.tabId);
-      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = await editableTarget(p.tabId, refNode(p.tabId, p.ref));
       const dbg = dbgOf(p.tabId, sessionId);
       const objectId = await objectFor(dbg, backendNodeId, frameId);
       // Read the value back in the same call. A phone/date/currency/card field with an input mask
