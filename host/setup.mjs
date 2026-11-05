@@ -271,7 +271,7 @@ function install(opts) {
   const skillDest = scope === 'global'
     ? path.join(HOME, '.claude', 'skills', 'browser')
     : path.join(opts.project, '.claude', 'skills', 'browser');
-  copyDir(path.join(ROOT, 'skill'), skillDest);
+  linkSkill(path.join(ROOT, 'skill'), skillDest);
   if (prev?.skillDest && prev.skillDest !== skillDest && path.basename(prev.skillDest) === 'browser') {
     fs.rmSync(prev.skillDest, { recursive: true, force: true });
     log('removed the previous skill copy:', prev.skillDest);
@@ -393,6 +393,18 @@ function status() {
   log('browsers found:', detectedBrowsers().join(', ') || 'none');
 }
 
+// Link the skill directory into place rather than copying it, so a `git pull` of the bridge updates
+// the skill too and no reinstall is needed for doc changes. A previous copy (or link) is replaced.
+// Where symlinks are unavailable (Windows without developer mode), fall back to a copy.
+function linkSkill(src, dest) {
+  try {
+    const cur = fs.lstatSync(dest);
+    if (cur.isSymbolicLink() && path.resolve(path.dirname(dest), fs.readlinkSync(dest)) === src) return;
+    fs.rmSync(dest, { recursive: true, force: true });
+  } catch { /* nothing there yet */ }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  try { fs.symlinkSync(src, dest, 'dir'); } catch { copyDir(src, dest); }
+}
 function copyDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
