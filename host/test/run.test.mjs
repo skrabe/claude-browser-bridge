@@ -126,5 +126,6 @@ await check('domSnapshot boxes annotation', `return /\\[box=-?\\d+,-?\\d+,\\d+,\
 await check('domSnapshot exclude prunes a subtree', `return (await page.domSnapshot({exclude:['ul']})).includes('alpha');`, false);
 await check('domSnapshot portal/overlay content sorted first', `const s = await page.domSnapshot(); return s.indexOf('Confirm')>=0 && s.indexOf('Confirm') < s.indexOf('Save changes');`, true);
 
+{ keys.length = 0; await runScript({ callHost, tabId: 1, script: "await page.locator('#email').press('Enter');" }); const k = keys.find((x) => x.key === 'Enter'); const ok = !!k && k.text === '\r'; console.log((ok ? '  ok  ' : '  FAIL') + ' press("Enter") carries its text, so the default action runs'); ok ? pass++ : fail++; }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

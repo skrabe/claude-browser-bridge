@@ -394,7 +394,10 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     }
   }
 
-  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: ch } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
+  async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); // Enter's default action (submit a form, commit an input's change) runs only when the key
+    // event carries its text, as a real keypress does; without it the page sees keydown and nothing.
+    const text = printable ? ch : base === 'Enter' && !(mods & (1 | 2 | 4)) ? '\r' : null;
+    await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(text != null ? { text } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
   const rootLoc = (step) => new Locator([step]);
   const dom_cua = {
     async get_visible_dom() { return evalIn('vdom', { cap: 400 }); },
