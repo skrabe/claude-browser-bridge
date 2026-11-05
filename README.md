@@ -28,8 +28,12 @@ compact codebase you can read in one sitting.
   serialized for a debugger) and runs every script in an isolated JS world the page cannot see. Only
   opt-ins switch Runtime on: `read_console` for page console capture, and page-world calls
   (`world:"page"`, WebMCP), which toggle it for a few milliseconds. Input uses curved pointer paths, dwell and a typing rhythm instead of
-  teleporting clicks and value pokes. On an anti-bot challenge it gets out of the way and hands the
-  tab to you. `node test/run-stealth.mjs` checks all of it against a page that probes for each.
+  teleporting clicks and value pokes. `node test/run-stealth.mjs` checks all of it against a page
+  that probes for each.
+- **Verification assistance.** Assistants are authorized by default to attempt CAPTCHAs and browser
+  verification through the normal UI while carrying out your task, unless you say otherwise. They
+  verify clearance before continuing and use `challenge_wait` for automatic checks or when they
+  need your help. Failed attempts are not repeated.
 - **Private.** No TCP port anywhere — a `0600` unix socket + Chrome native messaging, with the
   extension id pinned in the manifest. A small, auditable codebase.
 
@@ -96,7 +100,7 @@ the loop. `cdp` is the escape hatch for anything they don't cover.
 | **Act** | `click` *(by ref, CSS `selector`, or `intent` — selector narrows, intent confirms the label and finds the control again if the selector died; right/double; returns a receipt naming what it hit; `space:"image"`/`"page"` coords)* · `fill` *(reads the value back and reports a mask/maxlength rewrite; rejects a wrongly-formatted date)* · `type_text` · `press_key` · `select_option` · `select_text` *(caret/selection at an exact spot in existing text)* · `scroll` · `hover` · `drag` · `act_batch` · `upload_file` |
 | **Flows** | `flow_record` *(start/stop: every state-changing call captured with a page fingerprint, refs made durable, `%variables%`)* · `flow_run` *(replay in one call; `HIT` / `HIT-DRIFTED` / `STALE` with the failing step to heal)* · `flows` · `user_record` *(watch the USER do it once → run script + flow; passwords never captured)* |
 | **Browser & perf** | `browser_manage` *(windows, tab groups, pinning, bookmarks + an undo audit trail)* · `emulate` *(CPU/network throttling, dark mode, UA, geolocation, headers, device viewport)* · `perf_trace` *(Core Web Vitals rated + named insights + trace .json.gz)* · `cdp_events` *(cursor-paged CDP event buffer)* |
-| **Auth & dialogs** | `credential_request` *(secure popup)* · `dialog_handle` · `challenge_wait` *(anti-bot check: detach, let it pass, hand it to the user, resume)* |
+| **Auth & dialogs** | `credential_request` *(secure popup)* · `dialog_handle` · `challenge_wait` *(verification fallback: detach, await automatic clearance or user help, resume)* |
 | **Secrets** | `secret_set` / `secret_list` / `secret_clear` *(fill by name; the literal is auto-redacted from every tool result so a page echo / network body / console line can't leak it)* |
 | **Downloads** | `download_wait` · `downloads_list` |
 | **Page API & assets** | `webmcp_tools` / `webmcp_call` *(call the page's own published tools instead of driving its UI)* · `page_assets` / `bundle_assets` *(inventory + download what the page rendered)* |

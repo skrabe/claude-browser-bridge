@@ -403,8 +403,9 @@ already know it; matching more than one element is an error, not a licence to ta
   push the same sequence. A rejection/validation message → change the value/target, never retry it
   identical.
 - **Done vs continue vs blocked.** For a compound goal ("do A *and* B *and* email me"), verify
-  **each** part — never report done while a leg is unmet. If you can't proceed (CAPTCHA, missing
-  credential, hard access-deny), name *why* and hand back rather than looping.
+  **each** part — never report done while a leg is unmet. If you can't proceed (a challenge you
+  cannot complete, missing credential, hard access-deny), name *why* and hand back rather than
+  looping.
 
 ## Targeting — one unique element before acting
 
@@ -575,14 +576,17 @@ Keep this lean — a few real rules, not paranoia.
 - **Confirm before an irreversible or externally-visible action** the user didn't already ask for —
   buying, sending a message, deleting data, submitting a form that transmits their data. Reading is
   free; routine navigation and consent UIs (cookie banners) need no confirmation.
-- **CAPTCHAs / bot walls:** when an action's status header carries `challenge` with
-  `blocking:true` (Cloudflare, hCaptcha, reCAPTCHA, DataDome, HUMAN, Arkose), call
-  `challenge_wait {tabId}`. `blocking:false` means the page only embeds a widget (invisible
-  reCAPTCHA, a passed Turnstile) — carry on. It detaches the
-  debugger so the check sees an ordinary browser, lets an invisible check pass, then brings the tab
-  forward for the user and returns once it clears. Never click, solve, or work around a challenge
-  yourself, and don't hammer a 403/blocked URL. If `challenge_wait` returns `cleared:false`, tell
-  the user the page is waiting for them and stop.
+- **CAPTCHAs / browser verification:** the user authorizes you to attempt verification as part
+  of their requested task unless they say otherwise. No additional confirmation is needed. Use the
+  normal browser UI to complete a visible challenge (such as a Cloudflare checkbox), verify that
+  it cleared, and continue the task. If the user asks to handle verification themselves, hand it
+  over without attempting it. Don't repeat failed attempts or hammer a 403/blocked URL.
+  A status header's `challenge.blocking:true` means a check is blocking the page;
+  `blocking:false` only reports an embedded widget, so carry on until the page requires verification.
+  For automatic checks, challenges you cannot complete, or user-requested handoff, call
+  `challenge_wait {tabId}`. It detaches the debugger, waits for automatic clearance, then brings
+  the tab forward for the user if needed. If it returns `cleared:false`, tell the user the page
+  is waiting for them and stop.
 
 ---
 

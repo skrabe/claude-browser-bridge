@@ -944,11 +944,6 @@ function loadAfter(s, t0, ms) {
 
 // ---- anti-bot challenge handoff ----
 //
-// When a site puts up a bot challenge, the right move for an agent on the user's own browser is to
-// get out of the way: detach the debugger (so not one CDP artifact is left for the challenge to
-// find), let an invisible check pass on its own, and if it needs a person, bring the tab forward
-// and wait for them. The bridge never tries to solve one.
-//
 // Detection uses only things the browser reports, never page-provided claims: the frames' URLs,
 // the document's title, and Cloudflare's cf-mitigated response header.
 // Two kinds of signal. A BLOCKING one means the site served a challenge in place of the page: the
@@ -1441,7 +1436,7 @@ async function handle(method, p) {
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
       result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
-        ...(challenge ? { challenge: { ...challenge, next: challenge.blocking ? 'an anti-bot check is blocking this page — call challenge_wait; do not click it or try to solve it' : 'the page embeds a challenge widget but is not blocked; carry on, and call challenge_wait only if it starts asking for a check' } } : {}) };
+        ...(challenge ? { challenge: { ...challenge, next: challenge.blocking ? 'an anti-bot check is blocking this page — attempts through the normal browser UI are authorized for the user task unless they said otherwise; verify clearance, and use challenge_wait if you cannot complete it or the user wants to handle it; do not repeat failed attempts' : 'the page embeds a challenge widget but is not blocked; carry on and handle verification only if requested' } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
   return result;
