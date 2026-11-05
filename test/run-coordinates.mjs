@@ -105,7 +105,15 @@ async function main() {
   const onscreen = targets.filter((t) => t.y >= 0 && t.y <= geo.viewport.height && t.x >= 0 && t.x <= geo.viewport.width);
   // The "V" row sits under a deliberate overlay: those clicks SHOULD be blocked, so they belong to
   // the interception check below, not to targeting accuracy.
-  const reachable = onscreen.filter((t) => !t.tid.startsWith('V'));
+  // A pixel can only hit what is actually painted there: targets clipped by the inner scroller are
+  // on-screen by their rect but hidden, so they are not reachable by a coordinate.
+  const visible = new Set(await evalIn(tabId, `window.__harness.targets().filter((t) => {
+    const el = t.frame === 'iframe' ? document.getElementById('frame') : document.elementFromPoint(t.x, t.y);
+    if (t.frame === 'iframe') { const r = el.getBoundingClientRect(); return t.y >= r.top && t.y <= r.bottom; }
+    if (t.frame === 'shadow') return el && el.id === 'shadowhost';
+    return el && el.dataset && el.dataset.tid === t.tid;
+  }).map((t) => t.tid)`));
+  const reachable = onscreen.filter((t) => !t.tid.startsWith('V') && visible.has(t.tid));
 
   const STRATEGIES = [
     { name: 'ref (semantic)', note: 'dom_query → click{ref}',
@@ -130,6 +138,11 @@ async function main() {
   const results = [];
   for (const s of STRATEGIES) {
     await evalIn(tabId, 'window.__harness.reset()');
+    // A ref click scrolls its target into view, which moves the page and the inner scroller. Put
+    // both back and take a fresh screenshot so pixel strategies aim at where targets really are.
+    await evalIn(tabId, 'window.scrollTo(0, 0), window.__harness.scrollInner(0)');
+    await new Promise((r) => setTimeout(r, 150));
+    await call('screenshot', { tabId });
     let hit = 0, missed = 0, skipped = 0, intercepted = 0;
     const offsets = [];
     for (const t of reachable) {
@@ -138,8 +151,14 @@ async function main() {
       try { r = await s.run(t); } catch (e) { r = { error: e.message }; }
       if (r?.skipped) { skipped++; continue; }
       if (r?.intercepted) intercepted++;
-      const log = await evalIn(tabId, 'window.__harness.log()');
-      const last = log[log.length - 1];
+      // Clicks inside the iframe arrive by postMessage, a task after the click itself; poll briefly
+      // so the read does not race the record.
+      let log = await evalIn(tabId, 'window.__harness.log()');
+      for (let i = 0; i < 10 && log[log.length - 1]?.expect !== t.tid; i++) {
+        await new Promise((r) => setTimeout(r, 30));
+        log = await evalIn(tabId, 'window.__harness.log()');
+      }
+      const last = log[log.length - 1]?.expect === t.tid ? log[log.length - 1] : null;
       if (last && last.hit) hit++;
       else {
         if (process.env.CBB_DEBUG) console.log('    miss', s.name, t.tid, JSON.stringify({ want: [t.x, t.y], frame: t.frame, got: last, log: log.slice(-3), r }).slice(0, 400));
