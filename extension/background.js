@@ -665,6 +665,9 @@ const DATE_FORMATS = { date: 'YYYY-MM-DD', month: 'YYYY-MM', week: 'YYYY-Www', t
 // ---- ref resolution ----
 function refNode(tabId, ref) {
   const n = st(tabId).refs.get(ref);
+  // A CSS selector passed as a ref is a natural slip (the agent just used it as `selector`); say so
+  // rather than send it off to re-read the page.
+  if (n == null && /^[#.\[]|[\s>:=]/.test(String(ref))) throw new Error(`"${ref}" looks like a CSS selector, not a ref — pass it as selector:${JSON.stringify(String(ref))}`);
   if (n == null) throw new Error(`unknown ref "${ref}" — take a fresh read_page/dom_query`);
   return n; // { backendNodeId, sessionId }
 }
