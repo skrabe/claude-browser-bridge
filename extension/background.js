@@ -297,18 +297,13 @@ async function mainWorldId(dbg) {
   if (hit) return hit;
   const wasOn = !!s.consoleOn;
   const frameId = (await rawCmd(dbg, 'Page.getFrameTree'))?.frameTree?.frame?.id;
-  const find = () => [...(s.contexts?.get(dbg.sessionId || 'main') || new Map()).values()].find((c) => c.auxData?.isDefault && (!frameId || c.auxData?.frameId === frameId))?.id ?? null;
-  // Contexts are tracked from Runtime events (see the event handler). Enabling reports every live
-  // context, but the events can trail the command's reply, and with console capture already on the
-  // record can be stale (a navigation's events landing in a different order). So when the default
-  // context is not on record, cycle the domain to have it reported afresh, and give it a moment.
+  // Contexts are tracked from Runtime events (see the event handler), so this works whether the
+  // events arrive now (Runtime was off) or arrived earlier (console capture already on).
   if (!wasOn) await rawCmd(dbg, 'Runtime.enable');
   try {
-    let id = find();
-    for (let attempt = 0; id == null && attempt < 2; attempt++) {
-      if (attempt === 1 || wasOn) { await rawCmd(dbg, 'Runtime.disable').catch(() => {}); s.contexts?.delete(dbg.sessionId || 'main'); await rawCmd(dbg, 'Runtime.enable'); }
-      for (let t = 0; id == null && t < 10; t++) { await pause(30); id = find(); }
-    }
+    const ctxs = s.contexts?.get(dbg.sessionId || 'main') || new Map();
+    const hit = [...ctxs.values()].find((c) => c.auxData?.isDefault && (!frameId || c.auxData?.frameId === frameId));
+    const id = hit ? hit.id : null;
     if (id == null) throw new Error('could not find the page\'s main JS world');
     s.worlds.set(key, id);
     return id;
@@ -322,15 +317,7 @@ async function mainWorldId(dbg) {
 }
 async function pageWorldEval(dbg, params, attempt = 0) {
   const { contextId, uniqueContextId, ...rest } = params || {};
-  let ctx;
-  try { ctx = await mainWorldId(dbg); }
-  catch (e) {
-    // Last resort: a node resolved with no context lands in the frame's main world, and a function
-    // called on it runs there. It evaluates through indirect eval, which a strict CSP can refuse.
-    const { root } = await rawCmd(dbg, 'DOM.getDocument', { depth: 0 });
-    const { object } = await rawCmd(dbg, 'DOM.resolveNode', { nodeId: root.nodeId });
-    return rawCmd(dbg, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: 'function(src){return (0,eval)(src)}', arguments: [{ value: String(rest.expression ?? '') }], returnByValue: rest.returnByValue, awaitPromise: rest.awaitPromise, userGesture: rest.userGesture });
-  }
+  const ctx = await mainWorldId(dbg);
   try { return await rawCmd(dbg, 'Runtime.evaluate', { ...rest, contextId: ctx }); }
   catch (e) {
     if (attempt === 0 && STALE_CONTEXT.test(String(e && e.message))) { st(dbg.tabId).worlds?.delete('main:' + worldKey(dbg)); return pageWorldEval(dbg, params, 1); }
