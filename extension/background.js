@@ -2096,15 +2096,24 @@ async function dispatch(method, p) {
     case 'navigate': {
       await need(p.tabId);
       const cur = (await chrome.tabs.get(p.tabId)).url;
-      if (cur === p.url) return { ok: true, skipped: 'already on url' };
-      const t0 = Date.now();
       const s = st(p.tabId);
+      // A failed load leaves Chrome's error page committed AT the target URL, so "already there" is
+      // only true when the last load of this URL succeeded. Otherwise a retry must load it again.
+      if (cur === p.url && s.navError?.url !== p.url) return { ok: true, skipped: 'already on url' };
+      const t0 = Date.now();
       const nav = await cmd(p.tabId, 'Page.navigate', { url: p.url });
       if (nav?.isDownload) return { ok: true, download: true, note: 'the URL started a download; the page did not change — download_wait for the file' };
       // Chrome reports a navigation it refused (a top-frame data: URL, a blocked scheme or port) as
       // an errorText while the tab stays where it was. ERR_ABORTED is also what a navigation the page
       // itself redirected looks like, so that one only fails when the tab really did not move.
-      if (nav?.errorText && nav.errorText !== 'net::ERR_ABORTED') throw new Error(`navigation to ${p.url} failed: ${nav.errorText} — the tab is still on ${cur}`);
+      if (nav?.errorText && nav.errorText !== 'net::ERR_ABORTED') {
+        // A network or TLS failure commits Chrome's own error page for that URL (it does not stay on
+        // the previous page). Say what the tab shows, so a retry or a read is not misread.
+        s.navError = { url: p.url, error: nav.errorText };
+        throw new Error(`navigation to ${p.url} failed: ${nav.errorText} — the tab now shows Chrome's error page for it, not the site. `
+          + (/CERT|SSL/.test(nav.errorText) ? 'The site\'s certificate is not trusted; do not bypass the warning unless the user says to.' : 'Retry navigate (it reloads), or report the site unreachable.'));
+      }
+      s.navError = null;
       if (nav?.errorText && !(await replacedNavigation(s, t0, nav.loaderId))) {
         throw new Error(`navigation to ${p.url} was refused (net::ERR_ABORTED) — the tab is still on ${cur}.`
           + (/^data:/i.test(p.url) ? ' Chrome does not let a page navigate its top frame to a data: URL; open it with tab_create instead.' : ''));

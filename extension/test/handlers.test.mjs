@@ -10,6 +10,7 @@ const code = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.ur
 const L = () => ({ addListener() {}, removeListener() {} });
 const node = { backendNodeId: 5, nodeName: 'INPUT', attributes: [] };
 const describe = { tag: 'input', role: null, label: 'Email', disabled: false, ariaDisabled: false, box: { x: 10, y: 10, width: 100, height: 20 } };
+let navCalls = 0, tabUrl = 'https://x.test/';
 function reply(method, params) {
   switch (method) {
     case 'DOM.resolveNode': return { object: { objectId: 'o1' } };
@@ -22,7 +23,7 @@ function reply(method, params) {
     case 'Page.getLayoutMetrics': return { cssLayoutViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 }, cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0, scale: 1 } };
     case 'Accessibility.getFullAXTree': return { nodes: [{ nodeId: '1', role: { value: 'textbox' }, name: { value: 'Email' }, backendDOMNodeId: 5 }] };
     case 'DOMSnapshot.captureSnapshot': return { documents: [], strings: [] };
-    case 'Page.navigate': return { frameId: 'F', loaderId: 'L1' };
+    case 'Page.navigate': navCalls++; return String(params.url).includes('down.test') ? { frameId: 'F', loaderId: 'L2', errorText: 'net::ERR_CONNECTION_TIMED_OUT' } : { frameId: 'F', loaderId: 'L1' };
     case 'Runtime.callFunctionOn': {
       const f = String(params.functionDeclaration || '');
       if (/selectorMatches|clickable/.test(f) || /getBoundingClientRect\(\)/.test(f) && /tag:/.test(f)) return { result: { value: describe } };
@@ -38,7 +39,7 @@ const chrome = {
   storage: { local: { async get() { return {}; }, async set() {} }, session: { async get() { return {}; }, async set() {} } },
   runtime: { connectNative() { throw new Error('no host'); }, getManifest: () => ({ version: 'test' }), onStartup: L(), onInstalled: L(), onMessage: L(), lastError: null, getURL: (p) => p },
   downloads: { onCreated: L(), onChanged: L() },
-  tabs: { onRemoved: L(), onCreated: L(), async get(id) { return { id, url: 'https://x.test/', title: 'X', status: 'complete' }; }, async query() { return []; } },
+  tabs: { onRemoved: L(), onCreated: L(), async get(id) { return { id, url: tabUrl, title: 'X', status: 'complete' }; }, async query() { return []; } },
   tabGroups: { async query() { return []; } }, windows: { async getAll() { return []; } }, bookmarks: {},
   alarms: { create() {}, onAlarm: L() },
   debugger: { onEvent: L(), onDetach: L(), attach(t, v, cb) { cb(); }, sendCommand(d, m, p, cb) { setTimeout(() => cb(reply(m, p)), 0); } },
@@ -67,6 +68,14 @@ for (const [m, p] of calls) {
   let err = null;
   try { await ctx.handle(m, p); } catch (e) { err = e; }
   ok(`${m} is wired`, !(err && WIRING.test(String(err.message))), err && err.message);
+}
+// A failed load commits Chrome's error page at the target URL; navigating there again must reload.
+{
+  let e1 = null; try { await ctx.handle('navigate', { tabId: tab, url: 'https://down.test/', waitUntil: 'none' }); } catch (e) { e1 = e; }
+  ok('a network failure is reported as an error page, not "still on" the old page', !!e1 && /error page/.test(e1.message), e1 && e1.message);
+  tabUrl = 'https://down.test/'; const before = navCalls;
+  try { await ctx.handle('navigate', { tabId: tab, url: 'https://down.test/', waitUntil: 'none' }); } catch {}
+  ok('retrying the same URL after a failure navigates again instead of "already on url"', navCalls === before + 1, `navCalls ${before} -> ${navCalls}`);
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
