@@ -1094,6 +1094,24 @@ async function editableTarget(tabId, node) {
   return { backendNodeId: target.backendNodeId, sessionId: typeof docDbg === 'number' ? node.sessionId : docDbg.sessionId, ...(frameId ? { frameId } : {}) };
 }
 
+// After an action: did it start a top-level navigation? A click on a link or a submit button starts
+// one within a few dozen ms of the release; give it a quarter second to show, then up to `commitMs` to commit, so the
+// status reports the page the action led to rather than the one it left. Returns 'committed',
+// 'pending' (started, not committed in time) or null (nothing started).
+async function settleNavigation(tabId, t0, { startMs = 250, commitMs = 3000 } = {}) {
+  const s = state.get(tabId); if (!s) return null;
+  const started = () => (s.navStartTs || 0) >= t0 || (s.navCommitTs || 0) >= t0;
+  for (let waited = 0; !started() && waited < startMs; waited += 50) await pause(50);
+  if (!started()) return null;
+  if ((s.navCommitTs || 0) >= t0) return 'committed';
+  const ok = await new Promise((res) => {
+    const timer = setTimeout(() => { s.commitWaiters = (s.commitWaiters || []).filter((w) => w !== wake); res(false); }, commitMs);
+    const wake = () => { clearTimeout(timer); res(true); };
+    (s.commitWaiters || (s.commitWaiters = [])).push(wake);
+  });
+  return ok ? 'committed' : 'pending';
+}
+
 // Resolve once a load event newer than t0 has fired, or after ms. Event-driven, so it returns the
 // moment the page loads rather than on the next poll tick.
 function loadAfter(s, t0, ms) {
@@ -1654,7 +1672,7 @@ async function handle(method, p) {
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
-      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
         ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
@@ -2304,13 +2322,17 @@ async function dispatch(method, p) {
         node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y, node.frameId) : Promise.resolve(null),
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
+      const clickT0 = Date.now();
       const dialog = await humanClick(p.tabId, x, y, { button, double: !!p.double });
+      const nav = dialog ? null : await settleNavigation(p.tabId, clickT0);
       // Lead with what took the click: the button, not the <svg><path> or <i> icon under the cursor.
       // The innermost element follows as `via` when it differs, which is where an overlay shows up.
       const leaf = before?.hit || null, target = before?.clickable || leaf;
       const brief = (d) => d && { tag: d.tag, ...(d.role ? { role: d.role } : {}), ...(d.label ? { label: d.label } : {}), ...(d.href ? { href: d.href } : {}), ...(d.disabled ? { disabled: true } : {}), selector: d.selector, ...(d.selectorMatches > 1 ? { selectorMatches: d.selectorMatches } : {}) };
       const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: brief(target), ...(before?.clickable ? { via: { tag: leaf.tag, ...(leaf.label && leaf.label !== target.label ? { label: leaf.label } : {}) } } : {}) };
       if (dialog) out.openedDialog = { ...dialog, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' };
+      if (nav === 'committed') out.navigated = true;
+      else if (nav === 'pending') out.navigating = true; // started, still loading: status.url may be the old page
       if (covered?.covered) {
         const by = covered.by;
         out.intercepted = `click at (${Math.round(x)},${Math.round(y)}) was over `
@@ -2444,9 +2466,11 @@ async function dispatch(method, p) {
       // inserting the character (a chord like Ctrl+A intentionally omits text — it's a shortcut).
       const printable = base.length === 1 && !(modifiers & (1 | 2 | 4));
       const textField = printable ? { text: base } : {};
+      const keyT0 = Date.now();
       await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers, ...k, ...textField });
       await cmd(p.tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers, ...k });
-      return { ok: true };
+      const nav = base === 'Enter' ? await settleNavigation(p.tabId, keyT0) : null;
+      return { ok: true, ...(nav === 'committed' ? { navigated: true } : nav === 'pending' ? { navigating: true } : {}) };
     }
     case 'scroll': {
       await need(p.tabId);
@@ -2706,7 +2730,12 @@ async function dispatch(method, p) {
       await need(p.tabId);
       const k = p.kind;
       if (k === 'move') { await moveTo(p.tabId, p.x, p.y, p.buttons ? { buttons: p.buttons } : {}); return { ok: true }; }
-      if (k === 'click') { const dialog = await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 }); return { ok: true, ...(dialog ? { dialog } : {}) }; }
+      if (k === 'click') {
+        const t0 = Date.now();
+        const dialog = await humanClick(p.tabId, p.x, p.y, { button: p.button || 'left', double: (p.clickCount || 1) > 1, modifiers: p.modifiers || 0 });
+        const nav = dialog ? null : await settleNavigation(p.tabId, t0); // like Playwright: a click's navigation has committed when it returns
+        return { ok: true, ...(dialog ? { dialog } : {}), ...(nav ? { nav } : {}) };
+      }
       if (k === 'drag') {
         await moveTo(p.tabId, p.from.x, p.from.y); await pause(rnd(60, 140));
         await rawCmd({ tabId: p.tabId }, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: p.from.x, y: p.from.y, button: 'left', clickCount: 1, buttons: 1 });
@@ -3026,8 +3055,13 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
       s.console.push({ level: e.level, text: (e.source ? e.source + ': ' : '') + (e.text || ''), ts: e.timestamp, ...(e.url ? { url: e.url } : {}) });
       if (s.console.length > 500) s.console.shift();
     }
+  } else if ((cdpMethod === 'Page.frameRequestedNavigation' || cdpMethod === 'Page.frameStartedLoading') && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navStartTs = Date.now();
+  } else if (cdpMethod === 'Page.navigatedWithinDocument' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navCommitTs = Date.now();
+    if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; }
   } else if (cdpMethod === 'Page.frameNavigated') {
-    if (!cdpParams.frame?.parentId && !source.sessionId) s.topFrameId = cdpParams.frame?.id;
+    if (!cdpParams.frame?.parentId && !source.sessionId) { s.topFrameId = cdpParams.frame?.id; s.navCommitTs = Date.now(); if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; } }
     // A new document in some frame: the isolated world we made in its old document is gone.
     if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); if (cdpParams.frame?.id) s.worlds.delete((source.sessionId || 'main') + '#' + cdpParams.frame.id); }
     if (!cdpParams.frame?.parentId) {

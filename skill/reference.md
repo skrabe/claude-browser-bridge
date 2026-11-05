@@ -229,6 +229,11 @@ selector, box) plus a ref you can click. That turns a coordinate guess into a se
 `annotate:true` also returns a picture with a crosshair on the point, so you can see a misplaced
 guess.
 
+A click or Enter that starts a navigation waits for it to commit, so `status.url` is the new page
+(`navigated:true`); `navigating:true` means it started but has not committed yet. A page that
+navigates later on its own (a timer, a slow redirect after login) is not caught: follow the click
+with `wait_for {urlIncludes}`, or in a script wrap it in `page.expectNavigation(() => …)`.
+
 Every `click` returns a receipt. `landedOn` names the element that took the click (the button or
 link, not the icon inside it; `via` names the innermost element when it differs); `intercepted`
 appears when an overlay covered the element your ref pointed at:
