@@ -178,8 +178,9 @@ opening a new one.
 - Console: `await page.consoleLogs({limit})`, for debugging a local app.
 - Screenshot: `await page.screenshot({fullPage, marks, boxes, ref})` uses the same capture path as
   the atomic tool, so it returns the same `{scale, origin, space, …}` mapping and can draw marks.
-- Save the page: `await page.pdf({path})` or `page.export({format:'text'})` returns
-  `{path, bytes}`.
+- Save the page: `await page.pdf({path})` or `page.export({format:'text'})` writes a file and
+  returns `{path, bytes}` (plus `text` when it is under 8 KB). To just read the text, return
+  `await page.evaluate(() => document.body.innerText)` or use `read_text`.
 - Responsive: `await page.setViewport({width:390, height:844, mobile:true})`, then
   `page.resetViewport()`. Only for device or breakpoint testing.
 - Batch read: `await browser.readUrls([url1, url2])` loads each URL in a background tab (bounded
