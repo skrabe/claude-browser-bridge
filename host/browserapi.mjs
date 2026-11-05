@@ -177,9 +177,11 @@ if (!window.__cbb) {
       // open dialogs/dropdowns render at end-of-body (portals) → surface them first so truncation can't drop them
       const inPortal = (e) => { let n = e; while (n && n.nodeType === 1) { const rr = n.getAttribute && n.getAttribute('role'); if (rr && /^(dialog|alertdialog|menu|listbox)$/.test(rr.trim())) return true; if (n.getAttribute && n.getAttribute('aria-modal') === 'true') return true; n = n.parentElement; } return false; };
       const portal = [], rest = [];
-      for (const e of universe(root.documentElement ? root : root)) { if (!isVisible(e) || excluded(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; (inPortal(e) ? portal : rest).push({ e, r, nm }); }
+      const scope = root.nodeType === 9 ? universe(root) : [root, ...universe(root)];
+      for (const e of scope) { if (!isVisible(e) || excluded(e)) continue; const r = roleOf(e); const nm = accName(e).replace(/\\s+/g, ' ').trim(); if (!r || (!INT.has(r) && !nm)) continue; if (r === 'generic' || r === 'none' || r === 'presentation') continue; (inPortal(e) ? portal : rest).push({ e, r, nm }); }
       const lines = []; let ref = 0;
       for (const it of portal.concat(rest)) { const b = a.boxes ? topBox(it.e) : null; const line = '[' + (++ref) + '] ' + it.r + (it.nm ? ' "' + it.nm.slice(0, 160) + '"' : '') + ('value' in it.e && it.e.value ? ' =' + String(it.e.value).slice(0, 80) : '') + (b ? ' [box=' + Math.round(b.x) + ',' + Math.round(b.y) + ',' + Math.round(b.w) + ',' + Math.round(b.h) + ']' : ''); lines.push(line); if (lines.join('\\n').length > (a.max || 20000)) { lines.push('… (truncated)'); break; } }
+      if (!lines.length) return a.selector ? '(selector matched, but nothing visible and named is under it)' : '(nothing visible and named on the page)';
       return lines.join('\\n');
     }
     if (op === 'vdom') {

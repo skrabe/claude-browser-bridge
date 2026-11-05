@@ -15,6 +15,7 @@ const html = `<!doctype html><html><body>
     <div role="button" aria-label="Custom action">x</div>
   </form>
   <ul><li>alpha</li><li>beta</li><li>gamma</li></ul>
+  <div id="blank"><span></span></div>
 </body></html>`;
 
 const dom = new JSDOM(html, { runScripts: 'dangerously', pretendToBeVisual: true });
@@ -86,6 +87,10 @@ const tcbb = tdom.window.__cbb;
 eq('getByText skips <script> source', tcbb('q',{steps:[{by:'text',text:'Hello World!'}]}).matches.map(m=>m.tag), ['p']);
 eq('getByText skips a hidden editor <textarea> and its wrapper', tcbb('q',{steps:[{by:'text',text:'Hello editor'}]}).matches.map(m=>m.tag), ['p']);
 eq('getByText matches a submit input by value', tcbb('q',{steps:[{by:'text',text:'Send it'}]}).matches.map(m=>m.tag), ['input']);
+
+eq('domSnapshot of a leaf selector includes the element itself', /button "Save changes"/.test(cbb('snapshot',{selector:'[data-testid=submit]'})), true);
+eq('domSnapshot of a selector with nothing named under it says so', /nothing visible and named/.test(cbb('snapshot',{selector:'#blank'})), true);
+eq('domSnapshot of a missing selector says so', cbb('snapshot',{selector:'#nope'}), '(selector matched nothing)');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
