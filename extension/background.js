@@ -4,7 +4,7 @@
 // chrome.debugger events are buffered per-tab (console/network) and streamed as onCDPEvent.
 
 const HOST = 'com.claude.browserbridge';
-const VERSION = '0.14.0';
+const VERSION = chrome.runtime.getManifest?.().version ?? 'dev'; // one source of truth: the manifest
 let port = null;
 
 // Downloads are browser-wide (not tab-scoped): buffer them so the agent can wait for one and get
