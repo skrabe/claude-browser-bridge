@@ -69,6 +69,10 @@ try {
   const ch = nav.status && nav.status.challenge;
   check('navigate reports the challenge in its status header', !!ch, ch ? `${ch.vendor}: ${ch.signals.join('; ')}` : JSON.stringify(nav.status));
   check('it names Cloudflare and marks it blocking', ch && ch.vendor === 'cloudflare' && ch.blocking === true);
+  const rp = await call('read_page', { tabId });
+  check('read_page reports the challenge too', rp.challenge && rp.challenge.blocking === true, JSON.stringify(rp.challenge || null).slice(0, 80));
+  const rs = await call('run', { tabId, script: 'return 1' });
+  check('a run script reports it in its status', rs.status && rs.status.challenge && rs.status.challenge.blocking === true, JSON.stringify(rs.status || null).slice(0, 80));
   const pre = await call('challenge_wait', { tabId, check: true });
   check('challenge_wait check:true sees it without waiting', !!pre.challenge);
   const t0 = Date.now();

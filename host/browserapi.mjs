@@ -379,6 +379,9 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     getByLabel: (text, o) => rootLoc({ by: 'label', text: reWrap(text), exact: (o || {}).exact }),
     getByPlaceholder: (text, o) => rootLoc({ by: 'placeholder', text: reWrap(text), exact: (o || {}).exact }),
     getByTestId: (testId) => rootLoc({ by: 'testid', testId }),
+    // A ref from read_page/dom_query/find, as a locator. Resolved once, here, and then found by CSS,
+    // so it behaves like any other locator (auto-waits, crosses same-origin frames).
+    ref: async (ref) => rootLoc({ by: 'css', selector: (await callHost('markRef', { tabId, ref: String(ref) })).selector }),
     locator: (selector) => rootLoc({ by: 'css', selector }),
     frameLocator: (frameSelector) => rootLoc({ by: 'css', selector: frameSelector }), // selects the iframe; queryStep descends into its (same-origin) contentDocument for chained steps
     // Runs in the bridge's isolated world (shares the DOM, not page globals). Pass {world:'page'} as

@@ -1467,6 +1467,7 @@ function isPrivateHost(host) {
   return false;
 }
 
+const challengeNext = (challenge) => challenge.blocking ? 'an anti-bot check is blocking this page — attempts through the normal browser UI are authorized for the user task unless they said otherwise; verify clearance, and use challenge_wait if you cannot complete it or the user wants to handle it; do not repeat failed attempts' : 'the page embeds a challenge widget but is not blocked; carry on and handle verification only if requested';
 async function handle(method, p) {
   // Load new extension code without a trip to chrome://extensions (development: setup and tests).
   if (method === 'reloadExtension') { setTimeout(() => chrome.runtime.reload(), 50); return { ok: true, version: chrome.runtime.getManifest().version }; }
@@ -1475,6 +1476,7 @@ async function handle(method, p) {
   const track = ACTION_METHODS.has(method) && tabId != null;
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
   let result = await dispatch(method, p);
+  if (method === 'pageStatus') return result;
   // Say when the target came from a fallback: the caller asked for a selector and got the intent.
   if (p && p.resolvedBy && result && typeof result === 'object' && !result.__image) result = { ...result, resolvedBy: p.resolvedBy, ...(p.note ? { note: p.note } : {}) };
   if (track && result && typeof result === 'object' && !result.__image) {
@@ -1486,7 +1488,7 @@ async function handle(method, p) {
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
       result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
-        ...(challenge ? { challenge: { ...challenge, next: challenge.blocking ? 'an anti-bot check is blocking this page — attempts through the normal browser UI are authorized for the user task unless they said otherwise; verify clearance, and use challenge_wait if you cannot complete it or the user wants to handle it; do not repeat failed attempts' : 'the page embeds a challenge widget but is not blocked; carry on and handle verification only if requested' } } : {}) };
+        ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
   return result;
@@ -1697,6 +1699,27 @@ async function dispatch(method, p) {
     // finding the element again tomorrow, in a `run` script or a saved flow. This converts one to
     // the other, walking the durability ladder and reporting how many elements each candidate
     // actually matches, so a suggestion that is already ambiguous is visibly ambiguous.
+    // Hand a read_page/dom_query ref to a run script: tag its element so the script's own locator
+    // engine can find it by CSS. The attribute is unique per call and only marks the node.
+    // The status header an action carries, on demand: for a run script (which drives the page
+    // through many calls and reports once) and for read_page, so a blocking challenge surfaces there too.
+    case 'pageStatus': {
+      const tab = await chrome.tabs.get(p.tabId);
+      const challenge = await detectChallenge(p.tabId).catch(() => null);
+      const dialog = state.get(p.tabId)?.dialog;
+      return { url: await tabUrl(p.tabId, tab), title: tab.title || null, ...(dialog ? { openDialog: dialog } : {}), ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
+    }
+    case 'markRef': {
+      await need(p.tabId);
+      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const dbg = dbgOf(p.tabId, sessionId);
+      const objectId = await objectFor(dbg, backendNodeId);
+      const token = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, arguments: [{ value: token }],
+        functionDeclaration: 'function(t){ const el = this.nodeType === 3 ? this.parentElement : this; if (!el || !el.setAttribute) return false; el.setAttribute("data-cbb-ref", t); return true; }' });
+      if (!r.result?.value) throw new Error(`ref "${p.ref}" is not an element a script can target — take a fresh read_page`);
+      return { selector: `[data-cbb-ref="${token}"]` };
+    }
     case 'generateLocator': {
       await need(p.tabId);
       const s = st(p.tabId);
@@ -1828,7 +1851,6 @@ async function dispatch(method, p) {
     case 'readPage': {
       await need(p.tabId);
       const s = st(p.tabId);
-      if (p.mode === 'text') { const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.body?.innerText ?? ""', returnByValue: true }); return { url: (await chrome.tabs.get(p.tabId)).url, mode: 'text', text: r.result?.value ?? '' }; }
       // `ignore` is remembered per tab and applied BEFORE the delta baseline. If it only filtered the
       // output, the ignored region would still churn the baseline and everything in it would come
       // back as "added" on the next read — the opposite of the point. Pass ignore:[] to clear.
