@@ -501,9 +501,19 @@ async function domSnapshotIndex(tabId, sessionId) {
   } catch { return null; }
   const S = snap.strings || [];
   const str = (i) => (i == null || i < 0 ? undefined : S[i]);
-  const out = new Map();  // backendNodeId -> { tag, attrs, rect, paint }
-  const painted = [];     // { rect, paint, opaque } for the occlusion pass
-  for (const doc of snap.documents || []) {
+  const out = new Map();  // backendNodeId -> { tag, attrs, rect, paint, doc }
+  const painted = [];     // { rect, paint, opaque } for the occlusion pass — top document only
+  // Paint order is per document: a same-site iframe's nodes number their own paint from zero, and
+  // their bounds sit in a different coordinate space. Mixing them in made an iframe's input look
+  // buried under a top-page bar it does not touch. So occlusion is judged in the top document, and
+  // a node in a child document is covered exactly when the <iframe> that holds it is.
+  const ownerOfDoc = new Map(); // child document index -> owner <iframe> backendNodeId
+  (snap.documents || []).forEach((doc, di) => {
+    const nodes = doc.nodes || {};
+    const cdi = nodes.contentDocumentIndex || {};
+    (cdi.index || []).forEach((ni, k) => { const bid = (nodes.backendNodeId || [])[ni]; if (bid != null) ownerOfDoc.set(cdi.value[k], { bid, parentDoc: di }); });
+  });
+  for (const [di, doc] of (snap.documents || []).entries()) {
     const nodes = doc.nodes || {}, layout = doc.layout || {};
     const bids = nodes.backendNodeId || [];
     const byNodeIndex = new Map();
@@ -514,7 +524,7 @@ async function domSnapshotIndex(tabId, sessionId) {
       if (!b || paint == null) continue;
       const rect = { x1: b[0], y1: b[1], x2: b[0] + b[2], y2: b[1] + b[3] };
       byNodeIndex.set(ni, { rect, paint });
-      if (b[2] <= 0 || b[3] <= 0) continue;
+      if (di !== 0 || b[2] <= 0 || b[3] <= 0) continue;
       // Only something you cannot see through actually hides what is behind it. A transparent
       // layout wrapper spanning the page is the common case, and treating it as an occluder marks
       // the whole page unclickable — which is exactly the false positive this guards against.
@@ -533,9 +543,12 @@ async function domSnapshotIndex(tabId, sessionId) {
         const name = str(a[k]); if (name) attrs[name] = str(a[k + 1]) ?? '';
       }
       const geo = byNodeIndex.get(ni);
-      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint, cursor: geo?.cursor });
+      out.set(bid, { tag: (str((nodes.nodeName || [])[ni]) || '').toLowerCase(), attrs, rect: geo?.rect, paint: geo?.paint, cursor: geo?.cursor, doc: di });
     }
   }
+  // The top-document <iframe> each child document ultimately sits in.
+  const topOwner = (di) => { let o = ownerOfDoc.get(di), guard = 0; while (o && o.parentDoc !== 0 && guard++ < 16) o = ownerOfDoc.get(o.parentDoc); return o ? o.bid : null; };
+  for (const g of out.values()) if (g.doc) g.frameOwner = topOwner(g.doc);
   return { nodes: out, painted };
 }
 
@@ -602,12 +615,15 @@ function occludedNodes(geo) {
   }
   const union = new RectUnion();
   const byBid = new Map();
-  for (const [bid, g] of geo.nodes) if (g.rect && g.paint != null) byBid.set(bid, g);
+  // A zero-area box (a static <a> wrapping an absolutely placed image, say) has nothing to cover:
+  // any rect "contains" a point, which used to flag such links on every page.
+  for (const [bid, g] of geo.nodes) if (!g.doc && g.rect && g.paint != null && g.rect.x2 > g.rect.x1 && g.rect.y2 > g.rect.y1) byBid.set(bid, g);
   for (const paint of [...levels.keys()].sort((a, b) => b - a)) {
     const group = levels.get(paint);
     for (const [bid, g] of byBid) if (g.paint === paint && union.covers(g.rect)) covered.add(bid);
     for (const p of group) if (p.opaque) union.add(p.rect);
   }
+  for (const [bid, g] of geo.nodes) if (g.doc && g.frameOwner != null && covered.has(g.frameOwner)) covered.add(bid);
   return covered;
 }
 
@@ -2152,7 +2168,9 @@ async function dispatch(method, p) {
       const frames = { ...(s.frames.size ? { frames: s.frames.size } : {}), ...(ignoreSel.length ? { ignoring: ignoreSel } : {}), ...(interactOnly ? { mode: 'interact' } : {}) };
       // An overlay is the single most common reason a click does nothing, and the a11y tree gives no
       // hint of it. Say it once, as a count, rather than flipping a flag on every buried element.
-      const overlay = coveredCount ? { covered: coveredCount, hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {};
+      // The explanation once per change in the count; after that the bare count is enough.
+      const overlay = coveredCount ? { covered: coveredCount, ...(s.coveredSaid !== coveredCount ? { hint: coveredCount + ' element(s) are painted over by an overlay (modal, dropdown, cookie banner) and cannot be clicked until it is dismissed. They are marked covered:true.' } : {}) } : {};
+      s.coveredSaid = coveredCount;
       // A page with almost nothing on it is usually mid-load, not genuinely empty — worth saying,
       // because the alternative is the model concluding the content does not exist.
       const thin = next.size < 10 ? { note2: 'Very few elements — the page is probably still loading or rendering. wait_for a known element before concluding anything is missing.' } : {};
