@@ -260,7 +260,8 @@ a checked box, a toast, a cart line, a URL parameter.
 For a single action or a quick look. Each action (`click`, `fill`, `type_text`, `press_key`,
 `select_option`, `scroll`, `hover`, `drag`, `upload_file`, `navigate`, `reload`, `go_back`,
 `go_forward`, `dialog_handle`) returns a status:
-`{url, title, newConsoleErrors?, newConsoleWarnings?, openDialog?, challenge?}`. A `challenge`
+`{url, title, loading?, newConsoleErrors?, firstErrors?, newConsoleWarnings?, openDialog?, challenge?}`
+(`firstErrors` quotes the first two; `read_console {firstPartyOnly:true}` drops third-party noise). A `challenge`
 entry includes `blocking` and a `next` hint.
 
 ### See and target

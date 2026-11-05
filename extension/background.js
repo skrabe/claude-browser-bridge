@@ -1475,6 +1475,16 @@ function drawProbePoint(ctx, x, y) {
   ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
+// Registrable-ish site of a host, for first- vs third-party: the last two labels, or three under a
+// two-letter second-level like co.uk. Approximate by design; the public suffix list is not here.
+function siteOf(host) {
+  const h = String(host).toLowerCase().replace(/\.$/, '');
+  if (/^[\d.]+$/.test(h) || h.includes(':')) return h;
+  const parts = h.split('.');
+  const n = parts.length >= 3 && /^(co|com|org|net|gov|ac|edu)$/.test(parts[parts.length - 2]) && parts[parts.length - 1].length === 2 ? 3 : 2;
+  return parts.slice(-n).join('.');
+}
+
 // The page's visible text, frames included: same-origin iframes are read through contentDocument
 // (recursively), cross-origin ones through their own sessions. Each part is innerText, so hidden
 // text, <script> and <style> stay out of it.
@@ -1668,11 +1678,12 @@ async function handle(method, p) {
     try {
       const tab = await chrome.tabs.get(tabId);
       const fresh = state.get(tabId)?.console.slice(before) || [];
-      const errs = fresh.filter((m) => m.level === 'error').length;
+      const errList = fresh.filter((m) => m.level === 'error');
+      const errs = errList.length;
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
-      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, firstErrors: errList.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
         ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
@@ -2616,8 +2627,22 @@ async function dispatch(method, p) {
         for (const sid of s.frames.keys()) await rawCmd({ tabId: p.tabId, sessionId: sid }, 'Runtime.disable').catch(() => {});
         note = 'console capture is off for this tab again.';
       }
-      const out = s.console.slice(-(p.limit || 50)); if (p.clear) s.console = [];
-      return { messages: out, ...(note ? { note } : {}) };
+      // Third-party noise (an analytics beacon failing 50 times) drowns the errors that matter.
+      // firstPartyOnly keeps messages whose source URL is on the page's own site, plus the ones that
+      // carry no URL (the page's own console calls and thrown errors).
+      let list = s.console;
+      let dropped = 0;
+      if (p.firstPartyOnly || p.level) {
+        let site = null;
+        try { site = siteOf(new URL((await chrome.tabs.get(p.tabId)).url).hostname); } catch {}
+        list = list.filter((m) => {
+          if (p.level && m.level !== p.level && !(p.level === 'warning' && m.level === 'warn')) return false;
+          if (p.firstPartyOnly && m.url && site) { let h = ''; try { h = new URL(m.url).hostname; } catch {} if (h && siteOf(h) !== site) { dropped++; return false; } }
+          return true;
+        });
+      }
+      const out = list.slice(-(p.limit || 50)); if (p.clear) s.console = [];
+      return { messages: out, ...(dropped ? { thirdPartyHidden: dropped } : {}), ...(note ? { note } : {}) };
     }
     case 'readNetwork': { const s = st(p.tabId); const out = [...s.network.values()].slice(-(p.limit || 50)); if (p.clear) s.network.clear(); return { requests: out }; }
 
