@@ -1378,6 +1378,18 @@ function drawProbePoint(ctx, x, y) {
   ctx.fillStyle = '#e11d48'; ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
 }
 
+// The page's visible text, frames included: same-origin iframes are read through contentDocument
+// (recursively), cross-origin ones through their own sessions. Each part is innerText, so hidden
+// text, <script> and <style> stay out of it.
+const FRAME_TEXT_EXPR = `(()=>{const out=[];const walk=(d,depth)=>{if(!d||depth>8)return;out.push(d.body?d.body.innerText:'');for(const f of d.querySelectorAll('iframe,frame')){let c=null;try{c=f.contentDocument;}catch{}if(c)walk(c,depth+1);}};walk(document,0);return out;})()`;
+async function pageTexts(tabId) {
+  const parts = [];
+  const read = async (dbg) => { try { const r = await cmd(dbg, 'Runtime.evaluate', { expression: FRAME_TEXT_EXPR, returnByValue: true }); for (const t of r.result?.value || []) if (t) parts.push(t); } catch {} };
+  await read(tabId);
+  for (const sessionId of st(tabId).frames.keys()) await read({ tabId, sessionId });
+  return parts;
+}
+
 // chrome.tabs.get() reports an EMPTY url for a tab whose navigation hasn't committed yet — which is
 // exactly the moment after a fresh attach or a just-started load, so the status header could come
 // back with url:null and read as "we lost the page" when nothing was wrong. Fall back to the
@@ -2128,8 +2140,8 @@ async function dispatch(method, p) {
 
     case 'readText': {
       await need(p.tabId);
-      const r = await cmd(p.tabId, 'Runtime.evaluate', { expression: 'document.body?.innerText ?? ""', returnByValue: true });
-      return { text: r.result?.value ?? '' };
+      const [main, ...frames] = await pageTexts(p.tabId);
+      return { text: [main ?? '', ...frames.map((t) => '\n— frame —\n' + t)].join('') };
     }
 
     case 'domQuery': {
@@ -2376,17 +2388,18 @@ async function dispatch(method, p) {
       const q = String(p.query ?? '');
       if (!q) throw new Error('find_text needs a non-empty query');
       const max = Math.min(p.limit || 20, 50);
-      const r = await cmd(p.tabId, 'Runtime.evaluate', {
-        expression: `(()=>{const q=${JSON.stringify(q)},rx=${p.regex ? 'true' : 'false'},max=${max};
-          const t=document.body?document.body.innerText:'';const out=[];let count=0;
-          const push=(i,len)=>{if(out.length<max){const s=Math.max(0,i-40);out.push(t.slice(s,i+len+40).replace(/\\s+/g,' ').trim());}};
-          if(rx){const re=new RegExp(q,'gi');let m;while((m=re.exec(t))&&count<10000){count++;push(m.index,m[0].length);if(m.index===re.lastIndex)re.lastIndex++;}}
-          else{const hay=t.toLowerCase(),n=q.toLowerCase();let i=0;while((i=hay.indexOf(n,i))>=0&&count<10000){count++;push(i,n.length);i+=n.length;}}
-          return{count,contexts:out};})()`,
-        returnByValue: true,
+      let re = null;
+      if (p.regex) { try { re = new RegExp(q, 'gi'); } catch (e) { throw new Error('find_text: invalid regex — ' + e.message); } }
+      const texts = await pageTexts(p.tabId);
+      const out = []; let count = 0, inFrames = 0;
+      texts.forEach((t, part) => {
+        const push = (i, len) => { if (out.length < max) { const st0 = Math.max(0, i - 40); out.push(t.slice(st0, i + len + 40).replace(/\s+/g, ' ').trim()); } };
+        const before = count;
+        if (re) { re.lastIndex = 0; let m; while ((m = re.exec(t)) && count < 10000) { count++; push(m.index, m[0].length); if (m.index === re.lastIndex) re.lastIndex++; } }
+        else { const hay = t.toLowerCase(), n = q.toLowerCase(); let i = 0; while ((i = hay.indexOf(n, i)) >= 0 && count < 10000) { count++; push(i, n.length); i += n.length; } }
+        if (part > 0) inFrames += count - before;
       });
-      const v = r.result?.value || { count: 0, contexts: [] };
-      return { query: q, count: v.count, matches: v.contexts };
+      return { query: q, count, ...(inFrames ? { inFrames } : {}), matches: out };
     }
 
     // "Did it land?" as one cheap, deterministic call. Every check runs and reports its evidence, so
@@ -2402,9 +2415,12 @@ async function dispatch(method, p) {
       if (p.urlMatches != null) { let ok = false; try { ok = new RegExp(String(p.urlMatches)).test(url); } catch { checks.push({ check: 'urlMatches', want: p.urlMatches, ok: false, got: 'invalid regex' }); }
         if (!checks.some((c) => c.check === 'urlMatches')) checks.push({ check: 'urlMatches', want: p.urlMatches, ok, got: url }); }
       if (p.titleIncludes != null) checks.push({ check: 'titleIncludes', want: p.titleIncludes, ok: String(t.title || '').includes(String(p.titleIncludes)), got: t.title });
+      let texts = null;
       const textCount = async (q) => {
-        const r = await cmd(p.tabId, 'Runtime.evaluate', { returnByValue: true, expression: `(()=>{const t=(document.body?document.body.innerText:'').toLowerCase();const n=${JSON.stringify(String(q).toLowerCase())};let i=0,c=0;while((i=t.indexOf(n,i))>=0&&c<1000){c++;i+=n.length;}return c;})()` });
-        return r.result?.value ?? 0;
+        if (!texts) texts = (await pageTexts(p.tabId)).map((t) => t.toLowerCase());
+        const n = String(q).toLowerCase(); let c = 0;
+        for (const t of texts) { let i = 0; while (n && (i = t.indexOf(n, i)) >= 0 && c < 1000) { c++; i += n.length; } }
+        return c;
       };
       for (const q of [].concat(p.text ?? [])) { const c = await textCount(q); checks.push({ check: 'text', want: q, ok: c > 0, got: c + ' occurrence(s)' }); }
       for (const q of [].concat(p.textAbsent ?? [])) { const c = await textCount(q); checks.push({ check: 'textAbsent', want: q, ok: c === 0, got: c + ' occurrence(s)' }); }
