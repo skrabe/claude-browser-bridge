@@ -65,6 +65,20 @@ if (!window.__cbb) {
   const isEnabled = (e) => !(e.disabled || e.getAttribute && (e.getAttribute('aria-disabled') === 'true'));
   // aria-hidden/hidden subtrees are pruned from the a11y tree — exclude them from role/text/label
   // matching so hidden duplicates don't inflate the count and trip strict mode (like Playwright).
+  // Elements whose text is code, inert markup or a form field's source, never something a user
+  // reads as page text: a <script> containing the searched string must not match it, and nor may a
+  // hidden editor's <textarea> (TinyMCE keeps one beside its iframe) or the ancestors around it.
+  // Like Playwright, button-type inputs match by their value.
+  const NOT_TEXT = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE', 'META', 'LINK', 'IFRAME', 'FRAME', 'OBJECT', 'TEXTAREA', 'SELECT']);
+  const BUTTON_INPUT = /^(button|submit|reset)$/i;
+  const shownText = (e) => {
+    const tag = (e.tagName || '').toUpperCase();
+    if (tag === 'INPUT') return BUTTON_INPUT.test(e.type || '') ? String(e.value || '') : '';
+    if (NOT_TEXT.has(tag)) return '';
+    let out = '';
+    const walk = (n) => { for (const c of n.childNodes) { if (c.nodeType === 3) out += c.nodeValue; else if (c.nodeType === 1) { const t = c.tagName.toUpperCase(); if (t === 'INPUT') { if (BUTTON_INPUT.test(c.type || '')) out += ' ' + (c.value || '') + ' '; } else if (!NOT_TEXT.has(t)) walk(c); } } };
+    walk(e); return out;
+  };
   const aHidden = (e) => { let n = e; while (n && n.nodeType === 1) { if (n.getAttribute && (n.getAttribute('aria-hidden') === 'true' || n.hasAttribute('hidden'))) return true; n = n.parentElement; } return false; };
   const isChecked = (e) => { if (typeof e.checked === 'boolean') return e.checked; const a = e.getAttribute && e.getAttribute('aria-checked'); return a === 'true'; };
   const isEditable = (e) => (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA' || e.isContentEditable) && isEnabled(e) && !e.readOnly;
@@ -96,7 +110,7 @@ if (!window.__cbb) {
       for (const e of all) {
         if (aHidden(e)) continue;
         if (step.by === 'role') { if (roleOf(e) !== step.role) continue; if (step.name != null && !M(accName(e), step.name, step.exact)) continue; out.push(e); }
-        else if (step.by === 'text') { if (M(e.textContent, step.text, step.exact)) out.push(e); }
+        else if (step.by === 'text') { if (M(shownText(e), step.text, step.exact)) out.push(e); }
         else if (step.by === 'label') { const l = labelForm(e); const ar = e.getAttribute && e.getAttribute('aria-label'); if ((l && M(l, step.text, step.exact)) || (ar && M(ar, step.text, step.exact))) out.push(e); }
         else if (step.by === 'placeholder') { const ph = e.getAttribute && e.getAttribute('placeholder'); if (ph && M(ph, step.text, step.exact)) out.push(e); }
         else if (step.by === 'testid') { const t = e.getAttribute && (e.getAttribute('data-testid') || e.getAttribute('data-test-id') || e.getAttribute('data-test')); if (t === step.testId) out.push(e); }
@@ -114,7 +128,7 @@ if (!window.__cbb) {
       if (step.op === 'nth') { scopes = scopes[step.n < 0 ? scopes.length + step.n : step.n] ? [scopes[step.n < 0 ? scopes.length + step.n : step.n]] : []; }
       else if (step.op === 'first') scopes = scopes.slice(0, 1);
       else if (step.op === 'last') scopes = scopes.slice(-1);
-      else if (step.op === 'filter') { scopes = scopes.filter((s) => { if (step.hasText != null && !M(s.textContent, step.hasText, false)) return false; if (step.hasNotText != null && M(s.textContent, step.hasNotText, false)) return false; return true; }); }
+      else if (step.op === 'filter') { scopes = scopes.filter((s) => { if (step.hasText != null && !M(shownText(s), step.hasText, false)) return false; if (step.hasNotText != null && M(shownText(s), step.hasNotText, false)) return false; return true; }); }
       else scopes = queryStep(scopes, step);
     }
     return scopes;
@@ -267,6 +281,19 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   const clickAt = (x, y, o = {}) => human('click', { x, y, button: o.button || 'left', clickCount: o.clickCount || 1, modifiers: o.modifiers || 0 });
   const dragPath = (from, to) => human('drag', { from, to });
 
+  // Name a locator and a match in error messages, so a failure says which lookup failed and what
+  // it collided with instead of a bare count.
+  const describeSteps = (steps) => steps.map((st) => {
+    const v = (x) => (x && x.__re ? '/' + x.source + '/' + x.flags : JSON.stringify(x));
+    if (st.op === 'nth') return `.nth(${st.n})`; if (st.op === 'first') return '.first()'; if (st.op === 'last') return '.last()';
+    if (st.op === 'filter') return `.filter(${st.hasText != null ? 'hasText ' + v(st.hasText) : 'hasNotText ' + v(st.hasNotText)})`;
+    if (st.by === 'role') return `getByRole(${JSON.stringify(st.role)}${st.name != null ? ', ' + v(st.name) : ''})`;
+    if (st.by === 'css') return `locator(${JSON.stringify(st.selector)})`;
+    if (st.by === 'testid') return `getByTestId(${JSON.stringify(st.testId)})`;
+    return `getBy${st.by[0].toUpperCase() + st.by.slice(1)}(${v(st.text)})`;
+  }).join('.');
+  const describeMatch = (m) => `<${m.tag}>${m.role ? ' ' + m.role : ''}${m.name ? ' "' + String(m.name).slice(0, 50) + '"' : ''}${m.sessionId ? ' (in a frame)' : ''}${m.vis ? '' : ' hidden'}${m.en === false ? ' disabled' : ''}`;
+
   class Locator {
     constructor(steps) { this.steps = steps; }
     _child(step) { return new Locator([...this.steps, step]); }
@@ -288,16 +315,17 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async all() { const g = await resolveGlobal(this.steps); return g.map((_, i) => this.nth(i)); }
     // actionable: true → visible+enabled; 'visible' → visible only (hover); false → attached only.
     async _one(actionable, timeoutMs = 15000) {
-      const deadline = Date.now() + Math.min(timeoutMs, 60000);
+      const budget = Math.min(timeoutMs, 60000), deadline = Date.now() + budget;
       let last = null;
       while (Date.now() < deadline) {
         const g = await resolveGlobal(this.steps);
         if (g.length === 1) { const t = g[0]; const ok = actionable === 'visible' ? t.vis : actionable ? (t.vis && t.en) : true; if (ok) return t; last = t; }
-        else if (g.length > 1) throw new Error(`strict mode: ${g.length} elements match — add .first()/.nth()/.filter()`);
+        else if (g.length > 1) throw new Error(`strict mode: ${describeSteps(this.steps)} matches ${g.length} elements — ${g.slice(0, 4).map(describeMatch).join('; ')}${g.length > 4 ? '; …' : ''}. Add .first()/.nth()/.filter(), or a role/exact name`);
         await settle(deadline);
       }
-      if (last) throw new Error('element not actionable in time (visible/enabled)');
-      throw new Error('locator matched no element in time');
+      const secs = Math.round(budget / 1000) + 's';
+      if (last) throw new Error(`${describeSteps(this.steps)} stayed ${!last.vis ? 'hidden' : 'disabled'} for ${secs} (${describeMatch(last)})${!last.vis ? '' : ' — it is disabled; complete whatever enables it first'}`);
+      throw new Error(`${describeSteps(this.steps)} matched no element in ${secs} — check the name with read_page/find, or pass {timeoutMs} for a slow page (use .count() to test for existence without waiting)`);
     }
     async waitFor(o = {}) { const state = o.state || 'visible'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const g = await resolveGlobal(this.steps); const t = g[0]; const ok = state === 'attached' ? !!t : state === 'detached' ? !t : state === 'visible' ? (t && t.vis) : state === 'hidden' ? (!t || !t.vis) : !!t; if (ok) return; await settle(deadline); } throw new Error('waitFor(' + state + ') timed out'); }
     async textContent(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'text' }, t.sessionId); }

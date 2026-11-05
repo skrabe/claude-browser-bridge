@@ -76,5 +76,16 @@ eq('evaluateAll projects every match in one pass',
 eq('evaluateAll passes the index',
   cbb('evalfn',{steps:[{by:'css',selector:'li'}],all:true,fn:'(el,arg,i)=>i'}), [0,1,2]);
 
+// Text matching against a page that hides look-alike text in code and form fields.
+const tdom = new JSDOM(`<!doctype html><body><section><textarea style="display:none">Hello editor</textarea><p>Hello editor</p></section>
+  <input type="submit" value="Send it"><script>var greeting = "Hello World!";</script><p>Hello World!</p></body>`, { runScripts: 'dangerously', pretendToBeVisual: true });
+tdom.window.Element.prototype.getBoundingClientRect = function(){ return rect; };
+tdom.window.Element.prototype.getClientRects = function(){ return [rect]; };
+{ const s2 = tdom.window.document.createElement('script'); s2.textContent = _ENGINE; tdom.window.document.body.appendChild(s2); }
+const tcbb = tdom.window.__cbb;
+eq('getByText skips <script> source', tcbb('q',{steps:[{by:'text',text:'Hello World!'}]}).matches.map(m=>m.tag), ['p']);
+eq('getByText skips a hidden editor <textarea> and its wrapper', tcbb('q',{steps:[{by:'text',text:'Hello editor'}]}).matches.map(m=>m.tag), ['p']);
+eq('getByText matches a submit input by value', tcbb('q',{steps:[{by:'text',text:'Send it'}]}).matches.map(m=>m.tag), ['input']);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
