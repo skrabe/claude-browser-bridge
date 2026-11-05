@@ -1894,6 +1894,17 @@ async function dispatch(method, p) {
       const t0 = Date.now();
       const s = st(p.tabId);
       const nav = await cmd(p.tabId, 'Page.navigate', { url: p.url });
+      if (nav?.isDownload) return { ok: true, download: true, note: 'the URL started a download; the page did not change — download_wait for the file' };
+      // Chrome reports a navigation it refused (a top-frame data: URL, a blocked scheme or port) as
+      // an errorText while the tab stays where it was. ERR_ABORTED is also what a navigation the page
+      // itself redirected looks like, so that one only fails when the tab really did not move.
+      if (nav?.errorText && nav.errorText !== 'net::ERR_ABORTED') throw new Error(`navigation to ${p.url} failed: ${nav.errorText} — the tab is still on ${cur}`);
+      if (nav?.errorText) {
+        await pause(150);
+        const now = await tabUrl(p.tabId);
+        if (!now || now === cur) throw new Error(`navigation to ${p.url} was refused (net::ERR_ABORTED) — the tab is still on ${cur}.`
+          + (/^data:/i.test(p.url) ? ' Chrome does not let a page navigate its top frame to a data: URL; open it with tab_create instead.' : ''));
+      }
       // A same-document (hash) navigation or a download commits no new document and fires no load.
       if (p.waitUntil !== 'none' && nav && nav.loaderId) { // settle so the next read isn't racing the load
         // Woken by Page.loadEventFired instead of polling readyState every 120 ms.

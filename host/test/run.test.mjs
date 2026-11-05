@@ -31,7 +31,7 @@ async function callHost(method, params) {
     if (m === 'Input.dispatchMouseEvent') { mouse.push({ type: p.type, x: p.x, y: p.y, button: p.button, clickCount: p.clickCount, buttons: p.buttons }); return {}; }
     if (m === 'Input.insertText') { records.insert = { text: p.text, sessionId: params.sessionId ?? null }; return {}; }
     if (m === 'Input.dispatchKeyEvent') { if (p.type === 'keyDown') keys.push({ key: p.key, text: p.text, modifiers: p.modifiers, sessionId: params.sessionId ?? null }); return {}; }
-    if (m === 'Page.navigate') return String(p.url || '').includes('blocked.invalid') ? { errorText: 'net::ERR_NAME_NOT_RESOLVED' } : {};
+    if (m === 'Page.navigate') return String(p.url || '').includes('blocked.invalid') ? { errorText: 'net::ERR_NAME_NOT_RESOLVED' } : /^data:/.test(p.url) ? { errorText: 'net::ERR_ABORTED', loaderId: 'L' } : {};
     if (m === 'DOM.setFileInputFiles') { records.setFiles = { objectId: p.objectId, files: p.files }; return {}; }
     if (m === 'Page.printToPDF') return { data: Buffer.from('%PDF-1.4 hello').toString('base64') };
     if (m === 'Emulation.setDeviceMetricsOverride') { records.viewport = p; return {}; }
@@ -113,6 +113,7 @@ await check('#6 type dispatches per-char keystrokes', `await page.getByLabel('Em
 { const l2 = keys.slice(-2); const ok = l2.length===2 && l2[0].text==='h' && l2[1].text==='i' && l2.every(k=>k.sessionId==null); console.log((ok?'  ok  ':'  FAIL')+' #6 type → per-char keyDown(text) at top-level (H1)'+(ok?'':`  got=${JSON.stringify(l2)}`)); ok?pass++:fail++; }
 await check('#12 press Shift+a returns', `await page.getByLabel('Email').press('Shift+a'); return 'ok';`, 'ok');
 { const kd = keys[keys.length-1]; const ok = kd && kd.text === 'A' && kd.key === 'A'; console.log((ok?'  ok  ':'  FAIL')+' #12 press Shift+a → uppercase A (text/key)'); ok?pass++:fail++; }
+await check('goto a refused data: URL throws instead of reporting ok', `try{ await page.goto('data:text/html,hi'); return 'no-throw'; }catch(e){ return /goto refused.*data: URL/.test(e.message)?'threw':e.message; }`, 'threw');
 await check('#4 goto throws on nav failure', `try{ await page.goto('https://blocked.invalid'); return 'no-throw'; }catch(e){ return /goto failed/.test(e.message)?'threw':e.message; }`, 'threw');
 await check('#5 expectNavigation throws on timeout', `try{ await page.expectNavigation(()=>{}, {url:/nope/, timeoutMs:250}); return 'no-throw'; }catch(e){ return /no matching navigation/.test(e.message)?'threw':e.message; }`, 'threw');
 await check('#10 dom_cua.double_click guards missing node', `try{ await page.dom_cua.double_click({node_id:'99999'}); return 'no-throw'; }catch(e){ return /double_click/.test(e.message)?'threw':e.message; }`, 'threw');

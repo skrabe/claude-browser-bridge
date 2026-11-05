@@ -388,8 +388,12 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     // a third argument to reach page-defined JS — the page can observe that call.
     async evaluate(fn, arg, o = {}) { const expr = typeof fn === 'function' ? `(${fn.toString()})(${JSON.stringify(arg ?? null)})` : String(fn); const r = o && o.world === 'page' ? await callHost('executeCdp', { tabId, cdpMethod: 'Runtime.evaluate', cdpParams: { expression: expr, returnByValue: true, awaitPromise: true }, world: 'page' }) : await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) throw new Error('evaluate failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; },
     async goto(url, o = {}) {
+      const before = await this.url();
       const r = await cdp('Page.navigate', { url });
-      if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ')');
+      if (r && r.isDownload) return null;
+      if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ') — the tab is still on ' + before);
+      // ERR_ABORTED is also a navigation the page redirected; it only failed if the tab did not move.
+      if (r && r.errorText) { await sleep(150); const now = await this.url(); if (!now || now === before) throw new Error('goto refused: net::ERR_ABORTED (' + url + ') — the tab is still on ' + before + (/^data:/i.test(url) ? '. Chrome does not let a page navigate its top frame to a data: URL; use browser.newTab(url).' : '')); }
       if ((o.waitUntil || 'load') === 'commit') return null;
       // wait for the NEW document to commit (readyState leaves the old 'complete') before waiting for
       // its load state — otherwise a slow/blocked nav resolves against the stale page.
