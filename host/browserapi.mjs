@@ -425,7 +425,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
       if (r && r.isDownload) return null;
       if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ') — the tab is still on ' + before);
       // ERR_ABORTED is also a navigation the page redirected; it only failed if the tab did not move.
-      if (r && r.errorText) { await sleep(150); const now = await this.url(); if (!now || now === before) throw new Error('goto refused: net::ERR_ABORTED (' + url + ') — the tab is still on ' + before + (/^data:/i.test(url) ? '. Chrome does not let a page navigate its top frame to a data: URL; use browser.newTab(url).' : '')); }
+      if (r && r.errorText) { let now = before; for (let w = 0; w < 600 && now === before; w += 60) { await sleep(60); now = await this.url(); } if (!now || now === before) throw new Error('goto refused: net::ERR_ABORTED (' + url + ') — the tab is still on ' + before + (/^data:/i.test(url) ? '. Chrome does not let a page navigate its top frame to a data: URL; use browser.newTab(url).' : '')); }
       if ((o.waitUntil || 'load') === 'commit') return null;
       // wait for the NEW document to commit (readyState leaves the old 'complete') before waiting for
       // its load state — otherwise a slow/blocked nav resolves against the stale page.

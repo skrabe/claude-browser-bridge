@@ -1098,14 +1098,27 @@ async function editableTarget(tabId, node) {
   return { backendNodeId: target.backendNodeId, sessionId: typeof docDbg === 'number' ? node.sessionId : docDbg.sessionId, ...(frameId ? { frameId } : {}) };
 }
 
-// After an action: did it start a top-level navigation? A click on a link or a submit button starts
-// one within a few dozen ms of the release; give it a quarter second to show, then up to `commitMs` to commit, so the
-// status reports the page the action led to rather than the one it left. Returns 'committed',
-// 'pending' (started, not committed in time) or null (nothing started).
-async function settleNavigation(tabId, t0, { startMs = 250, commitMs = 3000 } = {}) {
+// ERR_ABORTED means "this navigation did not finish", which is both a refusal (a top-frame data:
+// URL) and a navigation the page itself superseded (a JS redirect, a second navigate). The browser
+// tells them apart: a superseding one starts under a different loaderId, or commits. Wait briefly
+// for either; comparing URLs instead misjudged a redirect still in flight as a refusal.
+async function replacedNavigation(s, t0, loaderId, ms = 600) {
+  const other = () => (s.navCommitTs || 0) >= t0 || (s.lastNavStart && s.lastNavStart.ts >= t0 && s.lastNavStart.loaderId !== loaderId);
+  for (let waited = 0; !other() && waited < ms; waited += 30) await pause(30);
+  return other();
+}
+
+// After an action: did it start a top-level navigation? A link, a submit or a location assignment
+// asks for one while the click is being handled, so once the renderer has answered one more
+// command, a navigation the click caused has already been announced. That round trip costs a few
+// ms, where a fixed wait cost a quarter second on every click. A navigation that did start gets up
+// to `commitMs` to commit, so the status names the page the action led to. Returns 'committed',
+// 'pending' (started, not committed in time) or null.
+async function settleNavigation(tabId, t0, { commitMs = 3000 } = {}) {
   const s = state.get(tabId); if (!s) return null;
   const started = () => (s.navStartTs || 0) >= t0 || (s.navCommitTs || 0) >= t0;
-  for (let waited = 0; !started() && waited < startMs; waited += 50) await pause(50);
+  if (!started()) { try { await cmd(tabId, 'Runtime.evaluate', { expression: '0', returnByValue: true }); } catch {} }
+  if (!started()) await pause(15); // events emitted with the answer may land a tick after it
   if (!started()) return null;
   if ((s.navCommitTs || 0) >= t0) return 'committed';
   const ok = await new Promise((res) => {
@@ -1684,6 +1697,7 @@ async function handle(method, p) {
   if ((track || method === 'humanInput' || method === 'executeCdp') && state.get(tabId)?.attached) st(tabId).lastActionTs = Date.now();
   const before = track ? (state.get(tabId)?.console.length ?? 0) : 0;
   const dialogBefore = tabId != null ? state.get(tabId)?.dialog : null;
+  const actionT0 = Date.now();
   // A JS dialog holds the renderer: anything that reads or drives the page would hang, or, where a
   // helper swallows the error, come back looking like an empty page. Refuse up front instead.
   if (dialogBefore && !DIALOG_SAFE.has(method)) throw dialogError(dialogBefore);
@@ -1707,7 +1721,15 @@ async function handle(method, p) {
       const warns = fresh.filter((m) => m.level === 'warning' || m.level === 'warn').length;
       const dialog = state.get(tabId)?.dialog;
       const challenge = await detectChallenge(tabId).catch(() => null);
-      result.status = { url: await tabUrl(tabId, tab), title: tab.title || null, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, firstErrors: errList.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
+      // chrome.tabs lags the commit: right after a click navigated, tab.url and tab.title still
+      // name the page it left. The committed frame URL and the new document's own title do not.
+      const st0 = state.get(tabId);
+      let url = await tabUrl(tabId, tab), title = tab.title || null;
+      if (st0?.navCommitTs >= actionT0 && st0.commitUrl) {
+        url = st0.commitUrl;
+        try { title = (await cmd(tabId, 'Runtime.evaluate', { expression: 'document.title', returnByValue: true })).result?.value || title; } catch {}
+      }
+      result.status = { url, title, ...(tab.status === 'loading' ? { loading: true } : {}), ...(errs ? { newConsoleErrors: errs, firstErrors: errList.slice(0, 2).map((m) => String(m.text).slice(0, 160)) } : {}), ...(warns ? { newConsoleWarnings: warns } : {}), ...(dialog ? { openDialog: dialog } : {}),
         ...(challenge ? { challenge: { ...challenge, next: challengeNext(challenge) } } : {}) };
     } catch { /* status is best-effort — never fail the action over it */ }
   }
@@ -2071,10 +2093,8 @@ async function dispatch(method, p) {
       // an errorText while the tab stays where it was. ERR_ABORTED is also what a navigation the page
       // itself redirected looks like, so that one only fails when the tab really did not move.
       if (nav?.errorText && nav.errorText !== 'net::ERR_ABORTED') throw new Error(`navigation to ${p.url} failed: ${nav.errorText} — the tab is still on ${cur}`);
-      if (nav?.errorText) {
-        await pause(150);
-        const now = await tabUrl(p.tabId);
-        if (!now || now === cur) throw new Error(`navigation to ${p.url} was refused (net::ERR_ABORTED) — the tab is still on ${cur}.`
+      if (nav?.errorText && !(await replacedNavigation(s, t0, nav.loaderId))) {
+        throw new Error(`navigation to ${p.url} was refused (net::ERR_ABORTED) — the tab is still on ${cur}.`
           + (/^data:/i.test(p.url) ? ' Chrome does not let a page navigate its top frame to a data: URL; open it with tab_create instead.' : ''));
       }
       // A same-document (hash) navigation or a download commits no new document and fires no load.
@@ -3094,15 +3114,17 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
       s.console.push({ level: e.level, text: (e.source ? e.source + ': ' : '') + (e.text || ''), ts: e.timestamp, ...(e.url ? { url: e.url } : {}) });
       if (s.console.length > 500) s.console.shift();
     }
+  } else if (cdpMethod === 'Page.frameStartedNavigating' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
+    s.navStartTs = Date.now(); s.lastNavStart = { loaderId: cdpParams.loaderId, ts: Date.now() };
   } else if (cdpMethod === 'Page.windowOpen' || (cdpMethod === 'Page.frameRequestedNavigation' && /^new/.test(cdpParams.disposition || ''))) {
     if (s.lastActionTs && Date.now() - s.lastActionTs < ADOPT_WINDOW_MS) noteAgentOpen(cdpParams.url);
   } else if ((cdpMethod === 'Page.frameRequestedNavigation' || cdpMethod === 'Page.frameStartedLoading') && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
     s.navStartTs = Date.now();
   } else if (cdpMethod === 'Page.navigatedWithinDocument' && !source.sessionId && (!s.topFrameId || cdpParams.frameId === s.topFrameId)) {
-    s.navCommitTs = Date.now();
+    s.navCommitTs = Date.now(); s.commitUrl = cdpParams.url;
     if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; }
   } else if (cdpMethod === 'Page.frameNavigated') {
-    if (!cdpParams.frame?.parentId && !source.sessionId) { s.topFrameId = cdpParams.frame?.id; s.navCommitTs = Date.now(); if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; } }
+    if (!cdpParams.frame?.parentId && !source.sessionId) { s.topFrameId = cdpParams.frame?.id; s.navCommitTs = Date.now(); s.commitUrl = (cdpParams.frame?.url || '') + (cdpParams.frame?.urlFragment || ''); if (s.commitWaiters) { for (const w of s.commitWaiters) w(); s.commitWaiters = []; } }
     // A new document in some frame: the isolated world we made in its old document is gone.
     if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); if (cdpParams.frame?.id) s.worlds.delete((source.sessionId || 'main') + '#' + cdpParams.frame.id); }
     if (!cdpParams.frame?.parentId) {
