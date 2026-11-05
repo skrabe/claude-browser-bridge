@@ -244,6 +244,10 @@ appears when an overlay covered the element your ref pointed at:
 
 That is the signal to dismiss the modal or banner, not to retry the same click.
 
+A ref click on a `disabled` control fails at once: complete whatever enables it. An `aria-disabled`
+control still takes the click (some sites use it to explain what is missing), and the receipt
+carries a `note` saying so.
+
 Inside `run`: `page.dom_cua.get_visible_dom()` (numbered nodes with boxes), then
 `click({node_id})` · `double_click({node_id})` · `type({text})` · `keypress({keys})` ·
 `scroll({node_id,x,y})`; plus `page.elementFromPoint({x,y})`, `page.mouse.click(x,y)` /
