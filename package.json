@@ -4,7 +4,7 @@
   "description": "Programmable browser bridge for Claude Code. Runtime uses only Node builtins; jsdom is a dev-only dependency for the engine tests.",
   "license": "MIT",
   "scripts": {
-    "test": "node host/test/engine.test.mjs && node host/test/run.test.mjs && node host/test/wedge.test.mjs && node host/test/flows.test.mjs && node extension/test/agent-tabs.test.mjs && node extension/test/assets.test.mjs && node extension/test/occlusion.test.mjs",
+    "test": "node host/test/engine.test.mjs && node host/test/run.test.mjs && node host/test/wedge.test.mjs && node host/test/flows.test.mjs && node extension/test/agent-tabs.test.mjs && node extension/test/assets.test.mjs && node extension/test/occlusion.test.mjs && node extension/test/intent.test.mjs",
     "test:coordinates": "node test/run-coordinates.mjs",
     "test:live": "node test/run-stealth.mjs && node test/run-challenge.mjs && node test/run-features.mjs && node test/run-coordinates.mjs"
   },

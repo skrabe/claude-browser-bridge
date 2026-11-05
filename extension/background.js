@@ -1462,10 +1462,21 @@ const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'select
 // Heuristic over the a11y tree (main + cross-origin frames): rank interactive nodes by fuzzy match
 // against the words of a query. Refs minted here use an 'f' prefix with the same monotonic seq, so
 // they never clobber read_page's.
+// Words that say how to refer to an element, not which one: "the Delete account button" names the
+// element by "delete account". Scoring them let "button" match every button and "the" match most
+// names, so a request for something absent came back "ambiguous" with unrelated buttons.
+const QUERY_STOPWORDS = new Set(['the', 'a', 'an', 'this', 'that', 'my', 'on', 'in', 'of', 'to', 'for', 'and', 'or', 'with', 'at', 'by', 'from', 'field', 'input', 'box', 'element', 'control', 'icon']);
+const ROLE_WORDS = { button: ['button'], btn: ['button'], link: ['link'], checkbox: ['checkbox'], radio: ['radio'], textbox: ['textbox', 'searchbox'], tab: ['tab'], menu: ['menu', 'menuitem'], option: ['option'], switch: ['switch'], slider: ['slider'], dropdown: ['combobox', 'listbox'], combobox: ['combobox'], select: ['combobox', 'listbox'], heading: ['heading'], image: ['image', 'img'] };
 async function findCandidates(tabId, query) {
   const s = st(tabId);
-  const q = String(query || '').toLowerCase();
-  const terms = q.split(/\s+/).filter(Boolean);
+  const q = String(query || '').toLowerCase().trim();
+  const words = q.split(/[\s"'“”‘’]+/).filter(Boolean);
+  // Role words only steer: they boost a candidate with that role, never make a match on their own.
+  const roleHints = new Set(words.flatMap((w) => ROLE_WORDS[w] || []));
+  let terms = words.filter((w) => !QUERY_STOPWORDS.has(w) && !ROLE_WORDS[w]);
+  // A query that is only role words ("the button") still needs something to match on.
+  const roleOnly = !terms.length && roleHints.size > 0;
+  if (!terms.length && !roleOnly) terms = words;
   const scored = [];
   for (const sessionId of [undefined, ...s.frames.keys()]) {
     let nodes;
@@ -1474,12 +1485,19 @@ async function findCandidates(tabId, query) {
       if (n.ignored || n.backendDOMNodeId == null) continue;
       const role = n.role?.value || ''; const name = (n.name?.value || '').trim();
       if (!INTERACTIVE.has(role) && !name) continue;
-      const hay = (role + ' ' + name).toLowerCase();
-      let score = 0; for (const t of terms) if (hay.includes(t)) score += t.length;
-      if (name && q.includes(name.toLowerCase())) score += 5;
-      if (score <= 0) continue;
+      const hay = name.toLowerCase();
+      let score = 0;
+      if (roleOnly) { if (!roleHints.has(role.toLowerCase())) continue; score = 1; }
+      else {
+        let hits = 0;
+        for (const t of terms) if (hay.includes(t)) { score += t.length; hits++; }
+        if (score <= 0) continue; // the name must carry the match; a role alone is not one
+        n.__full = hits === terms.length;
+        if (hay && q.includes(hay)) score += 5;
+        if (roleHints.has(role.toLowerCase())) score += 3;
+      }
       const ref = 'f' + (++s.seq); s.refs.set(ref, { backendNodeId: n.backendDOMNodeId, sessionId });
-      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, ...(sessionId ? { frame: true } : {}) });
+      scored.push({ ref, role, name: cleanName(name).slice(0, 160), score, full: roleOnly || !!n.__full, ...(sessionId ? { frame: true } : {}) });
     }
   }
   scored.sort((a, b) => b.score - a.score);
@@ -1488,10 +1506,15 @@ async function findCandidates(tabId, query) {
 
 // Rank the interactive elements an intent could mean. Controls first: a button's label is also
 // published as a StaticText, and letting the twin compete makes every intent look ambiguous.
+// Only a candidate whose name carries EVERY content word of the intent counts: "Delete account"
+// sharing "delete" with "Delete order" is exactly the near miss that must never be clicked.
 async function intentCandidates(tabId, intent) {
   const all = await findCandidates(tabId, intent);
   const controls = all.filter((c) => INTERACTIVE.has(c.role));
-  return controls.length ? controls : all;
+  const pool = controls.length ? controls : all;
+  const full = pool.filter((c) => c.full);
+  full.near = pool.filter((c) => !c.full).slice(0, 3);
+  return full;
 }
 
 // Let any ref-taking tool accept a CSS `selector` instead, resolved here so all of them gain it at
@@ -1516,7 +1539,11 @@ async function resolveSelector(method, p) {
     // scores Save 9 to Delete 5 — a clear pick, and a 2x rule would have called that ambiguous.
     if (top && (!second || top.score >= second.score * 1.5 || top.score - second.score >= 3)) return { ...p, ref: top.ref, resolvedBy: 'intent', ...(why ? { note: why } : {}) };
     const list = cands.slice(0, 5).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
-    throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list || 'none'}. Pick one by ref.`);
+    if (!top) {
+      const near = (cands.near || []).map((c) => `${c.ref} ${c.role} "${c.name}"`).join('; ');
+      throw new Error(`${why ? why + '; and ' : ''}nothing on the page matches intent ${JSON.stringify(p.intent)}${near ? ` (partial matches, not taken: ${near})` : ''} — read_page or find to see what is there, and target by ref`);
+    }
+    throw new Error(`${why ? why + '; and ' : ''}intent ${JSON.stringify(p.intent)} is ambiguous — candidates: ${list}. Pick one by ref.`);
   };
   if (!p.selector) return byIntent('');
   const { root } = await cmd(p.tabId, 'DOM.getDocument', { depth: 0 });
@@ -2218,7 +2245,7 @@ async function dispatch(method, p) {
     case 'find': {
       await need(p.tabId);
       const scored = await findCandidates(p.tabId, p.query);
-      return { candidates: scored.slice(0, 10).map(({ score, ...c }) => c) };
+      return { candidates: scored.slice(0, 10).map(({ score, full, ...c }) => c) };
     }
 
     case 'click': {
