@@ -91,9 +91,9 @@ Playwright's current name for `type(v)` — both work, and neither clears the fi
 
 - Clicks are **real trusted mouse events** at the element's center (auto-scrolled in first).
   `click({button:'right'})`, `click({modifiers:['Meta']})`, `click({clickCount:2})`.
-- `fill` clears then sets the value and fires `input`+`change` (fast). `type` sends **real
-  per-character keystrokes** — use it only when a widget reacts to keys (search-as-you-type,
-  key-filtered inputs, per-key OTP boxes); `fill` for everything else.
+- `fill` clicks into the field, clears it and types the value as real keystrokes (date, color and
+  range inputs are set directly). `type` appends keystrokes without clearing — use it to add to
+  existing text or to drive a per-key widget; `fill` for everything else.
 - `check`/`uncheck` are **idempotent**. `selectOption('US')` / `{label:'United States'}` /
   `{value:'us'}` / `{index:2}` (numbers coerce); for a **custom** (non-`<select>`) dropdown click
   to open, wait for the option to render, then click it.
@@ -575,8 +575,14 @@ Keep this lean — a few real rules, not paranoia.
 - **Confirm before an irreversible or externally-visible action** the user didn't already ask for —
   buying, sending a message, deleting data, submitting a form that transmits their data. Reading is
   free; routine navigation and consent UIs (cookie banners) need no confirmation.
-- **CAPTCHAs / bot walls:** don't try to solve or evade — report it and let the user decide. Don't
-  hammer a 403/blocked URL.
+- **CAPTCHAs / bot walls:** when an action's status header carries `challenge` with
+  `blocking:true` (Cloudflare, hCaptcha, reCAPTCHA, DataDome, HUMAN, Arkose), call
+  `challenge_wait {tabId}`. `blocking:false` means the page only embeds a widget (invisible
+  reCAPTCHA, a passed Turnstile) — carry on. It detaches the
+  debugger so the check sees an ordinary browser, lets an invisible check pass, then brings the tab
+  forward for the user and returns once it clears. Never click, solve, or work around a challenge
+  yourself, and don't hammer a 403/blocked URL. If `challenge_wait` returns `cleared:false`, tell
+  the user the page is waiting for them and stop.
 
 ---
 
@@ -594,6 +600,20 @@ browser** rather than a headless one you own.
   `prompt` state, the prompt can never be shown, and the promise **never settles** — your `run`
   script just hangs until it times out. Use the `clipboard_read` tool, which pastes via a trusted
   browser command and needs no permission.
+- **Your scripts run in a private world.** `page.evaluate`, `run`, and `cdp` `Runtime.evaluate`
+  execute in the bridge's isolated JS world: the same DOM and `document`, but **not** the page's own
+  globals — a variable the page set on `window` (an app object, a framework store) reads as
+  `undefined`. Data the page embeds in markup is still there: read
+  `document.getElementById('__NEXT_DATA__').textContent`, not `window.__NEXT_DATA__`. That split is
+  what keeps the page from seeing the bridge. To reach a page-defined global, pass `{ world: 'page' }` as the third
+  argument to `page.evaluate(fn, arg, { world: 'page' })`, or `world:"page"` to `cdp`. The page can
+  observe those calls, so use them only when you need page JS state.
+- **Page console capture is opt-in.** Network and browser errors are always recorded. The page's
+  own `console.*` calls start being captured at the first `read_console` on a tab (listening for
+  them is detectable); `read_console {stop:true}` turns it back off.
+- **Input is human-shaped.** Clicks travel a curved pointer path with a short dwell, and `fill`
+  clicks into the field, clears it with real keys and types with a rhythm. A long value types fast;
+  a date/color/range input is set directly. Expect a click or fill to take a few hundred ms.
 - **Background tabs work.** The bridge emulates focus and keeps the tab lifecycle active, so SPAs
   that gate rendering on visibility still load. `tab_activate` is for when the *user* should watch,
   not to make a page work.
@@ -663,8 +683,10 @@ reads, the dedicated tools for dialogs/uploads/screenshots (raw `Page.captureScr
 unusable base64 string), and the `navigate` tool over raw `Page.navigate` (which reloads even when
 already on the URL, wiping in-progress input). Reach here for: DOM node ops
 (`DOM.getDocument {depth:-1}`, `DOM.querySelector`), chorded mouse gestures / pointer types `click`
-doesn't expose, or a domain not otherwise surfaced. `Page`/`DOM`/`Runtime`/`Accessibility`/`Network`/
-`Log` are pre-enabled on claim; enable any other domain first.
+doesn't expose, or a domain not otherwise surfaced. `Page`/`DOM`/`Accessibility`/`Network`/`Log` are
+pre-enabled on claim. **`Runtime` is deliberately not** (it is the most detectable domain): evaluate
+still works and runs in the bridge's isolated world; pass `world:"page"` to reach page globals.
+Enable any other domain first.
 
 Events are buffered, not streamed. `read_console` / `read_network` are the digests for the two you
 usually want; **`cdp_events`** reads the rest of the protocol (lifecycle, CSS, Animation, a domain

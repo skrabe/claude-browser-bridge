@@ -12,8 +12,9 @@ import { join } from 'node:path';
 // cross-origin (OOPIF) frame sessions for full-page coverage.
 
 // ============================ in-page engine (string, injected via Runtime.evaluate) ============================
-// Exposes window.__cbb(op, arg). Stateless per call (re-resolves each time, like Playwright), so it
-// survives DOM churn and navigations; re-installs itself if the page replaced window.
+// Exposes window.__cbb(op, arg) inside the extension's ISOLATED world — the page's own scripts share
+// the DOM with it but cannot see the global. Stateless per call (re-resolves each time, like
+// Playwright), so it survives DOM churn; a new document gets a new world and a fresh install.
 const ENGINE = `
 if (!window.__cbb) {
   const M = (s, matcher, exact) => {
@@ -135,6 +136,13 @@ if (!window.__cbb) {
     if (op === 'fill') { if (!el) return { ok: false, err: 'not found' }; el.focus && el.focus(); if (el.isContentEditable) { el.textContent = a.value; el.dispatchEvent(new Event('input', { bubbles: true })); } else nativeSet(el, a.value); return { ok: true }; }
     if (op === 'select') { if (!el || el.tagName !== 'SELECT') return { ok: false, err: 'not a <select>' }; const want = a.values; let sel = []; for (const o of el.options) { const hit = want.some((w) => (w.value != null && o.value === String(w.value)) || (w.label != null && (o.label || o.text) === String(w.label)) || (w.index != null && o.index === Number(w.index)) || (typeof w === 'string' && (o.value === w || o.label === w || o.text === w)) || (typeof w === 'number' && (o.value === String(w) || o.index === w))); o.selected = hit; if (hit) sel.push(o.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return { ok: sel.length > 0, selected: sel }; }
     if (op === 'focus') { if (!el) return { ok: false }; el.focus && el.focus(); return { ok: true }; }
+    if (op === 'fieldinfo') { if (!el) return null; const t = (el.type || '').toLowerCase(); const NOT = ['date','time','datetime-local','month','week','color','range','file','checkbox','radio','hidden','submit','button','image','reset'];
+      const typeable = !!el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && !NOT.includes(t));
+      return { typeable, editable: !!el.isContentEditable, value: el.isContentEditable ? (el.textContent || '') : ('value' in el ? String(el.value) : '') }; }
+    if (op === 'settle') { // resolve on the next DOM mutation (or the cap), so a waiter re-checks on change instead of on a timer
+      return new Promise((res) => { let done = false; const fin = (v) => { if (done) return; done = true; try { mo.disconnect(); } catch {} clearTimeout(t); res(v); };
+        const mo = new MutationObserver(() => fin('mutation')); try { mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true }); } catch {}
+        const t = setTimeout(() => fin('timeout'), Math.max(20, Math.min(a.ms || 400, 2000))); }); }
     if (op === 'scroll') { if (!el) return { ok: false }; if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'center' }); return { ok: true, box: topBox(el) }; }
     if (op === 'checkstate') { if (!el) return null; return { box: topBox(el), checked: isChecked(el), vis: isVisible(el), en: isEnabled(el) }; }
     // Run the caller's function against the matched element(s) IN the page. The point is bulk reads:
@@ -178,6 +186,10 @@ if (!window.__cbb) {
 `;
 
 const asExpr = (op, arg) => `(()=>{${ENGINE}\nreturn window.__cbb(${JSON.stringify(op)}, ${JSON.stringify(arg)});})()`;
+// After the first call into a world the engine is already there, so only the invocation needs to
+// travel. A world that lost it (new document) reports ENGINE_MISSING and gets the full payload.
+const ENGINE_MISSING = '__cbb_engine_missing__';
+const callExpr = (op, arg) => `(()=>{if(!window.__cbb)return ${JSON.stringify(ENGINE_MISSING)};return window.__cbb(${JSON.stringify(op)}, ${JSON.stringify(arg)});})()`;
 
 export const _ENGINE = ENGINE; // exported for the jsdom unit test (host/test/engine.test.mjs)
 
@@ -202,8 +214,13 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   // Resolve a fill/type argument: a {secret:'NAME'} object → the registered value (never re-stated in
   // script text); a plain value passes through. Throws on an unknown secret name.
   const secretVal = (v) => { if (v && typeof v === 'object' && v.secret != null) { const g = secrets.get ? secrets.get(v.secret) : secrets[v.secret]; if (g == null) throw new Error('unknown secret "' + v.secret + '" — register it with secret_set first'); return g; } return v; };
-  const evalIn = async (op, arg, sessionId) => { const r = await cdp('Runtime.evaluate', { expression: asExpr(op, arg), returnByValue: true, awaitPromise: true }, sessionId); if (r && r.exceptionDetails) throw new Error('page eval failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; };
+  const evalOnce = async (expression, sessionId) => { const r = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId); if (r && r.exceptionDetails) throw new Error('page eval failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; };
+  const evalIn = async (op, arg, sessionId) => { const v = await evalOnce(callExpr(op, arg), sessionId); return v === ENGINE_MISSING ? evalOnce(asExpr(op, arg), sessionId) : v; };
 
+  // Wait until the page changes (or a short cap passes), then let the caller re-check. Replaces a
+  // fixed 120 ms poll: an element that appears 5 ms from now is seen 5 ms from now, and an idle
+  // page costs one round trip per cap instead of one every 120 ms.
+  const settle = async (deadline) => { const left = deadline - Date.now(); if (left <= 0) return; try { await evalIn('settle', { ms: Math.min(400, left) }); } catch { await sleep(Math.min(120, left)); } };
   let framesCache = null, framesCacheAt = 0;
   const frameSessions = async () => { const now = Date.now(); if (framesCache && now - framesCacheAt < 1500) return framesCache; let fr = { frames: [] }; try { fr = await callHost('listFrames', { tabId }); } catch {} framesCache = fr.frames || []; framesCacheAt = now; return framesCache; };
   const frameOffset = async (sessionId) => { try { return await callHost('frameOffsetOf', { tabId, sessionId }); } catch { return { ox: 0, oy: 0 }; } };
@@ -235,14 +252,12 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     return list;
   }
 
-  const mouse = async (type, x, y, opts = {}) => cdp('Input.dispatchMouseEvent', { type, x, y, button: opts.button || 'left', clickCount: opts.clickCount || 1, modifiers: opts.modifiers || 0, ...(opts.buttons != null ? { buttons: opts.buttons } : {}) });
-  // real drag: press at from, glide through intermediate moves (left button held → buttons:1), release at to
-  const dragPath = async (from, to, steps = 10) => {
-    await mouse('mouseMoved', from.x, from.y);
-    await mouse('mousePressed', from.x, from.y, { button: 'left', clickCount: 1 });
-    for (let s = 1; s <= steps; s++) { const x = from.x + ((to.x - from.x) * s) / steps, y = from.y + ((to.y - from.y) * s) / steps; await mouse('mouseMoved', x, y, { button: 'left', buttons: 1 }); await sleep(8); }
-    await mouse('mouseReleased', to.x, to.y, { button: 'left', clickCount: 1 });
-  };
+  // Pointer and keyboard go through the extension's human-shaped input (curved pointer paths with
+  // dwell, a typing rhythm), which also keeps one remembered pointer position per tab across the
+  // atomic tools and scripts.
+  const human = (kind, params) => { if (abort.aborted) throw new Error('run aborted (timeout)'); return callHost('humanInput', { tabId, kind, ...params }); };
+  const clickAt = (x, y, o = {}) => human('click', { x, y, button: o.button || 'left', clickCount: o.clickCount || 1, modifiers: o.modifiers || 0 });
+  const dragPath = (from, to) => human('drag', { from, to });
 
   class Locator {
     constructor(steps) { this.steps = steps; }
@@ -271,12 +286,12 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
         const g = await resolveGlobal(this.steps);
         if (g.length === 1) { const t = g[0]; const ok = actionable === 'visible' ? t.vis : actionable ? (t.vis && t.en) : true; if (ok) return t; last = t; }
         else if (g.length > 1) throw new Error(`strict mode: ${g.length} elements match — add .first()/.nth()/.filter()`);
-        await sleep(120);
+        await settle(deadline);
       }
       if (last) throw new Error('element not actionable in time (visible/enabled)');
       throw new Error('locator matched no element in time');
     }
-    async waitFor(o = {}) { const state = o.state || 'visible'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const g = await resolveGlobal(this.steps); const t = g[0]; const ok = state === 'attached' ? !!t : state === 'detached' ? !t : state === 'visible' ? (t && t.vis) : state === 'hidden' ? (!t || !t.vis) : !!t; if (ok) return; await sleep(120); } throw new Error('waitFor(' + state + ') timed out'); }
+    async waitFor(o = {}) { const state = o.state || 'visible'; const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const g = await resolveGlobal(this.steps); const t = g[0]; const ok = state === 'attached' ? !!t : state === 'detached' ? !t : state === 'visible' ? (t && t.vis) : state === 'hidden' ? (!t || !t.vis) : !!t; if (ok) return; await settle(deadline); } throw new Error('waitFor(' + state + ') timed out'); }
     async textContent(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'text' }, t.sessionId); }
     async innerText(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'inner' }, t.sessionId); }
     async inputValue(o = {}) { const t = await this._one(false, o.timeoutMs); return evalIn('text', { steps: this._q, i: t.i, kind: 'value' }, t.sessionId); }
@@ -292,13 +307,27 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async boundingBox(o = {}) { const t = await this._one(false, o.timeoutMs); return { x: t.box.x, y: t.box.y, width: t.box.w, height: t.box.h }; }
     async scrollIntoViewIfNeeded(o = {}) { const t = await this._one(false, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); }
     // terminal actions (real events / in-page mutation with auto-wait)
-    async click(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; const mods = (o.modifiers || []).reduce((m, k) => m | (MOD[k] || 0), 0); const button = o.button || 'left'; const clicks = o.clickCount || (o._double ? 2 : 1); await mouse('mouseMoved', b.cx, b.cy); for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); await mouse('mouseReleased', b.cx, b.cy, { button, clickCount: c, modifiers: mods }); } }
+    async click(o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one(true, 2000)).box; const mods = (o.modifiers || []).reduce((m, k) => m | (MOD[k] || 0), 0); await clickAt(b.cx, b.cy, { button: o.button || 'left', clickCount: o.clickCount || (o._double ? 2 : 1), modifiers: mods }); }
     async dblclick(o = {}) { return this.click({ ...o, _double: true }); }
-    async hover(o = {}) { const t = await this._one('visible', o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one('visible', 2000)).box; await mouse('mouseMoved', b.cx, b.cy); }
-    async fill(value, o = {}) { const t = await this._one(true, o.timeoutMs); const r = await evalIn('fill', { steps: this._q, i: t.i, value: String(secretVal(value)) }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err)); }
+    async hover(o = {}) { const t = await this._one('visible', o.timeoutMs); await evalIn('scroll', { steps: this._q, i: t.i }, t.sessionId); const b = (await this._one('visible', 2000)).box; await human('move', { x: b.cx, y: b.cy }); }
+    // Typed like a person: focus, clear with real keys, type. Controls that cannot be typed into
+    // (date pickers, color, range) and widgets that swallow synthetic keys fall back to setting
+    // the value directly, so fill always ends with the field holding the value.
+    async fill(value, o = {}) {
+      const t = await this._one(true, o.timeoutMs); const v = String(secretVal(value));
+      const info = await evalIn('fieldinfo', { steps: this._q, i: t.i }, t.sessionId);
+      if (info && info.typeable) {
+        await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId);
+        if (info.value) await human('clear', {});
+        await human('type', { text: v, fast: v.length > 60 });
+        const got = await evalIn('text', { steps: this._q, i: t.i, kind: info.editable ? 'text' : 'value' }, t.sessionId);
+        if (!v || got) return;
+      }
+      const r = await evalIn('fill', { steps: this._q, i: t.i, value: v }, t.sessionId); if (!r || !r.ok) throw new Error('fill failed: ' + (r && r.err));
+    }
     // Input.* must dispatch to the TOP-LEVEL page target (routes to the focused element across frames);
     // Chrome rejects Input on an OOPIF session — so focus in-frame, then type on the page session.
-    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await typeChars(cdp, secretVal(value)); }
+    async type(value, o = {}) { const t = await this._one(true, o.timeoutMs); await evalIn('focus', { steps: this._q, i: t.i }, t.sessionId); await human('type', { text: String(secretVal(value)), fast: !!o.fast }); }
     // Playwright renamed .type() to .pressSequentially(); accept both so a script written against
     // either generation of the API works here. Both append — neither clears first.
     async pressSequentially(value, o = {}) { return this.type(value, o); }
@@ -321,28 +350,17 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     }
     async dragTo(target, o = {}) {
       const b1 = await this.boundingBox(o); const b2 = await target.boundingBox(o);
-      await dragPath({ x: b1.x + b1.width / 2, y: b1.y + b1.height / 2 }, { x: b2.x + b2.width / 2, y: b2.y + b2.height / 2 }, o.steps || 10);
+      await dragPath({ x: b1.x + b1.width / 2, y: b1.y + b1.height / 2 }, { x: b2.x + b2.width / 2, y: b2.y + b2.height / 2 });
     }
   }
 
   async function pressChord(cdpFn, chord, sessionId) { const parts = String(chord).split('+'); const base = parts.pop(); let mods = 0; for (const m of parts) mods |= (MOD[m] || MOD[m.charAt(0).toUpperCase() + m.slice(1)] || 0); const printable = base.length === 1 && !(mods & (1 | 2 | 4)); const ch = printable && mods & 8 ? shiftChar(base) : base; const k = KEY[base] || (base.length === 1 ? { key: ch, code: 'Key' + base.toUpperCase(), kc: base.toUpperCase().charCodeAt(0) } : { key: base, code: base, kc: 0 }); await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc, ...(printable ? { text: ch } : {}) }, sessionId); await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: mods, key: k.key, code: k.code, windowsVirtualKeyCode: k.kc }, sessionId); }
-  // Real per-character typing: keyDown(text)+keyUp per code point, so widgets listening on
-  // keydown/keypress (search-as-you-type, key-filtered inputs, per-key OTP boxes) actually fire.
-  async function typeChars(cdpFn, text, sessionId) {
-    for (const ch of String(text)) {
-      const up = ch.toUpperCase(); const code = /^[a-z]$/i.test(ch) ? 'Key' + up : /^[0-9]$/.test(ch) ? 'Digit' + ch : '';
-      const kc = /^[a-z0-9]$/i.test(ch) ? up.charCodeAt(0) : 0;
-      await cdpFn('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, code, windowsVirtualKeyCode: kc }, sessionId);
-      await cdpFn('Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, windowsVirtualKeyCode: kc }, sessionId);
-    }
-  }
-
   const rootLoc = (step) => new Locator([step]);
   const dom_cua = {
     async get_visible_dom() { return evalIn('vdom', { cap: 400 }); },
-    async click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.click: ' + (r && r.err)); await mouse('mouseMoved', r.box.cx, r.box.cy); await mouse('mousePressed', r.box.cx, r.box.cy); await mouse('mouseReleased', r.box.cx, r.box.cy); },
-    async double_click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.double_click: ' + (r && r.err)); await mouse('mouseMoved', r.box.cx, r.box.cy); for (let c = 1; c <= 2; c++) { await mouse('mousePressed', r.box.cx, r.box.cy, { clickCount: c }); await mouse('mouseReleased', r.box.cx, r.box.cy, { clickCount: c }); } },
-    async type({ text }) { await cdp('Input.insertText', { text: String(text) }); },
+    async click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.click: ' + (r && r.err)); await clickAt(r.box.cx, r.box.cy); },
+    async double_click({ node_id }) { const r = await evalIn('vact', { node_id, action: 'box' }); if (!r || !r.ok) throw new Error('dom_cua.double_click: ' + (r && r.err)); await clickAt(r.box.cx, r.box.cy, { clickCount: 2 }); },
+    async type({ text }) { await human('type', { text: String(text) }); },
     async keypress({ keys }) { for (const k of (Array.isArray(keys) ? keys : [keys])) await pressChord(cdp, k); },
     async scroll({ node_id, x = 0, y = 300 }) { let cx = 200, cy = 300; if (node_id) { const r = await evalIn('vact', { node_id, action: 'box' }); if (r && r.ok) { cx = r.box.cx; cy = r.box.cy; } } await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x: cx, y: cy, deltaX: x, deltaY: y }); },
   };
@@ -355,7 +373,9 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     getByTestId: (testId) => rootLoc({ by: 'testid', testId }),
     locator: (selector) => rootLoc({ by: 'css', selector }),
     frameLocator: (frameSelector) => rootLoc({ by: 'css', selector: frameSelector }), // selects the iframe; queryStep descends into its (same-origin) contentDocument for chained steps
-    async evaluate(fn, arg) { const expr = typeof fn === 'function' ? `(${fn.toString()})(${JSON.stringify(arg ?? null)})` : String(fn); const r = await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) throw new Error('evaluate failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; },
+    // Runs in the bridge's isolated world (shares the DOM, not page globals). Pass {world:'page'} as
+    // a third argument to reach page-defined JS — the page can observe that call.
+    async evaluate(fn, arg, o = {}) { const expr = typeof fn === 'function' ? `(${fn.toString()})(${JSON.stringify(arg ?? null)})` : String(fn); const r = o && o.world === 'page' ? await callHost('executeCdp', { tabId, cdpMethod: 'Runtime.evaluate', cdpParams: { expression: expr, returnByValue: true, awaitPromise: true }, world: 'page' }) : await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) throw new Error('evaluate failed: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text)); return r && r.result ? r.result.value : undefined; },
     async goto(url, o = {}) {
       const r = await cdp('Page.navigate', { url });
       if (r && r.errorText && r.errorText !== 'net::ERR_ABORTED') throw new Error('goto failed: ' + r.errorText + ' (' + url + ')');
@@ -374,7 +394,7 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async goForward() { await this.evaluate(() => history.forward()); await sleep(300); },
     async bringToFront() { await callHost('activateTab', { tabId }); },
     async waitForTimeout(ms) { await sleep(Math.min(ms, 30000)); },
-    async waitForLoadState(o = {}) { const state = o.state || 'load'; if (state === 'networkidle') { await callHost('waitFor', { tabId, state: 'networkidle', timeoutMs: Math.min((o.timeoutMs || 15000), 25000) }).catch(() => {}); return; } const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const r = await cdp('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if (state === 'load' && rs === 'complete') return; await sleep(120); } },
+    async waitForLoadState(o = {}) { const state = o.state || 'load'; if (state === 'networkidle') { await callHost('waitFor', { tabId, state: 'networkidle', timeoutMs: Math.min((o.timeoutMs || 15000), 25000) }).catch(() => {}); return; } const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const left = deadline - Date.now(); const r = await cdp('Runtime.evaluate', { expression: `new Promise((res)=>{const want=${JSON.stringify(state)};const ok=()=>want==='domcontentloaded'?document.readyState!=='loading':document.readyState==='complete';if(ok())return res(document.readyState);const ev=want==='domcontentloaded'?'DOMContentLoaded':'load';const t=setTimeout(()=>res(document.readyState),${Math.min(left, 3000)});(want==='domcontentloaded'?document:window).addEventListener(ev,()=>{clearTimeout(t);res(document.readyState)},{once:true});})`, returnByValue: true, awaitPromise: true }).catch(() => ({})); const rs = r && r.result && r.result.value; if (state === 'domcontentloaded' && (rs === 'interactive' || rs === 'complete')) return; if (state === 'load' && rs === 'complete') return; if (!rs) await sleep(80); } },
     async waitForURL(pattern, o = {}) { const deadline = Date.now() + Math.min((o && o.timeoutMs) || 15000, 60000); const re = pattern instanceof RegExp ? pattern : null; while (Date.now() < deadline) { const u = await this.url(); if (u && (re ? re.test(u) : u.includes(pattern))) return; await sleep(150); } throw new Error('waitForURL timed out: ' + pattern); },
     async expectNavigation(action, o = {}) { const before = await this.url(); const r = await action(); const deadline = Date.now() + Math.min(o.timeoutMs || 15000, 60000); while (Date.now() < deadline) { const u = await this.url(); if (u !== before && (!o.url || (o.url instanceof RegExp ? o.url.test(u) : u.includes(o.url)))) { await this.waitForLoadState({ state: o.waitUntil || 'load', timeoutMs: 5000 }); return r; } await sleep(150); } throw new Error('expectNavigation: no matching navigation within timeout' + (o.url ? ' (url ' + o.url + ')' : '')); },
     async domSnapshot(o = {}) { const sel = o && o.selector, max = (o && o.max) || 20000, exclude = (o && o.exclude) || undefined, boxes = !!(o && o.boxes); const main = await evalIn('snapshot', { selector: sel, max, exclude, boxes }); const frames = await frameSessions(); if (!frames.length) return main; const parts = [main]; const framed = await Promise.all(frames.map(async (f) => { try { const s = await evalIn('snapshot', { selector: sel, max: 4000, exclude, boxes }, f.sessionId); return s && !/^\(/.test(s) ? '— frame ' + (f.url || '') + ' —\n' + s : null; } catch { return null; } })); for (const s of framed) if (s) parts.push(s); return parts.join('\n'); },
@@ -405,12 +425,12 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
     async elementFromPoint(pt) { return evalIn('fromPoint', { x: pt.x, y: pt.y }); },
     // coordinate mouse primitive (fallback for painted/canvas UIs; prefer semantic locators)
     mouse: {
-      async move(x, y) { await mouse('mouseMoved', x, y); },
-      async click(x, y, o = {}) { const button = o.button || 'left'; await mouse('mouseMoved', x, y); const clicks = o.clickCount || 1; for (let c = 1; c <= clicks; c++) { await mouse('mousePressed', x, y, { button, clickCount: c }); await mouse('mouseReleased', x, y, { button, clickCount: c }); } },
+      async move(x, y) { await human('move', { x, y }); },
+      async click(x, y, o = {}) { await clickAt(x, y, { button: o.button || 'left', clickCount: o.clickCount || 1 }); },
       async dblclick(x, y, o = {}) { return this.click(x, y, { ...o, clickCount: 2 }); },
       async wheel(x, y, dx = 0, dy = 0) { await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy }); },
     },
-    async drag(from, to, o = {}) { const pt = async (v) => (v && typeof v.boundingBox === 'function' ? (async () => { const b = await v.boundingBox(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; })() : { x: v.x, y: v.y }); await dragPath(await pt(from), await pt(to), o.steps || 10); },
+    async drag(from, to, o = {}) { const pt = async (v) => (v && typeof v.boundingBox === 'function' ? (async () => { const b = await v.boundingBox(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; })() : { x: v.x, y: v.y }); await dragPath(await pt(from), await pt(to)); },
     async setViewport(o = {}) { await cdp('Emulation.setDeviceMetricsOverride', { width: o.width || 1280, height: o.height || 800, deviceScaleFactor: o.deviceScaleFactor || 0, mobile: !!o.mobile }); },
     async resetViewport() { await cdp('Emulation.clearDeviceMetricsOverride', {}); },
     async pdf(o = {}) { const r = await cdp('Page.printToPDF', { printBackground: o.printBackground !== false, ...(o.landscape ? { landscape: true } : {}) }); const buf = Buffer.from(r.data, 'base64'); const p = o.path || join(tmpdir(), 'cbb-' + tabId + '-' + Date.now() + '.pdf'); await writeFile(p, buf); return { path: p, bytes: buf.length }; },

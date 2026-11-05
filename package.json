@@ -5,7 +5,8 @@
   "license": "MIT",
   "scripts": {
     "test": "node host/test/engine.test.mjs && node host/test/run.test.mjs && node host/test/wedge.test.mjs && node host/test/flows.test.mjs && node extension/test/agent-tabs.test.mjs && node extension/test/assets.test.mjs",
-    "test:coordinates": "node test/run-coordinates.mjs"
+    "test:coordinates": "node test/run-coordinates.mjs",
+    "test:live": "node test/run-stealth.mjs && node test/run-challenge.mjs && node test/run-features.mjs && node test/run-coordinates.mjs"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"

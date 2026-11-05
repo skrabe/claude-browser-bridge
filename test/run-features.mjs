@@ -37,7 +37,7 @@ async function call(name, args) {
   let data = null; if (t) { try { data = JSON.parse(t.text); } catch { data = t.text; } }
   return { data, image: im ? im.data : null, isError: !!r.isError };
 }
-const ev = async (tabId, e) => (await call('cdp', { tabId, method: 'Runtime.evaluate', params: { expression: e, returnByValue: true, awaitPromise: true } })).data?.result?.value;
+const ev = async (tabId, e) => (await call('cdp', { tabId, method: 'Runtime.evaluate', world: 'page', params: { expression: e, returnByValue: true, awaitPromise: true } })).data?.result?.value;
 
 const green = (s) => `\x1b[32m${s}\x1b[0m`, red = (s) => `\x1b[31m${s}\x1b[0m`;
 const bold = (s) => `\x1b[1m${s}\x1b[0m`, dim = (s) => `\x1b[2m${s}\x1b[0m`;
