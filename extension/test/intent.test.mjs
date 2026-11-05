@@ -32,5 +32,7 @@ eq('a role word prefers that role', (await names('email field'))[0], 'Email');
 eq('a query of only role words lists that role', (await names('the link')), ['Home']);
 eq('stopwords alone do not match every name', (await ctx.findCandidates(1, 'the')).map((c) => c.name), ['The order was saved']);
 
+eq('selector confirmation still ranks partial matches', (await ctx.intentCandidates(1, 'save the order')).pool.map((c) => c.name).slice(0, 2), ['Save order', 'Delete order']);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

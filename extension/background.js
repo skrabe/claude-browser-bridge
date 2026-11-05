@@ -1570,6 +1570,7 @@ async function intentCandidates(tabId, intent) {
   const pool = controls.length ? controls : all;
   const full = pool.filter((c) => c.full);
   full.near = pool.filter((c) => !c.full).slice(0, 3);
+  full.pool = pool; // every ranked candidate, for confirming a selector against the intent
   return full;
 }
 
@@ -1615,7 +1616,7 @@ async function resolveSelector(method, p) {
     // the intent could mean, the selector's element ranks first. A shared word is not agreement —
     // "save the order" overlaps "Delete order" on "order", and that is exactly the click that does
     // damage when a stale id now points at the wrong control.
-    const cands = await intentCandidates(p.tabId, p.intent);
+    const cands = (await intentCandidates(p.tabId, p.intent)).pool;
     const mine = cands.find((c) => s.refs.get(c.ref)?.backendNodeId === node.backendNodeId);
     const best = cands[0];
     if (mine) {
