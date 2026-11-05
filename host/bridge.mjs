@@ -461,6 +461,20 @@ function runMcpServer() {
     secret_clear: (a) => { if (a && a.name) secrets.delete(String(a.name)); else secrets.clear(); return { ok: true }; },
   };
 
+  // A `git pull` updates this server at once, but the browser keeps running the old extension until
+  // it is reloaded. Check once per session, off the critical path, and if the extension is older,
+  // say so once in the next tool result. Never repeated, never blocks a call.
+  let versionCheck = null, staleExtension = null, versionNoteDue = false;
+  const newer = (a, b) => { const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
+  const checkExtensionVersion = () => callHost('getInfo', {}).then((info) => {
+    const ext = info && info.version;
+    if (ext && /^\d+\.\d+\.\d+$/.test(ext) && newer(VERSION, ext)) {
+      staleExtension = `the browser is still running the bridge extension v${ext}, older than this server (v${VERSION}). Ask the user to reload "Better Claude in Chrome" on their browser's extensions page; newer tools fail until then`;
+      versionNoteDue = true;
+    }
+  }).catch(() => {});
+  const takeVersionNote = () => { if (!versionNoteDue) return null; versionNoteDue = false; return 'Note: ' + staleExtension + '.'; };
+
   const recorder = makeRecorder({ MAP });
 
   const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
@@ -475,6 +489,7 @@ function runMcpServer() {
     } else if (msg.method === 'notifications/initialized') { /* no-op */ }
     else if (msg.method === 'tools/list') { send({ jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } }); }
     else if (msg.method === 'tools/call') {
+      if (!versionCheck) versionCheck = checkExtensionVersion();
       try {
         const fn = MAP[msg.params.name]; if (!fn) throw new Error('unknown tool: ' + msg.params.name);
         const args = msg.params.arguments || {};
@@ -489,9 +504,15 @@ function runMcpServer() {
           ? [{ type: 'image', data: r.__image, mimeType: r.mimeType },
              ...(r.__meta ? [{ type: 'text', text: redact(JSON.stringify(r.__meta)) }] : [])]
           : [{ type: 'text', text: redact(typeof r === 'string' ? r : JSON.stringify(r)) }];
+        const note = takeVersionNote();
+        if (note) content.push({ type: 'text', text: note });
         send({ jsonrpc: '2.0', id: msg.id, result: { content } });
       } catch (e) {
-        send({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: redact('Error: ' + (e && e.message || e)) }], isError: true } });
+        let text = 'Error: ' + (e && e.message || e);
+        // An "unknown method" from the extension is the signature of an extension older than this
+        // server. Say what to do, instead of leaving a bare protocol error.
+        if (/unknown method/i.test(text) && staleExtension) text += ` — ${staleExtension}`;
+        send({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: redact(text) }], isError: true } });
       }
     } else if (msg.id !== undefined) { send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'method not found' } }); }
   }
