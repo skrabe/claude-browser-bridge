@@ -261,8 +261,8 @@ export function makeBrowser(callHost, tabId, abort = { aborted: false }, secrets
   // rhythm is per key, so chunking does not change what the page sees. fast is decided once for the
   // whole value; a 200-char value must not type its last chunk slowly.
   const typeText = async (text, fast) => {
-    const s = String(text), f = fast || s.length > 60;
-    for (let i = 0; i < s.length; i += 24) await human('type', { text: s.slice(i, i + 24), fast: f });
+    const chars = Array.from(String(text)), f = fast || chars.length > 60; // by code point: never split an emoji
+    for (let i = 0; i < chars.length; i += 24) await human('type', { text: chars.slice(i, i + 24).join(''), fast: f });
   };
   const clickAt = (x, y, o = {}) => human('click', { x, y, button: o.button || 'left', clickCount: o.clickCount || 1, modifiers: o.modifiers || 0 });
   const dragPath = (from, to) => human('drag', { from, to });

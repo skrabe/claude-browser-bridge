@@ -416,6 +416,7 @@ function runMcpServer() {
     // challenge or dialog it ran into is not lost the way it would be inside the script.
     run: async (a) => {
       const out = await runScript({ callHost, tabId: a.tabId, script: String(a.script || ''), timeoutMs: a.timeoutMs, secrets });
+      if (/\bpage\.ref\s*\(/.test(String(a.script || ''))) await callHost('clearRefMarks', { tabId: a.tabId }).catch(() => {});
       if (out.result && out.result.__image) return { __image: out.result.__image, mimeType: out.result.mimeType };
       const status = await callHost('pageStatus', { tabId: a.tabId }).catch(() => null);
       return status ? { ...out, status } : out;

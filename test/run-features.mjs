@@ -137,7 +137,8 @@ async function main() {
   {
     const edit = `<!doctype html><body><textarea id=ta>t</textarea>`
       + `<div contenteditable id=ce aria-label=editor><p>old</p></div>`
-      + `<iframe id=f srcdoc='<input aria-label=inner value=framevalue>'></iframe></body>`;
+      + `<iframe id=f srcdoc='<input aria-label=inner value=framevalue><div contenteditable role=textbox aria-label=frameeditor><p>old</p></div>`
+      + `<script>let k=0;document.addEventListener("keydown",()=>{k++;document.body.dataset.keys=k},true)</script>'></iframe></body>`;
     const es = http.createServer((_, r) => { r.writeHead(200, { 'content-type': 'text/html' }); r.end(edit); });
     await new Promise((r) => es.listen(0, '127.0.0.1', r));
     const et = (await call('tab_create', { url: `http://127.0.0.1:${es.address().port}/`, active: false })).data.id;
@@ -150,7 +151,18 @@ async function main() {
     if (inner) {
       const f = await call('fill', { tabId: et, ref: inner.ref, value: 'typed' });
       const got = await ev(et, 'f.contentDocument.querySelector("input").value');
-      check('fill writes into the iframe field', !f.isError && got === 'typed', f.isError ? String(f.data).slice(0, 90) : `value = ${JSON.stringify(got)}`);
+      const keys = Number(await ev(et, 'f.contentDocument.body.dataset.keys || 0'));
+      check('fill types into the iframe field', !f.isError && got === 'typed' && !f.data?.viaSetter && keys >= 5,
+        f.isError ? String(f.data).slice(0, 90) : `value = ${JSON.stringify(got)}, ${keys} keydowns${f.data?.viaSetter ? ', viaSetter' : ''}`);
+      const c = (await call('click', { tabId: et, ref: inner.ref })).data;
+      check('a click inside the iframe is not reported as covered', c && !c.intercepted, JSON.stringify(c?.intercepted || null).slice(0, 80));
+    }
+    const fe = els.find((e) => e.name === 'frameeditor');
+    check('read_page lists an editor inside the iframe', !!fe);
+    if (fe) {
+      const r = await call('fill', { tabId: et, ref: fe.ref, value: 'framed\ntext' });
+      const t = await ev(et, 'f.contentDocument.querySelector("[contenteditable]").innerText');
+      check('fill changes an editor inside the iframe', !r.isError && /framed/.test(t) && /text/.test(t), JSON.stringify(t));
     }
 
     const ce = await call('fill', { tabId: et, selector: '#ce', value: 'first\nsecond' });

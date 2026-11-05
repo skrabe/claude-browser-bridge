@@ -218,15 +218,17 @@ async function worldFor(dbg) {
 }
 // The isolated world for one child frame in a session. Keyed by frame id, so it is created once per
 // child document; a stale id is dropped and recreated on the next miss.
+const frameWorldKey = (dbg, frameId) => (typeof dbg === 'number' ? 'main' : worldKey(dbg)) + '#' + frameId;
 async function worldForFrame(dbg, frameId) {
-  const s = st(dbg.tabId);
+  const d = typeof dbg === 'number' ? { tabId: dbg } : dbg;
+  const s = st(d.tabId);
   if (!s.worlds) s.worlds = new Map();
-  const key = worldKey(dbg) + '#' + frameId;
+  const key = frameWorldKey(dbg, frameId);
   const hit = s.worlds.get(key);
   if (hit) return hit;
-  const pending = rawCmd(dbg, 'Page.createIsolatedWorld', { frameId, worldName: WORLD, grantUniveralAccess: false }).then((r) => r.executionContextId);
+  const pending = rawCmd(d, 'Page.createIsolatedWorld', { frameId, worldName: WORLD, grantUniveralAccess: false }).then((r) => r.executionContextId);
   s.worlds.set(key, pending);
-  try { return await pending; } catch (e) { s.worlds.delete(key); throw e; }
+  try { return await pending; } catch (e) { s.worlds?.delete(key); throw e; }
 }
 // Only errors meaning the call never ran. "Execution context was destroyed" means it started and the
 // page navigated mid-await; re-running that could repeat a side effect (a second form submit).
@@ -600,33 +602,26 @@ function refNode(tabId, ref) {
   return n; // { backendNodeId, sessionId }
 }
 // A node inside an in-process child frame (a same-site iframe) shares the top session but lives in
-// its own document, so it must resolve in that frame's isolated world. Resolving it in the top
-// frame's world fails outright on Chrome ("Node with given id does not belong to the document").
-async function objectFor(dbg, backendNodeId) {
-  try {
-    const { object } = await cmd(dbg, 'DOM.resolveNode', { backendNodeId });
-    return object.objectId;
-  } catch (e) {
-    const frameId = await nodeFrameId(dbg, backendNodeId).catch(() => null);
-    if (!frameId) throw e;
+// its own document. Resolving it in the top frame's world succeeds yet hands back a wrapper whose
+// `document` is the TOP document, so focus checks, elementFromPoint and execCommand all act on the
+// wrong page. read_page records which child frame each such node came from; resolve it there.
+async function objectFor(dbg, backendNodeId, frameId) {
+  if (typeof dbg === 'number') dbg = { tabId: dbg };
+  if (frameId) {
     const ctx = await worldForFrame(dbg, frameId);
-    const { object } = await rawCmd(dbg, 'DOM.resolveNode', { backendNodeId, executionContextId: ctx });
-    return object.objectId;
+    try {
+      const { object } = await rawCmd(dbg, 'DOM.resolveNode', { backendNodeId, executionContextId: ctx });
+      return object.objectId;
+    } catch (e) {
+      // The child frame navigated since its world was made: drop it and make a fresh one, once.
+      st(dbg.tabId).worlds?.delete(frameWorldKey(dbg, frameId));
+      const fresh = await worldForFrame(dbg, frameId);
+      const { object } = await rawCmd(dbg, 'DOM.resolveNode', { backendNodeId, executionContextId: fresh });
+      return object.objectId;
+    }
   }
-}
-async function nodeFrameId(dbg, backendNodeId) {
-  const { node } = await cmd(dbg, 'DOM.describeNode', { backendNodeId, depth: 0 });
-  if (node.frameId) return node.frameId;
-  // describeNode reports frameId only on documents and frame owners; walk to the owning document.
-  const { nodeIds } = await cmd(dbg, 'DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [backendNodeId] });
-  let id = nodeIds && nodeIds[0];
-  for (let i = 0; id && i < 200; i++) {
-    const d = (await cmd(dbg, 'DOM.describeNode', { nodeId: id, depth: 0 })).node;
-    if (d.nodeType === 9 && d.frameId) return d.frameId;
-    if (!d.parentId) break;
-    id = d.parentId;
-  }
-  return null;
+  const { object } = await cmd(dbg, 'DOM.resolveNode', { backendNodeId });
+  return object.objectId;
 }
 // Accumulated top-left offset of a frame chain, in top-level viewport CSS px. In a real
 // (non-headless) browser DOM.getBoxModel returns FRAME-LOCAL coords, so an OOPIF element's viewport
@@ -751,10 +746,10 @@ const DESCRIBE_FN = `function(){
   return { tag:e.tagName?e.tagName.toLowerCase():'', role:a('role')||null, label:label||null,
            box:r?{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)}:null };
 }`;
-async function describeNode(tabId, backendNodeId, sessionId) {
+async function describeNode(tabId, backendNodeId, sessionId, frameId) {
   try {
     const dbg = dbgOf(tabId, sessionId);
-    const objectId = await objectFor(dbg, backendNodeId);
+    const objectId = await objectFor(dbg, backendNodeId, frameId);
     const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, functionDeclaration: DESCRIBE_FN, returnByValue: true });
     return r.result?.value ?? null;
   } catch { return null; }
@@ -773,9 +768,12 @@ const COVERED_FN = `function(x,y){
   const label=(a('aria-label')||hit.title||(hit.innerText||hit.textContent||'').trim()).replace(/\\s+/g,' ').slice(0,80);
   return {covered:true,by:{tag:hit.tagName?hit.tagName.toLowerCase():'',label:label||null}};
 }`;
-async function checkCovered(tabId, backendNodeId, sessionId, x, y) {
+async function checkCovered(tabId, backendNodeId, sessionId, x, y, frameId) {
   if (sessionId) return null; // cross-origin frame: the point would need frame-local coords — skip
   try {
+    // A node in a same-site child frame is covered or not as its <iframe> is: the top document's
+    // elementFromPoint stops at the frame element. Ask about the owner instead.
+    if (frameId) backendNodeId = (await cmd(tabId, 'DOM.getFrameOwner', { frameId })).backendNodeId;
     const objectId = await objectFor(tabId, backendNodeId);
     const r = await cmd(tabId, 'Runtime.callFunctionOn', {
       objectId, functionDeclaration: COVERED_FN,
@@ -858,9 +856,13 @@ async function moveTo(tabId, x, y, opts = {}) {
   // order, and only the last one is awaited.
   const sent = [];
   for (const pt of pointerPath(from, { x, y })) {
-    sent.push(cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, ...(opts.buttons ? { button: 'left', buttons: opts.buttons } : {}) }).catch(() => {}));
+    const m = cmd(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, ...(opts.buttons ? { button: 'left', buttons: opts.buttons } : {}) });
+    m.catch(() => {}); // handled now so an early failure is not an unhandled rejection; the last is awaited below
+    sent.push(m);
     await pause(rnd(6, 16));
   }
+  // Commands to one target are answered in order, so the last answer means every move landed, and a
+  // detach or closed tab surfaces here.
   await sent[sent.length - 1];
   s.pointer = { x, y };
 }
@@ -931,16 +933,21 @@ async function clearFocused(tabId) {
 // Inputs whose value cannot be typed character by character (date/time pickers, color, range,
 // file) and anything that is not a text control keep the direct value setter. Returns what the
 // field holds afterwards, so callers can report masks and truncation.
+// An editor's text, read the way it was typed. innerText puts a blank line between block elements
+// (<p>, <div>) that typing Enter once created, so a block boundary counts as one line break. A blank
+// line typed inside a block (two <br>) is kept.
+const EDITOR_TEXT_BODY = "const out = []; const walk = (n) => { for (const c of n.childNodes) { if (c.nodeType === 3) out.push(c.nodeValue); else if (c.nodeName === 'BR') out.push('\\n'); else if (c.nodeType === 1) { const block = /^(P|DIV|LI|H[1-6]|BLOCKQUOTE|PRE)$/.test(c.nodeName); if (block && out.length && !String(out[out.length - 1]).endsWith('\\n')) out.push('\\n'); walk(c); if (block && !String(out[out.length - 1] || '').endsWith('\\n')) out.push('\\n'); } } }; walk(this); return out.join('').replace(/\\n$/, '');";
+const EDITOR_TEXT = '(function(){ ' + EDITOR_TEXT_BODY + ' }).call(this)';
 const SETTER_TYPES = new Set(['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range', 'file', 'checkbox', 'radio', 'hidden', 'submit', 'button', 'reset', 'image']);
 const FIELD_INFO_FN = `function(){ const t=(this.type||'').toLowerCase(); return { tag:(this.tagName||'').toLowerCase(), type:t, editable:!!this.isContentEditable,
-  text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t))||!!this.isContentEditable, secret:t==='password', focused:document.activeElement===this,
-  value:this.isContentEditable&&!('value' in this)?String(this.innerText).replace(/\\n\\n+/g,'\\n').replace(/\\n$/,''):'value' in this?String(this.value):null }; }`;
+  text:(this.tagName==='TEXTAREA')||(this.tagName==='INPUT'&&!${JSON.stringify([...SETTER_TYPES])}.includes(t))||!!this.isContentEditable, secret:t==='password', focused:this.ownerDocument.activeElement===this,
+  value:this.isContentEditable&&!/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)?${EDITOR_TEXT}:'value' in this?String(this.value):null }; }`;
 const SET_VALUE_FN = `function(v){
   this.focus && this.focus();
-  if (this.isContentEditable && !("value" in this)) {
-    const sel = getSelection(); sel.removeAllRanges(); const r = document.createRange(); r.selectNodeContents(this); sel.addRange(r);
-    document.execCommand("insertText", false, v);
-    return { got: String(this.innerText).replace(/\\n\\n+/g, "\\n").replace(/\\n$/, ""), secret: false, type: "" };
+  if (this.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName)) {
+    const doc = this.ownerDocument, sel = doc.getSelection(); sel.removeAllRanges(); const r = doc.createRange(); r.selectNodeContents(this); sel.addRange(r);
+    doc.execCommand("insertText", false, v);
+    return { got: ${EDITOR_TEXT}, secret: false, type: "" };
   }
   const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
   if (d && d.set) d.set.call(this, v); else this.value = v;
@@ -1149,7 +1156,7 @@ async function captureShot(tabId, p = {}) {
   let space = 'viewport', origin = { x: 0, y: 0 }, srcW = geo.viewport.width, srcH = geo.viewport.height;
 
   if (p.ref != null) { // just this element
-    const { backendNodeId, sessionId } = refNode(tabId, p.ref);
+    const { backendNodeId, sessionId, frameId } = refNode(tabId, p.ref);
     const dbg = dbgOf(tabId, sessionId);
     await cmd(dbg, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
     // captureScreenshot's clip is in DOCUMENT space while getBoxModel reports VIEWPORT space, so the
@@ -1400,7 +1407,11 @@ async function intentCandidates(tabId, intent) {
 // nothing, the intent is searched for — so a step written yesterday survives a renamed id today. Saves the dom_query round trip when you already know the selector — and it is strict on
 // purpose: matching several elements is an ambiguous instruction, not a licence to take the first.
 const REF_TOOLS = new Set(['click', 'fill', 'typeText', 'pressKey', 'selectOption', 'scroll', 'hover', 'drag', 'setFiles', 'selectText', 'generateLocator', 'screenshot', 'validate']);
+const NEEDS_TARGET = new Set(['fill', 'selectOption', 'selectText', 'setFiles', 'generateLocator', 'markRef']);
 async function resolveSelector(method, p) {
+  if (p && NEEDS_TARGET.has(method) && p.ref == null && !p.selector && !p.intent) {
+    throw new Error('pass a target: ref (from read_page/dom_query/find), a unique CSS selector, or an intent like "the Email field"');
+  }
   if (!p || !REF_TOOLS.has(method) || p.tabId == null || p.ref) return p;
   if (!p.selector && !p.intent) return p;
   await need(p.tabId);
@@ -1711,21 +1722,27 @@ async function dispatch(method, p) {
     }
     case 'markRef': {
       await need(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
-      const objectId = await objectFor(dbg, backendNodeId);
+      const objectId = await objectFor(dbg, backendNodeId, frameId);
       const token = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
       const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, arguments: [{ value: token }],
-        functionDeclaration: 'function(t){ const el = this.nodeType === 3 ? this.parentElement : this; if (!el || !el.setAttribute) return false; el.setAttribute("data-cbb-ref", t); return true; }' });
+        functionDeclaration: 'function(t){ const el = this.nodeType === 3 ? this.parentElement : this; if (!el || !el.setAttribute) return null; if (!el.hasAttribute("data-cbb-ref")) el.setAttribute("data-cbb-ref", t); return el.getAttribute("data-cbb-ref"); }' });
       if (!r.result?.value) throw new Error(`ref "${p.ref}" is not an element a script can target — take a fresh read_page`);
-      return { selector: `[data-cbb-ref="${token}"]` };
+      return { selector: `[data-cbb-ref="${r.result.value}"]` };
+    }
+    // Remove the marks page.ref left, once the script that needed them has finished.
+    case 'clearRefMarks': {
+      await need(p.tabId);
+      await cmd(p.tabId, 'Runtime.evaluate', { expression: 'for (const d of [document, ...[...document.querySelectorAll("iframe")].map((f) => { try { return f.contentDocument; } catch { return null; } })]) if (d) for (const el of d.querySelectorAll("[data-cbb-ref]")) el.removeAttribute("data-cbb-ref"); true', returnByValue: true }).catch(() => {});
+      return { ok: true };
     }
     case 'generateLocator': {
       await need(p.tabId);
       const s = st(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
-      const objectId = await objectFor(dbg, backendNodeId);
+      const objectId = await objectFor(dbg, backendNodeId, frameId);
       const r = await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId, returnByValue: true,
         functionDeclaration: `function(){
@@ -1890,7 +1907,7 @@ async function dispatch(method, p) {
           const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
           walk((await cmd(dbgS, 'Page.getFrameTree')).frameTree);
           for (const frameId of kids) {
-            try { nodes = nodes.concat((await cmd(dbgS, 'Accessibility.getFullAXTree', { frameId })).nodes); } catch { /* out-of-process child: its own session covers it */ }
+            try { nodes = nodes.concat((await cmd(dbgS, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
           }
         } catch { /* frame tree unavailable — the root document still reads */ }
         const byId = new Map(nodes.map((n) => [n.nodeId, n]));
@@ -1940,7 +1957,7 @@ async function dispatch(method, p) {
             role, name: cleanName(name).slice(0, 160),
             ...(val != null ? { value: String(val).slice(0, 80) } : {}),
             ...(sessionId ? { frame: true } : {}),
-            __bid: bid, __sid: sessionId,
+            __bid: bid, __sid: sessionId, __fid: n.__frameId,
           });
           if (cur.size >= 500) break outer;
         }
@@ -2023,7 +2040,7 @@ async function dispatch(method, p) {
         let ref = was && was.ref;
         if (e.__bid != null) {
           if (!ref) ref = 'e' + (++s.seq);
-          s.refs.set(ref, { backendNodeId: e.__bid, sessionId: e.__sid });
+          s.refs.set(ref, { backendNodeId: e.__bid, sessionId: e.__sid, ...(e.__fid ? { frameId: e.__fid } : {}) });
         } else ref = null;
         const shown = { ref, role: e.role, name: e.name, ...(e.value != null ? { value: e.value } : {}), ...(e.format ? { format: e.format } : {}), ...(e.covered ? { covered: true } : {}), ...(e.frame ? { frame: true } : {}) };
         next.set(k, shown);
@@ -2098,7 +2115,7 @@ async function dispatch(method, p) {
         node = refNode(p.tabId, p.ref);
         const c = await absCenter(p.tabId, node.backendNodeId, node.sessionId);
         x = c.x; y = c.y;
-        intended = await describeNode(p.tabId, node.backendNodeId, node.sessionId);
+        intended = await describeNode(p.tabId, node.backendNodeId, node.sessionId, node.frameId);
       } else {
         const pt = await pointOf(p.tabId, p);
         if (!pt) throw new Error('click needs a ref or {x,y}');
@@ -2113,7 +2130,7 @@ async function dispatch(method, p) {
       // an overlay/cookie banner says so instead of reporting a bare ok.
       const [before, covered] = await Promise.all([
         hitTest(p.tabId, x, y),
-        node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y) : Promise.resolve(null),
+        node ? checkCovered(p.tabId, node.backendNodeId, node.sessionId, x, y, node.frameId) : Promise.resolve(null),
       ]);
       const button = p.button === 'right' ? 'right' : p.button === 'middle' ? 'middle' : 'left';
       await humanClick(p.tabId, x, y, { button, double: !!p.double });
@@ -2162,22 +2179,25 @@ async function dispatch(method, p) {
 
     case 'fill': {
       await need(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
-      const objectId = await objectFor(dbg, backendNodeId);
+      const objectId = await objectFor(dbg, backendNodeId, frameId);
       // Read the value back in the same call. A phone/date/currency/card field with an input mask
       // silently rewrites what you set, and a maxlength quietly truncates it — so "fill succeeded"
       // is not the same as "the field holds what you asked for". Reporting the difference here is
       // what turns a wrong value discovered three steps later into one you see immediately.
       const want = String(p.value ?? '');
-      const { got, secret, type } = await fillField(p.tabId, dbg, objectId, backendNodeId, sessionId, want);
+      const { got, secret, type, viaSetter } = await fillField(p.tabId, dbg, objectId, backendNodeId, sessionId, want);
       // A date/time input silently rejects anything not in its wire format, leaving the field empty
       // while the page still displays a locale mask like mm/dd/yyyy. Without this the model sets a
       // perfectly reasonable-looking value, sees no error, and moves on with an empty field.
       if (DATE_FORMATS[type] && got === '' && want !== '') {
         throw new Error(`this is an <input type="${type}"> — it only accepts ${DATE_FORMATS[type]}, and rejected ${JSON.stringify(want)}, leaving the field empty. The mm/dd/yyyy you see is just how Chrome displays it. Re-fill using ${DATE_FORMATS[type]}.`);
       }
-      if (got === want || got === undefined) return { ok: true };
+      // viaSetter: keystrokes could not reach the field, so the value was set directly. Frameworks
+      // that listen for key events may not have seen the edit; say so instead of a bare ok.
+      const how = viaSetter ? { viaSetter: true, note: 'set directly, not typed — the field could not take keyboard focus' } : {};
+      if (got === want || got === undefined) return { ok: true, ...how };
       // Never echo a password back, even to report a mismatch.
       if (secret) return { ok: true, mismatch: 'the field did not keep the value exactly (length ' + String(got).length + ' vs ' + want.length + ')' };
       return { ok: true, mismatch: 'the field now holds ' + JSON.stringify(String(got).slice(0, 120)) + ', not what you set — an input mask or maxlength rewrote it. Reconcile before continuing.', value: got };
@@ -2187,9 +2207,9 @@ async function dispatch(method, p) {
     // This is what makes "change just this word" a single action rather than clear-and-retype.
     case 'selectText': {
       await need(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
-      const objectId = await objectFor(dbg, backendNodeId);
+      const objectId = await objectFor(dbg, backendNodeId, frameId);
       const r = await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId, returnByValue: true,
         functionDeclaration: `function(text, prefix, suffix, how){
@@ -2255,16 +2275,16 @@ async function dispatch(method, p) {
     }
     case 'scroll': {
       await need(p.tabId);
-      if (p.ref != null) { const { backendNodeId, sessionId } = refNode(p.tabId, p.ref); await cmd(dbgOf(p.tabId, sessionId), 'DOM.scrollIntoViewIfNeeded', { backendNodeId }); return { ok: true }; }
+      if (p.ref != null) { const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref); await cmd(dbgOf(p.tabId, sessionId), 'DOM.scrollIntoViewIfNeeded', { backendNodeId }); return { ok: true }; }
       const pt = (await pointOf(p.tabId, p)) || { x: 100, y: 100 };
       await cmd(p.tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: pt.x, y: pt.y, deltaX: p.dx || 0, deltaY: p.dy || 300 });
       return { ok: true };
     }
     case 'selectOption': {
       await need(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const dbg = dbgOf(p.tabId, sessionId);
-      const objectId = await objectFor(dbg, backendNodeId);
+      const objectId = await objectFor(dbg, backendNodeId, frameId);
       const r = await cmd(dbg, 'Runtime.callFunctionOn', {
         objectId,
         // match by option value OR visible label/text (doctrine advertises both)
@@ -2340,16 +2360,16 @@ async function dispatch(method, p) {
       for (const q of [].concat(p.text ?? [])) { const c = await textCount(q); checks.push({ check: 'text', want: q, ok: c > 0, got: c + ' occurrence(s)' }); }
       for (const q of [].concat(p.textAbsent ?? [])) { const c = await textCount(q); checks.push({ check: 'textAbsent', want: q, ok: c === 0, got: c + ' occurrence(s)' }); }
       if (p.ref) {
-        const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+        const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
         const dbg = dbgOf(p.tabId, sessionId);
-        const objectId = await objectFor(dbg, backendNodeId);
+        const objectId = await objectFor(dbg, backendNodeId, frameId);
         const r = await cmd(dbg, 'Runtime.callFunctionOn', { objectId, returnByValue: true, functionDeclaration: `function(){
           const el = this.nodeType === 3 ? this.parentElement : this; if (!el) return null;
           const cs = getComputedStyle(el), b = el.getBoundingClientRect();
           const visible = cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0 && b.width > 0 && b.height > 0;
           const checked = typeof el.checked === 'boolean' ? el.checked : el.getAttribute('aria-checked') === 'true';
           const enabled = !(el.disabled || el.getAttribute('aria-disabled') === 'true');
-          return { visible, checked, enabled, value: el.isContentEditable && !('value' in el) ? String(el.innerText).replace(/\\n\\n+/g, '\\n').replace(/\\n$/, '') : 'value' in el ? String(el.value) : null, text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 300), secret: el.type === 'password' };
+          return { visible, checked, enabled, value: el.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) ? (function(){ ${EDITOR_TEXT_BODY} }).call(el) : 'value' in el ? String(el.value) : null, text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 300), secret: el.type === 'password' };
         }` });
         const e = r.result?.value;
         if (!e) checks.push({ check: 'element', ok: false, got: 'ref no longer resolves to an element' });
@@ -2418,7 +2438,7 @@ async function dispatch(method, p) {
 
     case 'setFiles': {
       await need(p.tabId);
-      const { backendNodeId, sessionId } = refNode(p.tabId, p.ref);
+      const { backendNodeId, sessionId, frameId } = refNode(p.tabId, p.ref);
       const files = Array.isArray(p.paths) ? p.paths : [p.paths];
       await cmd(dbgOf(p.tabId, sessionId), 'DOM.setFileInputFiles', { files, backendNodeId });
       return { ok: true, files };
@@ -2829,7 +2849,7 @@ chrome.debugger.onEvent.addListener((source, cdpMethod, cdpParams) => {
   } else if (cdpMethod === 'Page.frameNavigated') {
     if (!cdpParams.frame?.parentId && !source.sessionId) s.topFrameId = cdpParams.frame?.id;
     // A new document in some frame: the isolated world we made in its old document is gone.
-    if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); }
+    if (s.worlds) { s.worlds.delete(source.sessionId || 'main'); s.worlds.delete('main:' + (source.sessionId || 'main')); if (cdpParams.frame?.id) s.worlds.delete((source.sessionId || 'main') + '#' + cdpParams.frame.id); }
     if (!cdpParams.frame?.parentId) {
       // New main-frame document: every backendDOMNodeId from the old one is dead, so a delta against
       // it would be pure noise. Drop the baseline and let the next read_page return a full tree. The
