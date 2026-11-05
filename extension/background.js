@@ -1552,6 +1552,22 @@ const ACTION_METHODS = new Set(['click', 'fill', 'typeText', 'pressKey', 'select
 // names, so a request for something absent came back "ambiguous" with unrelated buttons.
 const QUERY_STOPWORDS = new Set(['the', 'a', 'an', 'this', 'that', 'my', 'on', 'in', 'of', 'to', 'for', 'and', 'or', 'with', 'at', 'by', 'from', 'field', 'input', 'box', 'element', 'control', 'icon']);
 const ROLE_WORDS = { button: ['button'], btn: ['button'], link: ['link'], checkbox: ['checkbox'], radio: ['radio'], textbox: ['textbox', 'searchbox'], tab: ['tab'], menu: ['menu', 'menuitem'], option: ['option'], switch: ['switch'], slider: ['slider'], dropdown: ['combobox', 'listbox'], combobox: ['combobox'], select: ['combobox', 'listbox'], heading: ['heading'], image: ['image', 'img'] };
+// Every a11y node one session can see: its root document plus each same-site child frame, which
+// shares the session but which getFullAXTree without a frameId leaves out. Child-frame nodes carry
+// __frameId so their refs resolve in that frame's document. null when the session cannot be read.
+async function sessionAXNodes(dbg) {
+  let nodes;
+  try { nodes = (await cmd(dbg, 'Accessibility.getFullAXTree', {})).nodes; } catch { return null; }
+  try {
+    const kids = [];
+    const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
+    walk((await cmd(dbg, 'Page.getFrameTree')).frameTree);
+    for (const frameId of kids) {
+      try { nodes = nodes.concat((await cmd(dbg, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
+    }
+  } catch { /* frame tree unavailable — the root document still reads */ }
+  return nodes;
+}
 async function findCandidates(tabId, query) {
   const s = st(tabId);
   const q = String(query || '').toLowerCase().trim();
@@ -1586,22 +1602,6 @@ async function findCandidates(tabId, query) {
     }
   }
   scored.sort((a, b) => b.score - a.score);
-// Every a11y node one session can see: its root document plus each same-site child frame, which
-// shares the session but which getFullAXTree without a frameId leaves out. Child-frame nodes carry
-// __frameId so their refs resolve in that frame's document. null when the session cannot be read.
-async function sessionAXNodes(dbg) {
-  let nodes;
-  try { nodes = (await cmd(dbg, 'Accessibility.getFullAXTree', {})).nodes; } catch { return null; }
-  try {
-    const kids = [];
-    const walk = (ft) => { for (const c of ft.childFrames || []) { kids.push(c.frame.id); walk(c); } };
-    walk((await cmd(dbg, 'Page.getFrameTree')).frameTree);
-    for (const frameId of kids) {
-      try { nodes = nodes.concat((await cmd(dbg, 'Accessibility.getFullAXTree', { frameId })).nodes.map((n) => ({ ...n, __frameId: frameId }))); } catch { /* out-of-process child: its own session covers it */ }
-    }
-  } catch { /* frame tree unavailable — the root document still reads */ }
-  return nodes;
-}
   return scored;
 }
 
@@ -2387,6 +2387,7 @@ async function dispatch(method, p) {
       const brief = (d) => d && { tag: d.tag, ...(d.role ? { role: d.role } : {}), ...(d.label ? { label: d.label } : {}), ...(d.href ? { href: d.href } : {}), ...(d.disabled ? { disabled: true } : {}), selector: d.selector, ...(d.selectorMatches > 1 ? { selectorMatches: d.selectorMatches } : {}) };
       const out = { ok: true, point: { x: Math.round(x), y: Math.round(y) }, landedOn: brief(target), ...(before?.clickable ? { via: { tag: leaf.tag, ...(leaf.label && leaf.label !== target.label ? { label: leaf.label } : {}) } } : {}) };
       if (dialog) out.openedDialog = { ...dialog, next: 'the page is frozen until you answer it: dialog_handle {accept:true|false, promptText?}' };
+      if (intended?.ariaDisabled) out.note = `the ref's <${intended.tag}> is aria-disabled: it took the click, but the page marks it unavailable — check what it did (read_page / validate)`;
       if (nav === 'committed') out.navigated = true;
       else if (nav === 'pending') out.navigating = true; // started, still loading: status.url may be the old page
       if (covered?.covered) {
@@ -2433,7 +2434,6 @@ async function dispatch(method, p) {
     case 'fill': {
       await need(p.tabId);
       const { backendNodeId, sessionId, frameId } = await editableTarget(p.tabId, refNode(p.tabId, p.ref));
-      if (intended?.ariaDisabled) out.note = `the ref's <${intended.tag}> is aria-disabled: it took the click, but the page marks it unavailable — check what it did (read_page / validate)`;
       const dbg = dbgOf(p.tabId, sessionId);
       const objectId = await objectFor(dbg, backendNodeId, frameId);
       // Read the value back in the same call. A phone/date/currency/card field with an input mask
